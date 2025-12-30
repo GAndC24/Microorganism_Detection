@@ -1,7 +1,6 @@
 # Construct Weak Bounding Boxes
-from typing import List, Tuple, Dict, Optional, Iterable
+from typing import List, Tuple, Iterable
 import heapq
-import math
 
 Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
 LabeledBox = Tuple[Box, int]              # (box, class_id)
@@ -66,12 +65,106 @@ def purity_check_iou(candidate: Box, target_cls: int, gt: List[LabeledBox], eps:
             return False
     return True
 
+# Build weak bounding boxes from ground-truth labeled boxes
 def build_weak_boxes(
     gt: List[LabeledBox],   # Ground-truth
-    purity_mode: str = "center",    # Purity check mode: "center" or "iou"
+    purity_mode: str = "iou",    # Purity check mode: "center" or "iou"
     iou_eps: float = 1e-6,  # IoU threshold
 ) -> List[WeakBox]:
     # 1. 按类别分组，分别构建弱框
     classes_in_img = sorted({c for (_, c) in gt})
     weak_boxes: List[WeakBox] = []
+
+    for cls in classes_in_img:
+        # 2. 初始化：每个同类实例框作为一个 cluster
+        init_boxes = [b for (b, c) in gt if c == cls]
+        if not init_boxes:
+            continue
+
+        clusters: List[Cluster] = [Cluster([b], cls) for b in init_boxes]
+
+        n = len(clusters)
+        if n == 1:
+            wb = union_rect(clusters[0].boxes)
+            if purity_mode == 'iou':
+                is_pure = purity_check_iou(wb, cls)
+            else:
+                is_pure = purity_check_center(wb, cls)
+            if not is_pure:    # 极端情况下（其他类中心点恰好在该框内），跳过
+                pass
+            weak_boxes.append((wb, cls))
+            continue
+
+        # 3. min priority PQ: (cost, p, q, ver_p, ver_q)
+        #    cost = Area(union(p,q)) - Area(p) - Area(q)
+        pq: List[Tuple[float, int, int, int, int]] = []
+
+        alive = [True] * n  # for lazy deletion
+        version = [0] * n  # cluster 内容更新时 +1，用于过滤 dead pair
+
+        rect_cache: List[Box] = [union_rect((clusters[i].boxes)) for i in range(n)]     # 预计算当前 cluster rect
+
+        # 初始化所有 pair
+        for p in range(n):
+            for q in range(p + 1, n):
+                rp, rq = rect_cache[p], rect_cache[q]
+                r_pq = union_rect([rp, rq])
+                cost = area(r_pq) - area(rp) - area(rq)
+                heapq.heappush(pq, (cost, p, q, version[p], version[q]))
+
+        # 4. 贪心合并 + lazy deletion
+        while pq:
+            cost, p, q, vp, vq = heapq.heappop(pq)
+
+            # 过期/失效 pair：lazy deletion
+            if not alive[p] or not alive[q]:
+                continue
+            if vp != version[p] or vq != version[q]:
+                continue
+
+            # 尝试合并
+            merged_boxes = clusters[p].boxes + clusters[q].boxes
+            cand = union_rect(merged_boxes)
+
+            # purity check
+            if purity_mode == 'iou':
+                is_pure = purity_check_iou(cand, cls, gt, eps=iou_eps)
+            else:
+                is_pure = purity_check_center(cand, cls, gt)
+            if not is_pure:
+                continue
+
+            # 接受合并：q 合并进 p，q 失效
+            clusters[p].boxes = merged_boxes
+            alive[q] = False
+
+            # 更新 p 的 version 与 rect_cache
+            version[p] += 1
+            rect_cache[p] = union_rect(clusters[p].boxes)
+
+            # 把新的 (p, k) pair 入队（旧 pair 不删除，靠 lazy deletion 过滤）
+            for k in range(n):
+                if k == p or not alive[k]:
+                    continue
+                pp, qq = (p, k) if p < k else (k, p)
+                rp, rk = rect_cache[pp], rect_cache[qq]
+                r_pq = union_rect([rp, rk])
+                cost = area(r_pq) - area(rp) - area(rk)
+                heapq.heappush(pq, (cost, pp, qq, version[pp], version[qq]))
+
+        # output alive clusters as weak boxes
+        for i in range(n):
+            if not alive[i]:
+                continue
+            wb = union_rect(clusters[i].boxes)
+            # 最终 check purity
+            if purity_mode == 'iou':
+                is_pure = purity_check_iou(wb, cls, gt, eps=iou_eps)
+            else:
+                is_pure = purity_check_center(wb, cls, gt)
+            if not is_pure:
+                raise RuntimeError(f"Purity violated in final weak box for class={cls}")
+            weak_boxes.append((wb, cls))
+
+    return weak_boxes
 
