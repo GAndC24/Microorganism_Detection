@@ -1,11 +1,15 @@
 import xml.etree.ElementTree as ET
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, TypedDict
+from dataclasses import dataclass
 from PIL import Image
 import cv2
 import numpy as np
 
 Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
-LabeledBox = Dict[Box, int]              # (box, class_id)
+
+class LabeledBox(TypedDict):
+    box: Box
+    class_id: int
 
 # read the VOC XML annotation file
 def parse_voc_xml(xml_path: str, class_map : Dict) -> Tuple[Dict, List[LabeledBox]]:
@@ -43,12 +47,12 @@ def parse_voc_xml(xml_path: str, class_map : Dict) -> Tuple[Dict, List[LabeledBo
     return image_info, boxes
 
 # Visualize the annotations on the image
-def draw_boxes(image: Image, boxes: List) -> Image:
+def draw_boxes(image: Image, boxes: List, class_map : Dict) -> Image:
     '''在图像上绘制边界框'''
     image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     for b in boxes:
-        xmin, ymin, xmax, ymax = b[0]
-        label = b[1]
+        xmin, ymin, xmax, ymax = map(int, b["box"])
+        label = class_map[b["class_id"]]
         cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
         cv2.putText(image, label, (xmin, ymin - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
