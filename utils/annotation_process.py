@@ -57,6 +57,74 @@ def iou(a: Box, b: Box) -> float:
     ua = area(a) + area(b) - inter
     return inter / ua if ua > 0 else 0.0
 
+
+# Clip a box to image boundary
+def clip_box(b: Box, img_w: float, img_h: float) -> Box:
+    x1, y1, x2, y2 = b
+    x1 = max(0.0, min(x1, img_w))
+    y1 = max(0.0, min(y1, img_h))
+    x2 = max(0.0, min(x2, img_w))
+    y2 = max(0.0, min(y2, img_h))
+    # ensure valid ordering
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return (x1, y1, x2, y2)
+
+# Expand a box around its center (used to weaken singleton instances)
+def expand_box(b: Box, expand_ratio: float = 1.0, min_expand: float = 2.0, image_size: Tuple[float, float] = None) -> Box:
+    x1, y1, x2, y2 = b
+    w = max(0.0, x2 - x1)
+    h = max(0.0, y2 - y1)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    dw = max(w * expand_ratio, min_expand)
+    dh = max(h * expand_ratio, min_expand)
+    nx1 = cx - (w / 2.0 + dw)
+    ny1 = cy - (h / 2.0 + dh)
+    nx2 = cx + (w / 2.0 + dw)
+    ny2 = cy + (h / 2.0 + dh)
+    out = (nx1, ny1, nx2, ny2)
+    if image_size is not None:
+        img_w, img_h = image_size
+        out = clip_box(out, img_w, img_h)
+    return out
+
+# Post-process singleton weak boxes so that WB is not identical to GT while still satisfying purity
+def weaken_singleton_box(
+    b: Box,
+    target_cls: int,
+    gt: List[LabeledBox],
+    purity_mode: str = 'iou',
+    iou_eps: float = 1e-6,
+    expand_ratio: float = 1.0,
+    min_expand: float = 2.0,
+    max_iter: int = 10,
+    image_size: Tuple[float, float] = None,
+) -> Box:
+    # Try expanded candidates; if purity fails, gradually reduce expansion
+    r = expand_ratio
+    m = min_expand
+    for _ in range(max_iter):
+        cand = expand_box(b, expand_ratio=r, min_expand=m, image_size=image_size)
+        if purity_mode == 'iou':
+            ok = purity_check_iou(cand, target_cls, gt, eps=iou_eps)
+        else:
+            ok = purity_check_center(cand, target_cls, gt)
+        if ok:
+            return cand
+        r *= 0.5
+        m *= 0.5
+    # If no expansion can satisfy purity, return a minimally expanded box (numerical epsilon)
+    eps = 1e-3
+    x1, y1, x2, y2 = b
+    out = (x1 - eps, y1 - eps, x2 + eps, y2 + eps)
+    if image_size is not None:
+        img_w, img_h = image_size
+        out = clip_box(out, img_w, img_h)
+    return out
+
 # Check the purity of a candidate weak box
 def purity_check_center(candidate: Box, target_cls: int, gt: List[LabeledBox]) -> bool:
     """纯度：候选弱框内不允许出现其它类别实例（以中心点落入作为判定）。"""
@@ -80,6 +148,10 @@ def build_weak_boxes(
     gt: List[LabeledBox],   # Ground-truth
     purity_mode: str = "iou",    # Purity check mode: "center" or "iou"
     iou_eps: float = 1e-6,  # IoU threshold
+    weaken_singletons: bool = True,  # whether to weaken singleton instances
+    expand_ratio: float = 1.0,        # expansion ratio for singleton weak boxes
+    expand_min_px: float = 2.0,       # minimum expansion (in pixels) for singleton weak boxes
+    image_size: Tuple[float, float] = None,  # (img_w, img_h)
 ) -> List[WeakBox]:
     # 1. 按类别分组，分别构建弱框
     classes_in_img = sorted({lb["class_id"] for lb in gt})
@@ -96,6 +168,12 @@ def build_weak_boxes(
         n = len(clusters)
         if n == 1:
             wb = union_rect(clusters[0].boxes)
+            if weaken_singletons:
+                wb = weaken_singleton_box(wb, cls, gt, purity_mode=purity_mode, iou_eps=iou_eps,
+                                         expand_ratio=expand_ratio, min_expand=expand_min_px, image_size=image_size)
+            if image_size is not None:
+                img_w, img_h = image_size
+                wb = clip_box(wb, img_w, img_h)
             if purity_mode == 'iou':
                 is_pure = purity_check_iou(wb, cls, gt, eps=iou_eps)
             else:
@@ -119,6 +197,9 @@ def build_weak_boxes(
             for q in range(p + 1, n):
                 rp, rq = rect_cache[p], rect_cache[q]
                 r_pq = union_rect([rp, rq])
+                if image_size is not None:
+                    img_w, img_h = image_size
+                    r_pq = clip_box(r_pq, img_w, img_h)
                 cost = area(r_pq) - area(rp) - area(rq)
                 heapq.heappush(pq, (cost, p, q, version[p], version[q]))
 
@@ -135,6 +216,10 @@ def build_weak_boxes(
             # 尝试合并
             merged_boxes = clusters[p].boxes + clusters[q].boxes
             cand = union_rect(merged_boxes)
+
+            if image_size is not None:
+                img_w, img_h = image_size
+                cand = clip_box(cand, img_w, img_h)
 
             # purity check
             if purity_mode == 'iou':
@@ -159,6 +244,9 @@ def build_weak_boxes(
                 pp, qq = (p, k) if p < k else (k, p)
                 rp, rk = rect_cache[pp], rect_cache[qq]
                 r_pq = union_rect([rp, rk])
+                if image_size is not None:
+                    img_w, img_h = image_size
+                    r_pq = clip_box(r_pq, img_w, img_h)
                 cost = area(r_pq) - area(rp) - area(rk)
                 heapq.heappush(pq, (cost, pp, qq, version[pp], version[qq]))
 
@@ -167,6 +255,12 @@ def build_weak_boxes(
             if not alive[i]:
                 continue
             wb = union_rect(clusters[i].boxes)
+            if weaken_singletons and len(clusters[i].boxes) == 1:
+                wb = weaken_singleton_box(wb, cls, gt, purity_mode=purity_mode, iou_eps=iou_eps,
+                                         expand_ratio=expand_ratio, min_expand=expand_min_px, image_size=image_size)
+            if image_size is not None:
+                img_w, img_h = image_size
+                wb = clip_box(wb, img_w, img_h)
             # 最终 check purity
             if purity_mode == 'iou':
                 is_pure = purity_check_iou(wb, cls, gt, eps=iou_eps)
