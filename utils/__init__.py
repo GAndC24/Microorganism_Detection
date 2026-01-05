@@ -1,2 +1,2 @@
 from .annotation_process import build_weak_boxes
-from .annotation_visualization import parse_voc_xml, draw_boxes
+from .visualizations import parse_voc_xml, draw_boxes
