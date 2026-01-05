@@ -1,10 +1,10 @@
 import xml.etree.ElementTree as ET
 from typing import Dict, Tuple, List, TypedDict
-from dataclasses import dataclass
 from PIL import Image
 import cv2
 import numpy as np
 
+# Annotations visualization for VOC format
 Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
 
 class LabeledBox(TypedDict):
