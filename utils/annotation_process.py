@@ -1,15 +1,17 @@
 # Construct Weak Bounding Boxes
-from typing import List, Tuple, Iterable
+from typing import List, Tuple, Iterable, Dict
+from dataclasses import dataclass, field
 import heapq
 
 Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
-LabeledBox = Tuple[Box, int]              # (box, class_id)
-WeakBox = Tuple[Box, int]                 # (weak_box, class_id)
+LabeledBox = Dict[Box, int]              # {box: class_id}
+WeakBox = Dict[Box, int]                 # {weak_box: class_id}
 
+@dataclass
 class Cluster:
     """一个 cluster 对应同一类别的一组实例框。"""
-    boxes: List[Box]
-    cls: int
+    boxes: List[Box] = field(default_factory=list)
+    cls: int = -1
 
 # Calculate the area of a bounding box
 def area(b: Box) -> float:
@@ -50,34 +52,34 @@ def iou(a: Box, b: Box) -> float:
     return inter / ua if ua > 0 else 0.0
 
 # Check the purity of a candidate weak box
-def purity_check_center(candidate: Box, target_cls: int, gt: List[LabeledBox]) -> bool:
+def purity_check_center(candidate: Box, target_cls: int, gt: LabeledBox) -> bool:
     """纯度：候选弱框内不允许出现其它类别实例（以中心点落入作为判定）。"""
-    for (b, c) in gt:
+    for (b, c) in gt.items():
         if c != target_cls and center_in_rect(b, candidate):
             return False
     return True
 
 # Check the purity of a candidate weak box
-def purity_check_iou(candidate: Box, target_cls: int, gt: List[LabeledBox], eps: float = 1e-6) -> bool:
+def purity_check_iou(candidate: Box, target_cls: int, gt: LabeledBox, eps: float = 1e-6) -> bool:
     """纯度：若候选弱框与其它类别任何实例框 IoU > eps，则视为混入。"""
-    for (b, c) in gt:
+    for (b, c) in gt.items():
         if c != target_cls and iou(candidate, b) > eps:
             return False
     return True
 
 # Build weak bounding boxes from ground-truth labeled boxes
 def build_weak_boxes(
-    gt: List[LabeledBox],   # Ground-truth
+    gt: LabeledBox,   # Ground-truth: {box: class_id}
     purity_mode: str = "iou",    # Purity check mode: "center" or "iou"
     iou_eps: float = 1e-6,  # IoU threshold
-) -> List[WeakBox]:
+) -> WeakBox:
     # 1. 按类别分组，分别构建弱框
-    classes_in_img = sorted({c for (_, c) in gt})
-    weak_boxes: List[WeakBox] = []
+    classes_in_img = sorted(set(gt.values()))
+    weak_boxes: WeakBox = {}
 
     for cls in classes_in_img:
         # 2. 初始化：每个同类实例框作为一个 cluster
-        init_boxes = [b for (b, c) in gt if c == cls]
+        init_boxes = [b for (b, c) in gt.items() if c == cls]
         if not init_boxes:
             continue
 
@@ -87,12 +89,12 @@ def build_weak_boxes(
         if n == 1:
             wb = union_rect(clusters[0].boxes)
             if purity_mode == 'iou':
-                is_pure = purity_check_iou(wb, cls)
+                is_pure = purity_check_iou(wb, cls, gt, eps=iou_eps)
             else:
-                is_pure = purity_check_center(wb, cls)
+                is_pure = purity_check_center(wb, cls, gt)
             if not is_pure:    # 极端情况下（其他类中心点恰好在该框内），跳过
                 pass
-            weak_boxes.append((wb, cls))
+            weak_boxes[wb] = cls
             continue
 
         # 3. min priority PQ: (cost, p, q, ver_p, ver_q)
@@ -164,7 +166,7 @@ def build_weak_boxes(
                 is_pure = purity_check_center(wb, cls, gt)
             if not is_pure:
                 raise RuntimeError(f"Purity violated in final weak box for class={cls}")
-            weak_boxes.append((wb, cls))
+            weak_boxes[wb] = cls
 
     return weak_boxes
 

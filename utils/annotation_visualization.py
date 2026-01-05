@@ -4,8 +4,11 @@ from PIL import Image
 import cv2
 import numpy as np
 
+Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
+LabeledBox = Dict[Box, int]              # (box, class_id)
+
 # read the VOC XML annotation file
-def parse_voc_xml(xml_path: str) -> Tuple[Dict, List]:
+def parse_voc_xml(xml_path: str, class_map : Dict) -> Tuple[Dict, List[LabeledBox]]:
     '''读取 VOC XML 标注文件并返回 image_info 和 boxes'''
     tree = ET.parse(xml_path)
     root = tree.getroot()
@@ -24,15 +27,18 @@ def parse_voc_xml(xml_path: str) -> Tuple[Dict, List]:
         label = obj.find("name").text
         bndbox = obj.find("bndbox")
 
-        xmin = int(bndbox.find("xmin").text)
-        ymin = int(bndbox.find("ymin").text)
-        xmax = int(bndbox.find("xmax").text)
-        ymax = int(bndbox.find("ymax").text)
+        class_id = class_map[label]
 
-        boxes.append({
-            "label": label,
-            "bbox": [xmin, ymin, xmax, ymax]
-        })
+        xmin = float(bndbox.find("xmin").text)
+        ymin = float(bndbox.find("ymin").text)
+        xmax = float(bndbox.find("xmax").text)
+        ymax = float(bndbox.find("ymax").text)
+
+        gt : LabeledBox = {
+            "box" : (xmin, ymin, xmax, ymax),
+            "class_id" : class_id
+        }
+        boxes.append(gt)
 
     return image_info, boxes
 
@@ -41,8 +47,8 @@ def draw_boxes(image: Image, boxes: List) -> Image:
     '''在图像上绘制边界框'''
     image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     for b in boxes:
-        xmin, ymin, xmax, ymax = b["bbox"]
-        label = b["label"]
+        xmin, ymin, xmax, ymax = b[0]
+        label = b[1]
         cv2.rectangle(image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
         cv2.putText(image, label, (xmin, ymin - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
