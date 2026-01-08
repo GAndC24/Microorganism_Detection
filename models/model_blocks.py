@@ -75,7 +75,7 @@ class CAMHead(nn.Module):
         :param x: RoI feature maps, [R, C, H, W]
         :param y: weak box labels, [R, num_classes]
         :return:
-        - CAMs, [B, num_classes, H, W]
+        - CAMs, [R, num_classes, H, W]
         - CAM loss, {loss_name: loss}
         """
         # get CAMs
@@ -226,6 +226,33 @@ class MorphologicalPrototypeGenerator(nn.Module):
 
         return torch.Tensor(anchor_feature).to(patch_features.device)
 
+    def _get_morphological_prototypes(
+        self,
+        patch_features : torch.Tensor,      # [R, Np, D]
+        weights : torch.Tensor,    # [R, Np]
+        eps: float = 1e-6,
+        normalize_proto: bool = True
+    )-> Dict[int, torch.Tensor]:
+        """
+        :return: prototypes, {class_id: prototype tensor}
+        """
+        # 扩维以便广播：
+        y_ = self.wb_labels[:, :, None, None]  # [R, num_classes, 1, 1]
+        w_ = weights[:, None, :, None]  # [R, 1, Np, 1]
+        f_ = patch_features[:, None, :, :]  # [R, 1, Np, D]
+
+        numerator = (y_ * w_ * f_).sum(dim=(0, 2))  # sum over r and p => [num_classes, D]
+        denom = (y_ * w_).sum(dim=(0, 2))  # [num_classes, 1]
+
+        prototypes = numerator / (denom + eps)  # [num_classes, D]
+        if normalize_proto:
+            prototypes = F.normalize(prototypes, p=2, dim=-1)
+
+        proto_dict : Dict[int, torch.Tensor] = {}
+        for class_id in range(self.num_classes):
+            proto_dict[class_id] = prototypes[class_id]
+
+        return proto_dict
 
 
     def forward(self, x : torch.Tensor)-> Dict[int, torch.Tensor]:
@@ -235,16 +262,16 @@ class MorphologicalPrototypeGenerator(nn.Module):
         """
 
         # RoI Align to get weak box features
-        roi_features = self.roi_align(x, self.wboxes)
+        roi_features = self.roi_align(x, self.wboxes)       # [R = num_wboxes, C, H, W]
 
         # get CAMs
-        cams, loss_cam = self.cam_head(roi_features, self.wb_labels)
+        cams, loss_cam = self.cam_head(roi_features, self.wb_labels)        # cams, [R, num_classes, H, W]
 
         # patch embedding
-        patch_features = self.patch_embed(roi_features)
+        patch_features = self.patch_embed(roi_features)     # [R, Np = num_patches, D]
 
         # get fg/bg scores for each patch
-        patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams)
+        patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams)      # [R, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
 
         # get anchor feature of each weak box
         R, Np, D = patch_features.shape
@@ -254,12 +281,17 @@ class MorphologicalPrototypeGenerator(nn.Module):
             patch_fg_bg_score = patch_fg_bg_scores[i]
             anchor_feature = self._get_anchor_features(patch_feature, patch_fg_bg_score)
             anchor_features_list.append(anchor_feature)
-        anchor_features = torch.stack(anchor_features_list, dim=0)
+        anchor_features = torch.stack(anchor_features_list, dim=0)      # [R, D]
 
+        # compute patch weights(similarity)
+        patch_features = F.normalize(patch_features, p=2, dim=-1)
+        anchor_features = F.normalize(anchor_features, p=2, dim=-1)
+        weights = (patch_features * anchor_features.unsqueeze(1)).sum(dim=-1)  # [R, Np]
 
+        # get morphological prototypes
+        prototypes = self._get_morphological_prototypes(patch_features, weights)        # {class_id : prototype tensor}
 
-
-
+        return prototypes
 
 # Build backbone hook
 def build_backbone_hook(backbone : nn.Module, indices : List[int]) -> FeatureHook:
