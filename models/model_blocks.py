@@ -261,26 +261,26 @@ class MorphologicalPrototypeGenerator(nn.Module):
 
 
 
-# Build backbone hooker
-def build_backbone_hooker(backbone : nn.Module, indices : List[int]) -> FeatureHook:
+# Build backbone hook
+def build_backbone_hook(backbone : nn.Module, indices : List[int]) -> FeatureHook:
     """
     :param backbone: Default VGG-16 backbone
     :param indices: feature layer indices
     :return: FeatureHook object
     """
-    hooker = FeatureHook()
+    hook = FeatureHook()
     for idx, tag in zip(indices, ['low', 'mid', 'high']):
         module = backbone.features[idx]
-        hooker.register(module, tag)
-    return hooker
+        hook.register(module, tag)
+    return hook
 
-# Build VGG-16 backbone with hooker
-def build_vgg16_backbone_with_hooker(indices : List[int]) -> Tuple[nn.Module, FeatureHook]:
+# Build VGG-16 backbone with hook
+def build_vgg16_backbone_with_hook(indices : List[int]) -> Tuple[nn.Module, FeatureHook]:
     """
     :return: VGG-16 backbone and FeatureHook object
     """
     # Load default VGG-16 backbone
     backbone = vgg16(pretrained=True)
     # Build backbone hooker
-    hooker = build_backbone_hooker(backbone, indices)
-    return backbone, hooker
+    hook = build_backbone_hook(backbone, indices)
+    return backbone, hook
