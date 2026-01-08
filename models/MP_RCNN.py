@@ -64,7 +64,7 @@ class Stage1(nn.Module):
 
         self.apply(self._init_weights)
 
-    def _init_weights(self, m):
+    def _init_weights(self, m)->None:
         """
         Initialize weights for Linear and BatchNorm layers.
         :param m: Module to initialize
@@ -116,7 +116,7 @@ class Stage1(nn.Module):
         return low_latent_features, high_feature_maps, high_embedding_features, prototypes
 
 
-def build_Stage1(
+def build_Stage1_model(
     num_classes: int,    # number of classes
     embed_dim: int,  # embedding dimension
     # for hook
