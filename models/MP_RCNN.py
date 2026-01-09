@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, List, Dict
 from model_blocks import MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook
+from dataclasses import dataclass
 
 # VGG-16 layer output channel maps, {layer index : output channels}
 vgg_layer_out_c_maps = {
@@ -116,50 +117,53 @@ class Stage1(nn.Module):
         return low_latent_features, high_feature_maps, high_embedding_features, prototypes
 
 
-def build_Stage1_model(
-    num_classes: int,    # number of classes
-    embed_dim: int,  # embedding dimension
-    # for hook
-    layer_indices: List[int],     # feature layer indices, [low, mid, high]
+@dataclass
+class Stage1Config:
+    num_classes: int  # number of classes
+    embed_dim: int  # embedding dimension
+    img_size: Tuple[int, int]  # input image size
+    batch_size: int  # batch size
+    hidden_dim: int  # MLP hidden dimension
     # for mp_generator
-    in_c : int,      # input channels
-    wb_labels: torch.Tensor,  # class label for weak boxes, [R, num_classes]
-    patch_size : int,       # patch size
-    components_range : List,   # list of number of components for GMM
-    random_state : int,     # random state for GMM(seed)
-    max_iter : int,     # max iteration for EM
-    wboxes : torch.Tensor,      # weak boxes, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
-    roi_out_size: Tuple[int, int],  # output size
-    # for Stage1
-    img_size: Tuple[int, int],  # input image size
-    batch_size: int,        # batch size
-    hidden_dim : int = 4096,     # MLP hidden dimension
+    in_c: int  # input channels
+    wb_labels: torch.Tensor  # class label for weak boxes, [R, num_classes]
+    patch_size: int  # patch size
+    components_range: List  # list of number of components for GMM
+    random_state: int  # random state for GMM(seed)
+    max_iter: int  # max iteration for EM
+    wboxes: torch.Tensor  # weak boxes, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+    roi_out_size: Tuple[int, int]  # output size
+
+
+def build_Stage1_model(
+    stage1_config: Stage1Config,        # Stage1 configuration
+    layer_indices: List[int],     # feature layer indices, [low, mid, high]
 )-> nn.Module:
     backbone, hook = build_vgg16_backbone_with_hook(layer_indices)
 
     mp_generator = MorphologicalPrototypeGenerator(
-        num_classes=num_classes,
-        in_c=in_c,
-        wb_labels=wb_labels,
-        patch_size=patch_size,
-        embed_dim=embed_dim,
-        components_range=components_range,
-        random_state=random_state,
-        max_iter=max_iter,
-        wboxes=wboxes,
-        roi_out_size=roi_out_size
+        num_classes=stage1_config.num_classes,
+        in_c=stage1_config.in_c,
+        wb_labels=stage1_config.wb_labels,
+        patch_size=stage1_config.patch_size,
+        embed_dim=stage1_config.embed_dim,
+        components_range=stage1_config.components_range,
+        random_state=stage1_config.random_state,
+        max_iter=stage1_config.max_iter,
+        wboxes=stage1_config.wboxes,
+        roi_out_size=stage1_config.roi_out_size
     )
 
     model = Stage1(
         backbone=backbone,
         hook=hook,
         mp_generator=mp_generator,
-        num_classes=num_classes,
-        img_size=img_size,
-        batch_size=batch_size,
+        num_classes=stage1_config.num_classes,
+        img_size=stage1_config.img_size,
+        batch_size=stage1_config.batch_size,
         layer_indices=layer_indices,
-        embed_dim=embed_dim,
-        hidden_dim=hidden_dim
+        embed_dim=stage1_config.embed_dim,
+        hidden_dim=stage1_config.hidden_dim
     )
 
     return model
