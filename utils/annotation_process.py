@@ -1,7 +1,10 @@
 # Construct Weak Bounding Boxes
-from typing import List, Tuple, Iterable, TypedDict
+from typing import List, Tuple, Iterable, TypedDict, Dict, Optional
 import heapq
 from dataclasses import dataclass
+import xml.etree.ElementTree as ET
+import os
+
 
 Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
 
@@ -56,7 +59,6 @@ def iou(a: Box, b: Box) -> float:
         return 0.0
     ua = area(a) + area(b) - inter
     return inter / ua if ua > 0 else 0.0
-
 
 # Clip a box to image boundary
 def clip_box(b: Box, img_w: float, img_h: float) -> Box:
@@ -268,6 +270,142 @@ def build_weak_boxes(
                 is_pure = purity_check_center(wb, cls, gt)
             if not is_pure:
                 raise RuntimeError(f"Purity violated in final weak box for class={cls}")
+                # return []
             weak_boxes.append({"box": wb, "class_id": cls})
 
     return weak_boxes
+
+# read the VOC XML annotation file
+def parse_voc_xml(xml_path: str, class_map : Dict) -> Tuple[Dict, List[LabeledBox]]:
+    '''读取 VOC XML 标注文件并返回 image_info 和 boxes'''
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    # 读取 image_info
+    size = root.find("size")
+    image_info = {
+        "width": int(size.find("width").text),
+        "height": int(size.find("height").text),
+        "depth": int(size.find("depth").text),
+    }
+
+    # 读取 boxes
+    boxes = []
+    for obj in root.findall("object"):
+        label = obj.find("name").text
+        bndbox = obj.find("bndbox")
+
+        class_id = class_map[label]
+
+        xmin = float(bndbox.find("xmin").text)
+        ymin = float(bndbox.find("ymin").text)
+        xmax = float(bndbox.find("xmax").text)
+        ymax = float(bndbox.find("ymax").text)
+
+        gt : LabeledBox = {
+            "box" : (xmin, ymin, xmax, ymax),
+            "class_id" : class_id
+        }
+        boxes.append(gt)
+
+    return image_info, boxes
+
+# Indent XML for pretty printing
+def _indent_xml(elem: ET.Element, level: int = 0) -> None:
+    """让 ElementTree 输出更美观（带缩进换行）。"""
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        for child in elem:
+            _indent_xml(child, level + 1)
+        if not child.tail or not child.tail.strip():
+            child.tail = i
+    if level and (not elem.tail or not elem.tail.strip()):
+        elem.tail = i
+
+# Save the weak boxes to VOC XML annotation file
+def save_weak_boxes_as_voc_xml(
+    xml_save_path: str,     # output xml path
+    image_info: Dict,       # at least include {"width": int, "height": int, "depth": int}
+    weak_boxes: List[dict],                 # List[WeakBox]
+    id2class: Dict[int, str],               # {class_id : class_name}
+    filename: Optional[str] = None,     # xml <filename>
+    folder: Optional[str] = None,       # xml <folder>
+    path: Optional[str] = None,     # xml <path>
+    database: str = None,      # xml <database>
+    segmented: int = 0,     # xml <segmented>
+    clip: bool = True,      # whether to clip boxes to image boundary
+) -> None:
+    w = int(image_info["width"])
+    h = int(image_info["height"])
+    d = int(image_info.get("depth", 3))
+
+    if filename is None:
+        filename = os.path.splitext(os.path.basename(xml_save_path))[0] + ".jpg"
+    if folder is None:
+        folder = ""
+    if path is None:
+        path = filename
+
+    root = ET.Element("annotation")
+
+    ET.SubElement(root, "folder").text = str(folder)
+    ET.SubElement(root, "filename").text = str(filename)
+    ET.SubElement(root, "path").text = str(path)
+
+    source = ET.SubElement(root, "source")
+    ET.SubElement(source, "database").text = str(database)
+
+    size = ET.SubElement(root, "size")
+    ET.SubElement(size, "width").text = str(w)
+    ET.SubElement(size, "height").text = str(h)
+    ET.SubElement(size, "depth").text = str(d)
+
+    ET.SubElement(root, "segmented").text = str(int(segmented))
+
+    for wb in weak_boxes:
+        cls_id = int(wb["class_id"])
+        cls_name = id2class.get(cls_id, str(cls_id))
+
+        x1, y1, x2, y2 = wb["box"]
+
+        # 裁剪到图像边界
+        if clip:
+            x1 = max(0.0, min(float(x1), float(w)))
+            y1 = max(0.0, min(float(y1), float(h)))
+            x2 = max(0.0, min(float(x2), float(w)))
+            y2 = max(0.0, min(float(y2), float(h)))
+
+        # 保证坐标顺序正确
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+
+        xmin = int(round(x1))
+        ymin = int(round(y1))
+        xmax = int(round(x2))
+        ymax = int(round(y2))
+
+        xmin = max(0, min(xmin, w))
+        ymin = max(0, min(ymin, h))
+        xmax = max(0, min(xmax, w))
+        ymax = max(0, min(ymax, h))
+
+        obj = ET.SubElement(root, "object")
+        ET.SubElement(obj, "name").text = str(cls_name)
+        ET.SubElement(obj, "pose").text = "Unspecified"
+        ET.SubElement(obj, "truncated").text = "0"
+        ET.SubElement(obj, "difficult").text = "0"
+
+        bndbox = ET.SubElement(obj, "bndbox")
+        ET.SubElement(bndbox, "xmin").text = str(xmin)
+        ET.SubElement(bndbox, "ymin").text = str(ymin)
+        ET.SubElement(bndbox, "xmax").text = str(xmax)
+        ET.SubElement(bndbox, "ymax").text = str(ymax)
+
+    _indent_xml(root)
+    tree = ET.ElementTree(root)
+    os.makedirs(os.path.dirname(xml_save_path), exist_ok=True)
+    tree.write(xml_save_path, encoding="utf-8", xml_declaration=True)
