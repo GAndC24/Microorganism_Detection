@@ -255,7 +255,7 @@ class MorphologicalPrototypeGenerator(nn.Module):
         return proto_dict
 
 
-    def forward(self, x : torch.Tensor)-> Dict[int, torch.Tensor]:
+    def forward(self, x : torch.Tensor)-> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
         """
         :param x: middle feature maps, [B, C, H, W]
         :return: prototypes, {class_id: prototype tensor}
@@ -291,7 +291,7 @@ class MorphologicalPrototypeGenerator(nn.Module):
         # get morphological prototypes
         prototypes = self._get_morphological_prototypes(patch_features, weights)        # {class_id : prototype tensor}
 
-        return prototypes
+        return loss_cam, prototypes
 
 # Build backbone hook
 def build_backbone_hook(backbone : nn.Module, indices : List[int]) -> FeatureHook:

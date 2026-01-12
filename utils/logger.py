@@ -7,9 +7,9 @@ class Logger:
     def __init__(
         self,
         model_name : str,
-        trainer_config : dict,      # training configuration
-        root : str = './logs',      # log root path
-        continue_existing : str = None   # continue existing logs
+        trainer_config : dict = None,      # training configuration
+        continue_existing: str = None,  # continue existing logs
+        root : str = './logs'      # log root path
     )-> None:
         if continue_existing is None:       # new training
             # create log directory
@@ -37,6 +37,10 @@ class Logger:
         else:       # continue existing logs
             self.log_dir = os.path.join(root, continue_existing)
             self.log_file_path = os.path.join(self.log_dir, "train_log.txt")
+            with open(self.log_file_path, 'a') as log_file:
+                log_file.write(f"--------------------Continue train {model_name}-------------------\n"
+                               f"Continue Time: {datetime.now()}\n"
+                               "\n")
             self.config_file_path = os.path.join(self.log_dir, "train_config.json")
             self.metrics_file_path = os.path.join(self.log_dir, "training_metrics.jsonl")
 
@@ -46,8 +50,12 @@ class Logger:
     def add_info(self, info : str)-> None:
         with open(self.log_file_path, 'a') as log_file:
             log_file.write(f"{info}")
+        print(f"Log info: {info}")
 
     def add_metrics(self, metrics : dict)-> None:
         with open(self.metrics_file_path, 'a') as metrics_file:
             json.dump(metrics, metrics_file)
             metrics_file.write("\n")
+        print("Train metrics:\n")
+        for k, v in metrics.items():
+            print(f"{k}: {v}")

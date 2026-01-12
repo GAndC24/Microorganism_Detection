@@ -67,7 +67,7 @@ class UrinarySedimentDataset(Dataset):
             "boxes" : torch.tensor(boxes, dtype=torch.float32),    # [N, 4]
             "labels" : torch.tensor(labels, dtype=torch.int64),  # [N]
             "image_id" : torch.tensor([idx], dtype=torch.int64),
-            "image_size" : (image_info['width'], image_info['height']),
+            # "image_size" : (image_info['width'], image_info['height']),
         }
 
         if self.transforms is not None:

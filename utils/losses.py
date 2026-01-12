@@ -1,5 +1,5 @@
 """
-Part of this code is adapted and modified from the official implementation of:
+Copyright：Part of this code is adapted and modified from the official implementation of:
 MuSCLe: A Multi-Strategy Contrastive Learning Framework for Weakly Supervised Semantic Segmentation
 GitHub repository: https://github.com/SCoulY/MuSCLe
 """
