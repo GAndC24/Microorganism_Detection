@@ -3,27 +3,9 @@ import torch
 import torch.nn as nn
 from typing import Tuple, List, Dict
 from dataclasses import dataclass
-from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook
+from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps
 from torchvision.ops import RoIAlign
 
-# VGG-16 layer output channel maps, {layer index : output channels}
-vgg_layer_out_c_maps = {
-    3 : 64,     # Relu1_2
-    8 : 128,    # Relu2_2
-    15 : 256,   # Relu3_3
-    22 : 512,   # Relu4_3
-    29 : 512,    # Relu5_3
-    30 : 512   # MaxPool5
-}
-# VGG-16 layer output size ratio maps, {layer index : output size ratio}
-vgg_layer_out_size_ratio_maps = {
-    3 : 1.0,      # Relu1_2, (H, W)
-    8 : 1/2,      # Relu2_2, (H/2, W/2)
-    15 : 1/4,     # Relu3_3, (H/4, W/4)
-    22 : 1/8,    # Relu4_3, (H/8, W/8)
-    29 : 1/16,     # Relu5_3, (H/16, W/16)
-    30 : 1/32    # MaxPool5, (H/32, W/32)
-}
 
 @dataclass
 class Stage1Config:
@@ -136,10 +118,10 @@ class Stage1(nn.Module):
         high_feature_maps = feature_maps['high']        # [B, C3, H3, W3]
 
         # -----get low-level latent features-----
-        low_latent_features = self.gap_l(low_feature_maps)    # [B, C1, 1, 1]
+        low_latent_features = self.gap_l(low_feature_maps)  # [B, C1, 1, 1]
         B, C1, _, _ = low_latent_features.shape
         low_latent_features = low_latent_features.view(B, C1)
-        low_latent_features = self.bn_l(low_latent_features)        # [B, C1]
+        low_latent_features = self.bn_l(low_latent_features)  # [B, C1]
 
         # -----get high-level embedding features-----
         # RoI Align to get weak box features

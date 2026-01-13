@@ -7,44 +7,91 @@ import torch
 from enum import Enum
 from dataclasses import dataclass
 from typing import Tuple, Optional
+import torch.nn.functional as F
 
 # -----Image Contrastive Loss-----
-def get_img_contrast_loss(emb : torch.Tensor, label : torch.Tensor)->torch.Tensor:
+def get_img_contrast_loss(emb : torch.Tensor, label : torch.Tensor, tau : float = 0.1, eps : float = 1e-6)->torch.Tensor:
     '''
     get the loss_img
     :param emb: embedding features, [B, D]
     :param label: multi-hot labels, [B, num_classes]
     :return: loss_img
     '''
-    loss_img = 0
-    batch_size = emb.shape[0]
+    # loss_img = 0
+    # batch_size = emb.shape[0]
+    #
+    # # 每个样本作为 anchor
+    # for i in range(batch_size):
+    #     sim_pos = 1e-6
+    #     sim_neg = 1e-6
+    #     neg_list = range(i + 1, batch_size)
+    #     valid_pos = 0
+    #     valid_neg = 0
+    #
+    #     # 构造正负样本对
+    #     for j in neg_list:
+    #         if torch.bitwise_and(label[i].long(), label[j].long()).sum() > 0:       # 有共同类别，正样本对
+    #             sim_pos = sim_pos + torch.exp((emb[i] * emb[j]).sum() / 0.1)
+    #             valid_pos += 1
+    #         if torch.bitwise_and(label[i].long(), label[j].long()).sum() == 0:      # 无共同类别，负样本对
+    #             sim_neg = sim_neg + torch.exp((emb[i] * emb[j]).sum() / 0.1)
+    #             valid_neg += 1
+    #     if torch.is_tensor(sim_pos) and torch.is_tensor(sim_neg) and valid_neg > valid_pos:
+    #         sim_pos = sim_pos
+    #         sim_neg = sim_pos + sim_neg
+    #         loss_img = loss_img - torch.log(sim_pos / sim_neg)
+    #     else:
+    #         del sim_neg
+    #         del sim_pos
+    #
+    # loss_img /= batch_size
+    # return loss_img
 
-    # 每个样本作为 anchor
-    for i in range(batch_size):
-        sim_pos = 1e-6
-        sim_neg = 1e-6
-        neg_list = range(i + 1, batch_size)
-        valid_pos = 0
-        valid_neg = 0
+    emb = F.normalize(emb, dim=-1, eps=eps)
+    B = emb.size(0)
 
-        # 构造正负样本对
-        for j in neg_list:
-            if torch.bitwise_and(label[i].long(), label[j].long()).sum() > 0:
-                sim_pos = sim_pos + torch.exp((emb[i] * emb[j]).sum() / 0.1)
-                valid_pos += 1
-            if torch.bitwise_and(label[i].long(), label[j].long()).sum() == 0:
-                sim_neg = sim_neg + torch.exp((emb[i] * emb[j]).sum() / 0.1)
-                valid_neg += 1
-        if torch.is_tensor(sim_pos) and torch.is_tensor(sim_neg) and valid_neg > valid_pos:
-            sim_pos = sim_pos
-            sim_neg = sim_pos + sim_neg
-            loss_img = loss_img - torch.log(sim_pos / sim_neg)
-        else:
-            del sim_neg
-            del sim_pos
+    # pairwise logits: [B, B]
+    logits = emb @ emb.t() / tau
 
-    loss_img /= batch_size
-    return loss_img
+    # 不用自己 exp，后续用 logsumexp
+    loss_sum = emb.new_tensor(0.0)
+    valid_i = 0
+
+    for i in range(B):
+        # j > i 和你原始一致（避免重复计数）
+        js = torch.arange(i + 1, B, device=emb.device)
+
+        if js.numel() == 0:
+            continue
+
+        li = label[i]
+        lj = label[js]
+
+        pos_mask = (lj == li).all(dim=-1)  # 和你原实现一致
+        neg_mask = (li.long() & lj.long()).sum(dim=-1) == 0
+
+        pos_js = js[pos_mask]
+        neg_js = js[neg_mask]
+
+        if pos_js.numel() == 0 or neg_js.numel() == 0:
+            continue
+
+        # log numerator = logsumexp(logits[i, pos_js])
+        log_num = torch.logsumexp(logits[i, pos_js], dim=0)
+
+        # log denominator = logsumexp(concat(pos, neg))
+        denom_js = torch.cat([pos_js, neg_js], dim=0)
+        log_den = torch.logsumexp(logits[i, denom_js], dim=0)
+
+        loss_i = -(log_num - log_den)
+        loss_sum = loss_sum + loss_i
+        valid_i += 1
+
+    if valid_i == 0:
+        # 避免 0/0；也可以直接 return 0
+        return emb.new_tensor(0.0)
+
+    return loss_sum / valid_i
 
 # -----Weak Bounding Box Contrastive Loss-----
 # Default All Views
