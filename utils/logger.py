@@ -59,3 +59,9 @@ class Logger:
         print("Train metrics:\n")
         for k, v in metrics.items():
             print(f"{k}: {v}")
+
+    def end_train(self)-> None:
+        with open(self.log_file_path, 'a') as log_file:
+            log_file.write(f"--------------------End train-------------------\n"
+                           f"End Time: {datetime.now()}\n"
+                           "\n")

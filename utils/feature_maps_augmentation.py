@@ -26,7 +26,7 @@ def random_masking(
 # Add Gaussian Noise
 def add_gaussian_noise(
     roi_feat: torch.Tensor,     # [N, C, H, W]
-    sigma: float = 0.5        # standard deviation of the Gaussian noise, [0.01, 0.1]
+    sigma: float = 0.05        # standard deviation of the Gaussian noise, [0.01, 0.1]
 ) -> torch.Tensor:
     ''':return: noisy_roi_feat : [N, C, H, W]'''
     # Sample Gaussian noise

@@ -1,9 +1,10 @@
 import os
-from typing import Callable, Dict, List, Optional, Tuple, Any, TypedDict
+from typing import Callable, Dict, List, Optional, Tuple, Any
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
 from utils import parse_voc_xml
+from torchvision import tv_tensors
 
 Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
 
@@ -53,7 +54,8 @@ class UrinarySedimentDataset(Dataset):
         if not os.path.isfile(xml_path):
             raise FileNotFoundError(f"Annotation not found: {xml_path}")
 
-        image = Image.open(img_path).convert("RGB")
+        image_pil = Image.open(img_path).convert("RGB")
+        W, H = image_pil.size  # PIL: (W, H)
 
         image_info, wbs = parse_voc_xml(xml_path, class_map_encoding)
 
@@ -63,11 +65,19 @@ class UrinarySedimentDataset(Dataset):
             boxes.append(wb['box'])
             labels.append(wb['class_id'])
 
-        target = {
-            "boxes" : torch.tensor(boxes, dtype=torch.float32),    # [N, 4]
-            "labels" : torch.tensor(labels, dtype=torch.int64),  # [N]
-            "image_id" : torch.tensor([idx], dtype=torch.int64),
-            # "image_size" : (image_info['width'], image_info['height']),
+        boxes_tensor = torch.tensor(boxes, dtype=torch.float32)  # [N,4]
+        labels_tensor = torch.tensor(labels, dtype=torch.int64)  # [N]
+
+        image = tv_tensors.Image(image_pil)
+        boxes_tv = tv_tensors.BoundingBoxes(
+            boxes_tensor,
+            format="XYXY",
+            canvas_size=(H, W)
+        )
+        target: Dict[str, Any] = {
+            "boxes": boxes_tv,
+            "labels": labels_tensor,
+            "image_id": torch.tensor([idx], dtype=torch.int64),
         }
 
         if self.transforms is not None:
