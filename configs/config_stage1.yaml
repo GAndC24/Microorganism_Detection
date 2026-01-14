@@ -26,7 +26,7 @@ stage1_trainer_config:
   epochs: 25
   lr: 0.001
   warm_up_lr_factor: 0.01    # min_lr = warm_up_lr_factor * lr
-  warmup_epochs: 5    # 1/10 epochs
+  warmup_epochs: 3    # 1/10 epochs
   weight_decay: 0.05    # [0.05, 0.1]
   checkpoints_save_path: "./checkpoints/stage1/"
   model_save_path: "./results/model_weights/"
