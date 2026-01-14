@@ -13,7 +13,7 @@ class Stage1TrainerConfig:
     device: torch.device  # "cpu" or "cuda"
     epochs: int
     lr: float  # base lr
-    min_lr: float  # min lr
+    warm_up_lr_factor: float  # min_lr = warm_up_lr_factor * lr
     warmup_epochs: int
     weight_decay: float
     checkpoints_save_path: str
@@ -23,6 +23,7 @@ class Stage1TrainerConfig:
     checkpoint_path: str = None
     w_img_loss : float = 0.5    # weight for image contrast loss
     w_wbb_loss : float = 0.5    # weight for weak box contrast loss
+    w_cam_loss : float = 0.5    # weight for cam loss
     mp_ema_alpha: float = 0.9   # ema alpha for updating prototypes, [0.9, 0.99]
 
 def _build_image_multi_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> torch.Tensor:
@@ -82,6 +83,7 @@ class Stage1Trainer:
         self.wbb_loss_config = wbb_loss_config
         self.w_img_loss = config.w_img_loss
         self.w_wbb_loss = config.w_wbb_loss
+        self.w_cam_loss = config.w_cam_loss
         self.mp_ema_alpha = config.mp_ema_alpha
 
         self.device = config.device
@@ -97,22 +99,30 @@ class Stage1Trainer:
             self.optimizer,
             schedulers=[
                 # Linear warm‑up
-                LinearLR(self.optimizer, start_factor=self.config.lr * 0.01, end_factor=1.0,
-                         total_iters=self.config.warmup_epochs),
+                LinearLR(self.optimizer, start_factor=self.config.warm_up_lr_factor, end_factor=1.0),
                 # cosine decay
                 CosineAnnealingLR(self.optimizer, T_max=self.config.epochs - self.config.warmup_epochs,
-                                  eta_min=self.config.lr * 1e-2)
+                                  eta_min=self.config.lr * self.config.warm_up_lr_factor)
             ],
             milestones=[self.config.warmup_epochs]
         )
 
         self.start_epoch = 1
         trainer_config = {
+            'num_classes' : self.config.num_classes,
+            'device': str(self.config.device),
             'epochs': self.config.epochs,
             'lr': self.config.lr,
-            'min_lr': self.config.min_lr,
+            'min_lr': self.config.lr * self.config.warm_up_lr_factor,
             'warmup_epochs': self.config.warmup_epochs,
             'weight_decay': self.config.weight_decay,
+            'checkpoints_save_path': self.config.checkpoints_save_path,
+            'model_save_path': self.config.model_save_path,
+            'dataset_mps_save_path': self.config.dataset_mps_save_path,
+            'w_img_loss' : self.w_img_loss,
+            'w_wbb_loss' : self.w_wbb_loss,
+            'w_cam_loss' : self.w_cam_loss,
+            'mp_ema_alpha' : self.mp_ema_alpha
         }
         self.logger = Logger(model_name="Stage1", trainer_config=trainer_config)
         self.log_path = self.logger.get_log_dir()
@@ -199,7 +209,7 @@ class Stage1Trainer:
             loss_img = get_img_contrast_loss(low_latent_features, img_multi_hot_labels)
             loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.wbb_loss_config)
             loss_MFHA = self.w_img_loss * loss_img + self.w_wbb_loss * loss_wbb
-            loss = loss_MFHA + loss_cam
+            loss = loss_MFHA + self.w_cam_loss * loss_cam
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -208,16 +218,16 @@ class Stage1Trainer:
 
             self._update_dataset_mps_ema(prototypes)
 
-            epoch_total_loss += (loss_MFHA.item() + loss_cam.item())
+            epoch_total_loss += loss.item()
             epoch_img_loss += loss_img.item()
             epoch_wbb_loss += loss_wbb.item()
             epoch_MFHA_loss += loss_MFHA.item()
             epoch_cam_loss += loss_cam.item()
 
             pbar.set_postfix({
-                "Iter Loss: Total": f"{(loss_MFHA.item() + loss_cam.item()):.4f} ",
+                "Iter Loss: Total": f"{loss.item():.4f} ",
                 "MFHA": f"{loss_MFHA.item():.4f} ",
-                "CAM": f"{loss_cam.item():.4f} ",
+                "CAM": f"{loss_cam.item():.4f}\n",
                 "img": f"{loss_img.item():.4f} ",
                 "wbb": f"{loss_wbb.item():.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",

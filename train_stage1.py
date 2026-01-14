@@ -132,7 +132,7 @@ def main()-> None:
     stage1_trainer_config = config["stage1_trainer_config"]
     epochs = stage1_trainer_config["epochs"]
     lr = stage1_trainer_config["lr"]
-    min_lr = stage1_trainer_config["min_lr"]
+    warm_up_lr_factor = stage1_trainer_config["warm_up_lr_factor"]
     warmup_epochs = stage1_trainer_config["warmup_epochs"]
     weight_decay = stage1_trainer_config["weight_decay"]
     checkpoints_save_path = stage1_trainer_config["checkpoints_save_path"]
@@ -142,12 +142,13 @@ def main()-> None:
     checkpoint_path = stage1_trainer_config["checkpoint_path"]
     w_img_loss = stage1_trainer_config["w_img_loss"]
     w_wbb_loss = stage1_trainer_config["w_wbb_loss"]
+    w_cam_loss = stage1_trainer_config["w_cam_loss"]
     mp_ema_alpha = stage1_trainer_config["mp_ema_alpha"]
     print(
         "-----Stage 1 Trainer Configurations-----\n"
         f"  Epochs: {epochs}\n"
         f"  Learning Rate: {lr}\n"
-        f"  Min Learning Rate: {min_lr}\n"
+        f"  Min Learning Rate: {lr * warm_up_lr_factor}\n"
         f"  Warmup Epochs: {warmup_epochs}\n"
         f"  Weight Decay: {weight_decay}\n"
         f"  Checkpoints Save Path: {checkpoints_save_path}\n"
@@ -157,6 +158,7 @@ def main()-> None:
         f"  Checkpoint Path: {checkpoint_path}\n"
         f"  Weight Image Loss: {w_img_loss}\n"
         f"  Weight Weak Box Loss: {w_wbb_loss}\n"
+        f"  Weight CAM Loss: {w_cam_loss}\n"
         f"  MP EMA Alpha: {mp_ema_alpha}\n"
     )
 
@@ -226,7 +228,7 @@ def main()-> None:
         device=device,
         epochs=epochs,
         lr=lr,
-        min_lr=min_lr,
+        warm_up_lr_factor=warm_up_lr_factor,
         warmup_epochs=warmup_epochs,
         weight_decay=weight_decay,
         checkpoints_save_path=checkpoints_save_path,
@@ -236,6 +238,7 @@ def main()-> None:
         checkpoint_path=checkpoint_path,
         w_img_loss=w_img_loss,
         w_wbb_loss=w_wbb_loss,
+        w_cam_loss=w_cam_loss,
         mp_ema_alpha=mp_ema_alpha
     )
     trainer = build_stage1_trainer(model, train_loader, stage1_trainer_config, wbb_loss_config)

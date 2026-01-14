@@ -53,7 +53,6 @@ def get_img_contrast_loss(emb : torch.Tensor, label : torch.Tensor, tau : float 
     # pairwise logits: [B, B]
     logits = emb @ emb.t() / tau
 
-    # 不用自己 exp，后续用 logsumexp
     loss_sum = emb.new_tensor(0.0)
     valid_i = 0
 
@@ -67,7 +66,7 @@ def get_img_contrast_loss(emb : torch.Tensor, label : torch.Tensor, tau : float 
         li = label[i]
         lj = label[js]
 
-        pos_mask = (lj == li).all(dim=-1)  # 和你原实现一致
+        pos_mask = (lj == li).all(dim=-1)
         neg_mask = (li.long() & lj.long()).sum(dim=-1) == 0
 
         pos_js = js[pos_mask]
@@ -227,6 +226,7 @@ def supervised_contrastive_loss(
     if features.dim() < 3:
         raise ValueError(f"`features` must be [B, V, D] with dim>=3, got {tuple(features.shape)}")
 
+    features = F.normalize(features, dim=-1, eps=1e-6)
     B, V = features.shape[0], features.shape[1]
     if B <= 0 or V <= 0:
         raise ValueError(f"Invalid B or V from features shape={tuple(features.shape)}")
