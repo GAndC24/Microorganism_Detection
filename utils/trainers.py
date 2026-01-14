@@ -19,6 +19,7 @@ class Stage1TrainerConfig:
     checkpoints_save_path: str
     model_save_path : str
     dataset_mps_save_path : str
+    logger: Logger
     continue_train: bool = False
     checkpoint_path: str = None
     w_img_loss : float = 0.5    # weight for image contrast loss
@@ -108,23 +109,8 @@ class Stage1Trainer:
         )
 
         self.start_epoch = 1
-        trainer_config = {
-            'num_classes' : self.config.num_classes,
-            'device': str(self.config.device),
-            'epochs': self.config.epochs,
-            'lr': self.config.lr,
-            'min_lr': self.config.lr * self.config.warm_up_lr_factor,
-            'warmup_epochs': self.config.warmup_epochs,
-            'weight_decay': self.config.weight_decay,
-            'checkpoints_save_path': self.config.checkpoints_save_path,
-            'model_save_path': self.config.model_save_path,
-            'dataset_mps_save_path': self.config.dataset_mps_save_path,
-            'w_img_loss' : self.w_img_loss,
-            'w_wbb_loss' : self.w_wbb_loss,
-            'w_cam_loss' : self.w_cam_loss,
-            'mp_ema_alpha' : self.mp_ema_alpha
-        }
-        self.logger = Logger(model_name="Stage1", trainer_config=trainer_config)
+
+        self.logger = config.logger
         self.log_path = self.logger.get_log_dir()
 
         self.dataset_MPs : Dict[int, torch.Tensor] = {}     # {class_id : prototype}
@@ -139,10 +125,6 @@ class Stage1Trainer:
 
             # 设置当前训练轮数
             self.start_epoch = checkpoint['epoch'] + 1
-
-            # 加载日志路径
-            log_path = checkpoint['log_path']
-            self.logger = Logger(model_name="Stage1", continue_existing=log_path)
 
             # 加载优化器状态
             optimizer_state_dict = checkpoint['optimizer_state_dict']
@@ -227,7 +209,7 @@ class Stage1Trainer:
             pbar.set_postfix({
                 "Iter Loss: Total": f"{loss.item():.4f} ",
                 "MFHA": f"{loss_MFHA.item():.4f} ",
-                "CAM": f"{loss_cam.item():.4f}\n",
+                "CAM": f"{loss_cam.item():.4f} ",
                 "img": f"{loss_img.item():.4f} ",
                 "wbb": f"{loss_wbb.item():.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",

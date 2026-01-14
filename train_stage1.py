@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
 from datasets import UrinarySedimentDataset, detection_collate_fn
 from models import Stage1Config, build_Stage1_model
-from utils import Stage1TrainerConfig, WBBLossConfig, build_stage1_trainer, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps
+from utils import Stage1TrainerConfig, WBBLossConfig, build_stage1_trainer, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps, Logger
 
 def _load_yaml(config_path : str)-> Dict[str, Any]:
     config_path = Path(config_path)
@@ -223,6 +223,13 @@ def main()-> None:
         temperature=temperature,
         positives_cap=positives_cap
     )
+
+    if continue_train:
+        checkpoint = torch.load(checkpoint_path)
+        logger = Logger(model_name="Stage1", config=config, continue_existing=checkpoint['log_path'])
+    else:       # new train
+        logger = Logger(model_name="Stage1", config=config)
+
     stage1_trainer_config = Stage1TrainerConfig(
         num_classes=num_classes,
         device=device,
@@ -234,6 +241,7 @@ def main()-> None:
         checkpoints_save_path=checkpoints_save_path,
         model_save_path=model_save_path,
         dataset_mps_save_path=dataset_mps_save_path,
+        logger=logger,
         continue_train=continue_train,
         checkpoint_path=checkpoint_path,
         w_img_loss=w_img_loss,
