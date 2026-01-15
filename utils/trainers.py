@@ -257,7 +257,7 @@ class Stage1Trainer:
         print(f"Checkpoint saved to {file_path}")
 
     def _save_model(self, model_save_path : str, model_name : str = 'Vgg16_backbone'):
-        model_state_dict = self.model.backbone.state_dict()
+        model_state_dict = self.model.encoder.state_dict()
         file_path = f"{model_save_path}/{model_name}.pth"
         torch.save(model_state_dict, file_path)
         print(f"Model parameters saved to {file_path}")

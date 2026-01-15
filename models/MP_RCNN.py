@@ -5,6 +5,7 @@ from typing import Tuple, List, Dict
 from dataclasses import dataclass
 from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps
 from torchvision.ops import RoIAlign
+from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 
 
 @dataclass
@@ -30,7 +31,15 @@ class Stage1Config:
     sampling_ratio: int = 2  # sampling ratio
     aligned: bool = True  # aligned flag
 
-# Stage 1: Feature Alignment and Construct Prototypes
+@dataclass
+class Stage2Config:
+    img_size: Tuple[int, int]  # input image size
+    in_c : int  # input channels
+    # for RPN
+    rpn_anchor_sizes: Tuple[int]  # anchor sizes
+    rpn_anchor_aspect_ratios: Tuple[float]  # anchor aspect ratios
+
+# Stage 1: Multi-Hierarchy Feature Alignment and Construct Prototypes
 class Stage1(nn.Module):
     def __init__(
         self,
@@ -144,6 +153,40 @@ class Stage1(nn.Module):
         loss_cam, prototypes = self.mp_generator(mid_feature_maps, wboxes, wb_labels)        # {class_id : prototype tensor}
 
         return low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes
+
+# Stage 2: Unsupervised Proposal Generation
+class Stage2(nn.Module):
+    def __init__(
+        self,
+        config : Stage2Config,       # Stage2 configuration
+        backbone : nn.Module,  # Default VGG-16 with aligned weights
+    )-> None:
+        super(Stage2, self).__init__()
+
+        self.encoder = backbone
+        # freeze backbone weights
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.config = config
+
+        anchor_generator = AnchorGenerator(
+            sizes=self.config.rpn_anchor_sizes,
+            aspect_ratios=self.config.rpn_anchor_aspect_ratios
+        )
+        rpn_head = RPNHead(in_channels=self.config.in_c, num_anchors=anchor_generator.num_anchors_per_location()[0])
+        self.rpn = RegionProposalNetwork(
+                    anchor_generator=anchor_generator,
+                    head=rpn_head,
+                    fg_iou_thresh=0.7,
+                    bg_iou_thresh=0.3,
+                    batch_size_per_image=256,
+                    positive_fraction=0.5,
+                    pre_nms_top_n={"training": 2000, "testing": 1000},
+                    post_nms_top_n={"training": 2000, "testing": 1000},
+                    nms_thresh=0.7
+        )
+
+
 
 
 def build_Stage1_model(

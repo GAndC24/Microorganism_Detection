@@ -28,8 +28,8 @@ stage1_trainer_config:
   checkpoints_save_path: ./checkpoints/stage1/
   model_save_path: ./results/model_weights/
   dataset_mps_save_path: ./dataset_morphological_prototypes/
-  continue_train: false
-  checkpoint_path: ''
+  continue_train: true
+  checkpoint_path: ./checkpoints/stage1/checkpoint_25.pth
   w_img_loss: 0.2
   w_wbb_loss: 0.8
   w_cam_loss: 0.5

@@ -1,0 +1,17 @@
+runtime:
+  seed: 42
+  device: cuda  # 'cuda' or 'cpu'
+
+data:
+  data_root: "./data/processed/Urinary Sediment Dataset"
+  batch_size: 32    # (32, 64)
+
+stage1_model_config:
+  img_size: 800  # (600, 800)
+  in_c: 512
+  rpn_anchor_sizes : 32, 40, 64, 120, 208
+  rpn_anchor_aspect_ratios: 0.89, 1.0, 1.15
+
+stage1_trainer_config:
+
+
