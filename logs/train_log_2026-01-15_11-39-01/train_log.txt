@@ -1,0 +1,44 @@
+--------------------Start train Stage1-------------------
+Start Time: 2026-01-15 11:39:01.882621
+
+Epoch [1/40]Total Loss: 2.5328, Image Contrast Loss: 4.4528, Weak Box Contrast Loss: 0.7865, MFHA Loss: 1.5198, CAM Loss: 2.0260
+Epoch [2/40]Total Loss: 1.6334, Image Contrast Loss: 3.8049, Weak Box Contrast Loss: 0.4886, MFHA Loss: 1.1518, CAM Loss: 0.9632
+Epoch [3/40]Total Loss: 1.3771, Image Contrast Loss: 2.9810, Weak Box Contrast Loss: 0.4198, MFHA Loss: 0.9320, CAM Loss: 0.8901
+Epoch [4/40]Total Loss: 1.1821, Image Contrast Loss: 2.4526, Weak Box Contrast Loss: 0.3664, MFHA Loss: 0.7837, CAM Loss: 0.7969
+Epoch [5/40]Total Loss: 1.1681, Image Contrast Loss: 2.2200, Weak Box Contrast Loss: 0.3544, MFHA Loss: 0.7275, CAM Loss: 0.8812
+Epoch [6/40]Total Loss: 1.0092, Image Contrast Loss: 1.9186, Weak Box Contrast Loss: 0.3204, MFHA Loss: 0.6401, CAM Loss: 0.7383
+Epoch [7/40]Total Loss: 0.8951, Image Contrast Loss: 1.7559, Weak Box Contrast Loss: 0.3056, MFHA Loss: 0.5956, CAM Loss: 0.5988
+Epoch [8/40]Total Loss: 0.8603, Image Contrast Loss: 1.5066, Weak Box Contrast Loss: 0.3003, MFHA Loss: 0.5416, CAM Loss: 0.6374
+Epoch [9/40]Total Loss: 0.7848, Image Contrast Loss: 1.3620, Weak Box Contrast Loss: 0.2909, MFHA Loss: 0.5051, CAM Loss: 0.5594
+Epoch [10/40]Total Loss: 0.7223, Image Contrast Loss: 1.2983, Weak Box Contrast Loss: 0.2851, MFHA Loss: 0.4877, CAM Loss: 0.4691
+Epoch [11/40]Total Loss: 0.7006, Image Contrast Loss: 1.1906, Weak Box Contrast Loss: 0.2804, MFHA Loss: 0.4624, CAM Loss: 0.4763
+Epoch [12/40]Total Loss: 0.6838, Image Contrast Loss: 1.1365, Weak Box Contrast Loss: 0.2762, MFHA Loss: 0.4483, CAM Loss: 0.4710
+Epoch [13/40]Total Loss: 0.6315, Image Contrast Loss: 1.0971, Weak Box Contrast Loss: 0.2681, MFHA Loss: 0.4339, CAM Loss: 0.3952
+Epoch [14/40]Total Loss: 0.6226, Image Contrast Loss: 1.0773, Weak Box Contrast Loss: 0.2668, MFHA Loss: 0.4289, CAM Loss: 0.3874
+Epoch [15/40]Total Loss: 0.6379, Image Contrast Loss: 1.0971, Weak Box Contrast Loss: 0.2658, MFHA Loss: 0.4321, CAM Loss: 0.4116
+Epoch [16/40]Total Loss: 0.5794, Image Contrast Loss: 1.0108, Weak Box Contrast Loss: 0.2606, MFHA Loss: 0.4106, CAM Loss: 0.3375
+Epoch [17/40]Total Loss: 0.5879, Image Contrast Loss: 1.0213, Weak Box Contrast Loss: 0.2614, MFHA Loss: 0.4134, CAM Loss: 0.3491
+Epoch [18/40]Total Loss: 0.5563, Image Contrast Loss: 0.9811, Weak Box Contrast Loss: 0.2555, MFHA Loss: 0.4006, CAM Loss: 0.3115
+Epoch [19/40]Total Loss: 0.5424, Image Contrast Loss: 0.9635, Weak Box Contrast Loss: 0.2550, MFHA Loss: 0.3967, CAM Loss: 0.2913
+Epoch [20/40]Total Loss: 0.5225, Image Contrast Loss: 0.9902, Weak Box Contrast Loss: 0.2507, MFHA Loss: 0.3986, CAM Loss: 0.2478
+Epoch [21/40]Total Loss: 0.5338, Image Contrast Loss: 0.9645, Weak Box Contrast Loss: 0.2491, MFHA Loss: 0.3922, CAM Loss: 0.2832
+Epoch [22/40]Total Loss: 0.4922, Image Contrast Loss: 0.9138, Weak Box Contrast Loss: 0.2449, MFHA Loss: 0.3787, CAM Loss: 0.2270
+Epoch [23/40]Total Loss: 0.4815, Image Contrast Loss: 0.9158, Weak Box Contrast Loss: 0.2405, MFHA Loss: 0.3756, CAM Loss: 0.2118
+Epoch [24/40]Total Loss: 0.4875, Image Contrast Loss: 0.9451, Weak Box Contrast Loss: 0.2420, MFHA Loss: 0.3826, CAM Loss: 0.2098
+Epoch [25/40]Total Loss: 0.4735, Image Contrast Loss: 0.9098, Weak Box Contrast Loss: 0.2396, MFHA Loss: 0.3737, CAM Loss: 0.1997
+Epoch [26/40]Total Loss: 0.4646, Image Contrast Loss: 0.9338, Weak Box Contrast Loss: 0.2371, MFHA Loss: 0.3765, CAM Loss: 0.1763
+Epoch [27/40]Total Loss: 0.4665, Image Contrast Loss: 0.9266, Weak Box Contrast Loss: 0.2356, MFHA Loss: 0.3738, CAM Loss: 0.1853
+Epoch [28/40]Total Loss: 0.4363, Image Contrast Loss: 0.8991, Weak Box Contrast Loss: 0.2307, MFHA Loss: 0.3644, CAM Loss: 0.1438
+Epoch [29/40]Total Loss: 0.4261, Image Contrast Loss: 0.8721, Weak Box Contrast Loss: 0.2302, MFHA Loss: 0.3586, CAM Loss: 0.1350
+Epoch [30/40]Total Loss: 0.4242, Image Contrast Loss: 0.8625, Weak Box Contrast Loss: 0.2293, MFHA Loss: 0.3560, CAM Loss: 0.1365
+Epoch [31/40]Total Loss: 0.4052, Image Contrast Loss: 0.8286, Weak Box Contrast Loss: 0.2263, MFHA Loss: 0.3467, CAM Loss: 0.1168
+Epoch [32/40]Total Loss: 0.4013, Image Contrast Loss: 0.8540, Weak Box Contrast Loss: 0.2250, MFHA Loss: 0.3508, CAM Loss: 0.1011
+Epoch [33/40]Total Loss: 0.4021, Image Contrast Loss: 0.8788, Weak Box Contrast Loss: 0.2241, MFHA Loss: 0.3550, CAM Loss: 0.0941
+Epoch [34/40]Total Loss: 0.3904, Image Contrast Loss: 0.8365, Weak Box Contrast Loss: 0.2232, MFHA Loss: 0.3459, CAM Loss: 0.0890
+Epoch [35/40]Total Loss: 0.3819, Image Contrast Loss: 0.8209, Weak Box Contrast Loss: 0.2228, MFHA Loss: 0.3424, CAM Loss: 0.0789
+Epoch [36/40]Total Loss: 0.3868, Image Contrast Loss: 0.8610, Weak Box Contrast Loss: 0.2223, MFHA Loss: 0.3500, CAM Loss: 0.0736
+Epoch [37/40]Total Loss: 0.3802, Image Contrast Loss: 0.8162, Weak Box Contrast Loss: 0.2222, MFHA Loss: 0.3410, CAM Loss: 0.0784
+--------------------Continue train Stage1-------------------
+Continue Time: 2026-01-16 11:00:44.677368
+
+Epoch [38/40]Total Loss: 0.3750, Image Contrast Loss: 0.8087, Weak Box Contrast Loss: 0.2210, MFHA Loss: 0.3386, CAM Loss: 0.0728
