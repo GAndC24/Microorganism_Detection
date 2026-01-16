@@ -85,4 +85,60 @@ class UrinarySedimentDataset(Dataset):
 
         return image, target
 
+class LinearProbDataset(Dataset):
+    def __init__(
+        self,
+        root: str,  # dataset root path
+        split: str,  # dataset split, "train" or "val" or "test"
+        transforms: Optional[Callable] = None,  # data transforms
+    )-> None:
+        super().__init__()
+
+        self.root = os.path.expanduser(root)
+        self.split = split
+        self.transforms = transforms
+
+        self.ann_dir = os.path.join(self.root, "Annotations")  # xml annotation folder
+        self.img_dir = os.path.join(self.root, "JPEGImages")  # jpg images folder
+        self.set_dir = os.path.join(self.root, "ImageSets", "Main")  # dataset split folder
+
+        # load images
+        imageset_txt = os.path.join(self.set_dir, f"{split}.txt")
+        if not os.path.isfile(imageset_txt):
+            raise FileNotFoundError(f"ImageSet file not found: {imageset_txt}")
+        with open(imageset_txt, "r", encoding="utf-8") as f:
+            self.img_ids = [line.strip() for line in f.readlines() if line.strip()]
+
+    def __len__(self) -> int:
+        return len(self.img_ids)
+
+    def __getitem__(self, idx: int):
+        image_id = self.img_ids[idx]
+
+        img_path = os.path.join(self.img_dir, f"{image_id}.jpg")
+        xml_path = os.path.join(self.ann_dir, f"{image_id}.xml")
+
+        if not os.path.isfile(img_path):
+            raise FileNotFoundError(f"Image not found: {img_path}")
+        if not os.path.isfile(xml_path):
+            raise FileNotFoundError(f"Annotation not found: {xml_path}")
+
+        image_pil = Image.open(img_path).convert("RGB")
+
+        image_info, wbs = parse_voc_xml(xml_path, class_map_encoding)
+
+        labels: List[int] = []
+        for wb in wbs:
+            labels.append(wb['class_id'])
+
+        # get multi-hot labels
+        multi_hot_label = torch.zeros(7)
+        for idx in labels:
+            multi_hot_label[idx] = 1.0
+
+        image = self.transforms(image_pil)
+
+        return image, multi_hot_label
+
+
 

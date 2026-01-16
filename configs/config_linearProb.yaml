@@ -1,0 +1,15 @@
+runtime:
+  seed: 42
+  device: cuda  # 'cuda' or 'cpu'
+
+data:
+  data_root: "./data/processed/Urinary Sediment Dataset"
+  batch_size: 32    # (32, 64)
+
+linearProb_model_config:
+  in_c: 512
+  in_size: 24
+  hidden_dim: 4096
+  out_dim: 1
+  dropout: 0.5
+

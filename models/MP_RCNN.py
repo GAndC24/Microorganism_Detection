@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps
 from torchvision.ops import RoIAlign
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
+from torchvision.models import vgg16
 
 
 @dataclass
@@ -35,9 +36,25 @@ class Stage1Config:
 class Stage2Config:
     img_size: Tuple[int, int]  # input image size
     in_c : int  # input channels
+    # for RoI Align
+
     # for RPN
     rpn_anchor_sizes: Tuple[int]  # anchor sizes
     rpn_anchor_aspect_ratios: Tuple[float]  # anchor aspect ratios
+    rpn_fg_iou_thresh : float  # foreground IoU threshold
+    rpn_bg_iou_thresh : float  # background IoU threshold
+    rpn_batch_size_per_image : int # RPN batch size per image
+    rpn_pre_nms_top_n: Dict[str, int]  # pre NMS top N, {"training": int, "testing": int}
+    rpn_post_nms_top_n: Dict[str, int]  # post NMS top N, {"training": int, "testing": int}
+    rpn_nms_thresh: float  # RPN NMS threshold
+
+@dataclass
+class LinearProbConfig:
+    in_c : int # feature map channels
+    in_size: int  # feature map size
+    hidden_dim: int = 4096  # MLP hidden dimension
+    out_dim : int = 1  # MLP output dimension
+    dropout_ratio : float = 0.5  # dropout ratio
 
 # Stage 1: Multi-Hierarchy Feature Alignment and Construct Prototypes
 class Stage1(nn.Module):
@@ -177,17 +194,141 @@ class Stage2(nn.Module):
         self.rpn = RegionProposalNetwork(
                     anchor_generator=anchor_generator,
                     head=rpn_head,
-                    fg_iou_thresh=0.7,
-                    bg_iou_thresh=0.3,
-                    batch_size_per_image=256,
+                    fg_iou_thresh=self.config.rpn_fg_iou_thresh,
+                    bg_iou_thresh=self.config.rpn_bg_iou_thresh,
+                    batch_size_per_image=self.config.rpn_batch_size_per_image,
                     positive_fraction=0.5,
-                    pre_nms_top_n={"training": 2000, "testing": 1000},
-                    post_nms_top_n={"training": 2000, "testing": 1000},
-                    nms_thresh=0.7
+                    pre_nms_top_n={"training": self.config.rpn_pre_nms_top_n['training'], "testing": self.config.rpn_pre_nms_top_n['testing']},
+                    post_nms_top_n={"training": self.config.rpn_post_nms_top_n['training'], "testing": self.config.rpn_post_nms_top_n['testing']},
+                    nms_thresh=self.config.rpn_nms_thresh
         )
 
+class LinearProb(nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,  # Default VGG-16 with aligned weights
+        config : LinearProbConfig       # LinearProb configuration
+    )->None:
+        super(LinearProb, self).__init__()
 
+        self.encoder = backbone
+        # freeze backbone weights
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+        self.config = config
 
+        self.avgpool = nn.AdaptiveAvgPool2d((self.config.in_size, self.config.in_size))
+
+        in_dim = self.config.in_c * self.config.in_size * self.config.in_size
+        self.classifier_0 = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+        )
+
+        self.classifier_1 = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+        )
+
+        self.classifier_2 = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+        )
+
+        self.classifier_3 = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+        )
+
+        self.classifier_4 = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+        )
+
+        self.classifier_5 = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+        )
+
+        self.classifier_6 = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
+            nn.ReLU(True),
+            nn.Dropout(p=self.config.dropout_ratio),
+            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+        )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m)->None:
+        """
+        Initialize weights for Linear
+        :param m: Module to initialize
+        """
+        if isinstance(m, nn.Linear):  # Check if the module is a Linear layer
+            torch.nn.init.xavier_uniform_(m.weight)  # Xavier initialization for weights
+            if m.bias is not None:  # Initialize bias to zero if it exists
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x : torch.Tensor)-> Dict[str, torch.Tensor]:
+        '''
+        :param x: input images, [B, C, H, W]
+        :return: logits for 7 classes, {class_id: logit}
+        '''
+
+        self.encoder[-1] = nn.Identity()
+        feature_maps = self.encoder(x)
+        pooled_features = self.avgpool(feature_maps)  # [B, C, 1, 1]
+
+        logits = {}
+        logits['0'] = self.classifier_0(pooled_features)
+        logits['1'] = self.classifier_1(pooled_features)
+        logits['2'] = self.classifier_2(pooled_features)
+        logits['3'] = self.classifier_3(pooled_features)
+        logits['4'] = self.classifier_4(pooled_features)
+        logits['5'] = self.classifier_5(pooled_features)
+        logits['6'] = self.classifier_6(pooled_features)
+
+        return logits
 
 def build_Stage1_model(
     stage1_config: Stage1Config,        # Stage1 configuration
@@ -216,7 +357,20 @@ def build_Stage1_model(
 
     return model
 
+def build_LinearProb_model(
+    linear_prob_config: LinearProbConfig,       # LinearProb configuration
+    backbone_weights_path: str  # Aligned backbone weights path
+)-> nn.Module:
+    backbone = vgg16(pretrained=False).features
+    model_state_dict = torch.load(backbone_weights_path)
+    backbone.load_state_dict(model_state_dict)
 
+    model = LinearProb(
+        backbone=backbone,
+        config=linear_prob_config
+    )
+
+    return model
 
 
 
