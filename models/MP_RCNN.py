@@ -7,7 +7,8 @@ from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGene
 from torchvision.ops import RoIAlign
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models import vgg16
-
+from timm.models.vision_transformer import PatchEmbed
+import torch.nn.functional as F
 
 @dataclass
 class Stage1Config:
@@ -59,8 +60,8 @@ class LinearProbConfig:
 @dataclass
 class PrototypeCheckerConfig:
     in_c: int  # input channels
-    hidden_dim: int # MLP hidden dimension
     embed_dim: int  # embedding dimension
+    patch_size : int # patch size
     roi_out_size: Tuple[int, int]  # output size for high feature maps
     spatial_scale : float  # spatial scale for high feature maps
     sampling_ratio: int = 2  # sampling ratio
@@ -347,6 +348,7 @@ class PrototypeChecker(nn.Module):
     def __init__(
         self,
         backbone: nn.Module,  # Default VGG-16 with aligned weights
+        patch_embed : PatchEmbed,       # Patch Embed layer from Stage1
         config : PrototypeCheckerConfig       # PrototypeChecker configuration
     )-> None:
         super(PrototypeChecker, self).__init__()
@@ -361,41 +363,49 @@ class PrototypeChecker(nn.Module):
             aligned=config.aligned,
         )
 
-        C3 = vgg_layer_out_c_maps[config.in_c]
-        H3, W3 = config.roi_out_size
-        hidden_dim_in = int(C3 * H3 * W3)
-        self.proj = nn.Sequential(
-            nn.Flatten(),  # [N, C3, H3, W3] -> [N, C3*H3*W3]
-            nn.Linear(hidden_dim_in, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, config.embed_dim),
-            nn.ReLU(),
-            nn.BatchNorm1d(config.embed_dim)
-        )
+        self.patch_embed = patch_embed
 
     def forward(
         self,
         x: torch.Tensor,        # input images, [B, C, H, W]
-        boxes: torch.Tensor,        # boxes for RoI Align, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        prototypes : Dict[int, torch.Tensor]        # prototypes, {class_id, prototype tensor}
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        boxes: torch.Tensor,        # GT boxes for RoI Align, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+        boxes_labels : torch.Tensor,        # class labels for GT boxes, [R, num_classes]
+        prototypes : Dict[int, torch.Tensor]        # {class_id, prototype tensor}
+    ) -> Dict[int, float]:
         '''
-        :return:
-        - GT embedding features, [R, D]
-        - prototype embedding features, [num_classes, D]
+        :return: Similarity of GT and prototypes, {class_id : average_similarity}
         '''
 
         self.encoder[-1] = nn.Identity()
         feature_maps = self.encoder(x)
 
         roi_features = self.roi_align(feature_maps, boxes)  # [R, C, H, W]
-        roi_embedding_features = self.proj(roi_features)  # [R, D]
+        patch_features = self.patch_embed(roi_features)  # [R, num_patches, D]
 
         prototypes = torch.stack([prototypes[k] for k in prototypes.keys()], dim=0)  # [num_classes, D]
-        prototypes_embedding = self.proj(prototypes)  # [num_classes, D]
 
-        return roi_embedding_features, prototypes_embedding
+        R, num_classes = boxes_labels.shape
+        sims = {k: 0.0 for k in range(num_classes)}
+        cnt = {k: 0 for k in range(num_classes)}
 
+        for i in range(R):
+            gt_patch_features = patch_features[i]  # [num_patches, D]
+            gt_patch_features = F.normalize(gt_patch_features, dim=1)  # [num_patches, D]
+            gt_patch_features_mean = gt_patch_features.mean(dim=0, keepdim=True)  # [1, D]
+            gt_label = torch.argmax(boxes_labels[i]).item()
+            prototype = prototypes[gt_label]
+            sim = F.cosine_similarity(gt_patch_features_mean, prototype.unsqueeze(0), dim=1).item()  # [1]
+            sims[gt_label] += sim
+            cnt[gt_label] += 1
+
+        average_sims : Dict[int, float] = {}
+        for k in sims.keys():
+            if cnt[k] > 0:
+                average_sims[k] = sims[k] / cnt[k]
+            else:
+                average_sims[k] = 0.0
+
+        return average_sims
 
 def build_Stage1_model(
     stage1_config: Stage1Config,        # Stage1 configuration
@@ -440,5 +450,27 @@ def build_LinearProb_model(
 
     return model
 
+def build_PrototypeChecker_model(
+    prototypeChecker_config : PrototypeCheckerConfig,
+    backbone_weights_path : str,  # Aligned backbone weights path
+    patch_embed_weights_path : str      # Patch Embed weights path
+)-> nn.Module:
+    backbone = vgg16(pretrained=False).features
+    backbone.load_state_dict(torch.load(backbone_weights_path))
 
+    patch_embed = PatchEmbed(
+        img_size=prototypeChecker_config.roi_out_size,
+        patch_size=prototypeChecker_config.patch_size,
+        in_chans=prototypeChecker_config.in_c,
+        embed_dim=prototypeChecker_config.embed_dim,
+    )
+    patch_embed.load_state_dict(torch.load(patch_embed_weights_path))
+
+    model = PrototypeChecker(
+        backbone=backbone,
+        patch_embed=patch_embed,
+        config=prototypeChecker_config
+    )
+
+    return model
 

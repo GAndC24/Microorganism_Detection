@@ -1,0 +1,20 @@
+runtime:
+  seed: 42
+  device: cuda  # 'cuda' or 'cpu'
+
+data:
+  data_root: "./data/processed/Urinary Sediment Dataset"
+  batch_size: 32    # (32, 64)
+  img_size: 384
+  num_classes: 7
+
+prototypeChecker_config:
+  in_c: 512
+  embed_dim : 512
+  patch_size: 3
+  roi_out_size: 7
+  spatial_scale: 0.125
+  sampling_ratio: 2
+  backbone_weights_path: ""
+  patch_embed_weights_path: ""
+  dataset_MPs_path: ""

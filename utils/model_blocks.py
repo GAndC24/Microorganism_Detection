@@ -256,10 +256,12 @@ class MorphologicalPrototypeGenerator(nn.Module):
         x : torch.Tensor,       # middle feature maps, [B, C, H, W]
         wboxes : torch.Tensor,    # weak boxes, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels : torch.Tensor    # class label for weak boxes, [R, num_classes]
-    )-> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+    )-> Tuple[torch.Tensor, Dict[int, torch.Tensor], torch.Tensor]:
         """
-        :param x:
-        :return: prototypes, {class_id: prototype tensor}
+        :return:
+        - CAM loss
+        - prototypes, {class_id: prototype tensor}
+        - Patch loss
         """
 
         # RoI Align to get weak box features
