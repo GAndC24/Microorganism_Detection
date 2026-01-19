@@ -9,6 +9,7 @@ import fvcore.nn.weight_init as weight_init
 from timm.models.vision_transformer import PatchEmbed
 import numpy as np
 from sklearn.mixture import GaussianMixture
+from utils import get_patch_loss
 
 # Feature Hook to extract Multi-level features of backbone
 class FeatureHook:
@@ -291,7 +292,10 @@ class MorphologicalPrototypeGenerator(nn.Module):
         # get morphological prototypes
         prototypes = self._get_morphological_prototypes(patch_features, weights, wb_labels)        # {class_id : prototype tensor}
 
-        return loss_cam, prototypes
+        # get patch loss
+        loss_patch = get_patch_loss(patch_features, wb_labels, prototypes)
+
+        return loss_cam, prototypes, loss_patch
 
 # Build backbone hook
 def build_backbone_hook(backbone : nn.Module, indices : List[int]) -> FeatureHook:

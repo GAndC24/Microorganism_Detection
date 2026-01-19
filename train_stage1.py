@@ -143,6 +143,7 @@ def main()-> None:
     w_img_loss = stage1_trainer_config["w_img_loss"]
     w_wbb_loss = stage1_trainer_config["w_wbb_loss"]
     w_cam_loss = stage1_trainer_config["w_cam_loss"]
+    w_patch_loss = stage1_trainer_config["w_patch_loss"]
     mp_ema_alpha = stage1_trainer_config["mp_ema_alpha"]
     print(
         "-----Stage 1 Trainer Configurations-----\n"
@@ -159,6 +160,7 @@ def main()-> None:
         f"  Weight Image Loss: {w_img_loss}\n"
         f"  Weight Weak Box Loss: {w_wbb_loss}\n"
         f"  Weight CAM Loss: {w_cam_loss}\n"
+        f"  Weight Patch Loss: {w_patch_loss}\n"
         f"  MP EMA Alpha: {mp_ema_alpha}\n"
     )
 
@@ -247,6 +249,7 @@ def main()-> None:
         w_img_loss=w_img_loss,
         w_wbb_loss=w_wbb_loss,
         w_cam_loss=w_cam_loss,
+        w_patch_loss=w_patch_loss,
         mp_ema_alpha=mp_ema_alpha
     )
     trainer = build_stage1_trainer(model, train_loader, stage1_trainer_config, wbb_loss_config)

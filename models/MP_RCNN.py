@@ -56,6 +56,16 @@ class LinearProbConfig:
     out_dim : int = 1  # MLP output dimension
     dropout_ratio : float = 0.5  # dropout ratio
 
+@dataclass
+class PrototypeCheckerConfig:
+    in_c: int  # input channels
+    hidden_dim: int # MLP hidden dimension
+    embed_dim: int  # embedding dimension
+    roi_out_size: Tuple[int, int]  # output size for high feature maps
+    spatial_scale : float  # spatial scale for high feature maps
+    sampling_ratio: int = 2  # sampling ratio
+    aligned: bool = True  # aligned flag
+
 # Stage 1: Multi-Hierarchy Feature Alignment and Construct Prototypes
 class Stage1(nn.Module):
     def __init__(
@@ -91,14 +101,14 @@ class Stage1(nn.Module):
         C3 = vgg_layer_out_c_maps[config.layer_indices[2]]
         H3, W3 = config.roi_out_size_high
         hidden_dim_in = int(C3 * H3 * W3)
-        self.mlp_h = nn.Sequential(
+        self.proj_h = nn.Sequential(
             nn.Flatten(),  # [N, C3, H3, W3] -> [N, C3*H3*W3]
             nn.Linear(hidden_dim_in, config.hidden_dim),
             nn.ReLU(),
             nn.Linear(config.hidden_dim, config.embed_dim),
             nn.ReLU(),
+            nn.BatchNorm1d(config.embed_dim)
         )
-        self.bn_h = nn.BatchNorm1d(config.embed_dim)
 
         self.apply(self._init_weights)
 
@@ -125,7 +135,8 @@ class Stage1(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        Dict[str, torch.Tensor]
+        Dict[str, torch.Tensor],
+        torch.Tensor
     ]:
         """
         :return:
@@ -134,6 +145,7 @@ class Stage1(nn.Module):
         - high-level embedding features, [B, D]
         - CAM loss
         - prototypes, {class_id, prototype tensor}
+        - Patch loss
         """
         # -----get multi-level feature maps-----
         self.hook.clear()
@@ -162,14 +174,13 @@ class Stage1(nn.Module):
         )  # [R, V=2, C3, H3, W3], view0=masked, view1=noise
         R, V, C3, H3, W3 = roi_views.shape
         roi_views_flat = roi_views.view(R * V, C3, H3, W3)  # [R*V, C3, H3, W3]
-        high_aug_embedding_features = self.mlp_h(roi_views_flat)  # [R*V, D]
-        high_aug_embedding_features = self.bn_h(high_aug_embedding_features)  # [R*V, D]
+        high_aug_embedding_features = self.proj_h(roi_views_flat)  # [R*V, D]
         high_aug_embedding_features = high_aug_embedding_features.view(R, V, self.embed_dim)  # [R, V, D]
 
         # -----construct prototypes-----
-        loss_cam, prototypes = self.mp_generator(mid_feature_maps, wboxes, wb_labels)        # {class_id : prototype tensor}
+        loss_cam, prototypes, loss_patch = self.mp_generator(mid_feature_maps, wboxes, wb_labels)        # {class_id : prototype tensor}
 
-        return low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes
+        return low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, loss_patch
 
 # Stage 2: Unsupervised Proposal Generation
 class Stage2(nn.Module):
@@ -203,6 +214,7 @@ class Stage2(nn.Module):
                     nms_thresh=self.config.rpn_nms_thresh
         )
 
+# For backbone verification
 class LinearProb(nn.Module):
     def __init__(
         self,
@@ -330,11 +342,67 @@ class LinearProb(nn.Module):
 
         return logits
 
+# For prototypes verification
+class PrototypeChecker(nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,  # Default VGG-16 with aligned weights
+        config : PrototypeCheckerConfig       # PrototypeChecker configuration
+    )-> None:
+        super(PrototypeChecker, self).__init__()
+
+        self.encoder = backbone
+        self.config = config
+
+        self.roi_align = RoIAlign(
+            output_size=config.roi_out_size,
+            spatial_scale=config.spatial_scale,
+            sampling_ratio=config.sampling_ratio,
+            aligned=config.aligned,
+        )
+
+        C3 = vgg_layer_out_c_maps[config.in_c]
+        H3, W3 = config.roi_out_size
+        hidden_dim_in = int(C3 * H3 * W3)
+        self.proj = nn.Sequential(
+            nn.Flatten(),  # [N, C3, H3, W3] -> [N, C3*H3*W3]
+            nn.Linear(hidden_dim_in, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, config.embed_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(config.embed_dim)
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,        # input images, [B, C, H, W]
+        boxes: torch.Tensor,        # boxes for RoI Align, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+        prototypes : Dict[int, torch.Tensor]        # prototypes, {class_id, prototype tensor}
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        '''
+        :return:
+        - GT embedding features, [R, D]
+        - prototype embedding features, [num_classes, D]
+        '''
+
+        self.encoder[-1] = nn.Identity()
+        feature_maps = self.encoder(x)
+
+        roi_features = self.roi_align(feature_maps, boxes)  # [R, C, H, W]
+        roi_embedding_features = self.proj(roi_features)  # [R, D]
+
+        prototypes = torch.stack([prototypes[k] for k in prototypes.keys()], dim=0)  # [num_classes, D]
+        prototypes_embedding = self.proj(prototypes)  # [num_classes, D]
+
+        return roi_embedding_features, prototypes_embedding
+
+
 def build_Stage1_model(
     stage1_config: Stage1Config,        # Stage1 configuration
 )-> nn.Module:
     backbone, hook = build_vgg16_backbone_with_hook(stage1_config.layer_indices)
 
+    # mp_generator
     mp_generator = MorphologicalPrototypeGenerator(
         num_classes=stage1_config.num_classes,
         in_c=stage1_config.in_c,
@@ -362,8 +430,8 @@ def build_LinearProb_model(
     backbone_weights_path: str  # Aligned backbone weights path
 )-> nn.Module:
     backbone = vgg16(pretrained=False).features
-    model_state_dict = torch.load(backbone_weights_path)
-    backbone.load_state_dict(model_state_dict)
+    backbone.load_state_dict(torch.load(backbone_weights_path))
+    # backbone = vgg16(pretrained=True).features
 
     model = LinearProb(
         backbone=backbone,

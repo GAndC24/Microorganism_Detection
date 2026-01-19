@@ -6,8 +6,9 @@ GitHub repository: https://github.com/SCoulY/MuSCLe
 import torch
 from enum import Enum
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 import torch.nn.functional as F
+import math
 
 # -----Image Contrastive Loss-----
 def get_img_contrast_loss(emb : torch.Tensor, label : torch.Tensor, tau : float = 0.1, eps : float = 1e-6)->torch.Tensor:
@@ -351,4 +352,34 @@ def supervised_contrastive_loss(
         raise ValueError(f"Unknown reduction: {cfg.reduction}")
 
     return loss
+
+# ----- Patch Loss -----
+def get_patch_loss(
+    patch_features : torch.Tensor,  # [R, N_patches, D]
+    wb_labels : torch.Tensor,      # [R, num_classes]
+    prototypes : Dict[int, torch.Tensor]
+)->torch.Tensor:
+    '''return loss_patch'''
+    R, Np, D = patch_features.shape
+    num_classes = wb_labels.shape[1]
+
+    # 1) stack prototypes -> [C, D]（按 class_id 对齐）
+    proto_mat = patch_features.new_zeros((num_classes, D))
+    for class_id, proto in prototypes.items():
+        cid = int(class_id)
+        if 0 <= cid < num_classes:
+            proto_mat[cid] = proto.to(device=patch_features.device, dtype=patch_features.dtype)
+
+    # 2) similarity: [R, Np, C]，因为都已归一化，所以点积就是 cosine 相似度
+    sim = torch.einsum("rpd,cd->rpc", patch_features, proto_mat)
+
+    # 3) patch 聚合成弱框级 logits（smooth-max）
+    # log(1/Np * sum exp(sim)) = logsumexp(sim) - log(Np)
+    box_logits = torch.logsumexp(sim, dim=1) - math.log(max(Np, 1))  # [R, C]
+
+    # 4) 单标签 CE：one-hot -> index
+    target = torch.argmax(wb_labels, dim=1).long()  # [R]
+    loss_patch = F.cross_entropy(box_logits, target)
+
+    return loss_patch
 

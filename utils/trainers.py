@@ -1,11 +1,12 @@
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from utils import Logger, get_img_contrast_loss, WBBLossConfig, supervised_contrastive_loss
 from tqdm.auto import tqdm
+from torchmetrics import MetricCollection, Precision, Recall, F1Score, AUROC, Accuracy
 
 @dataclass
 class Stage1TrainerConfig:
@@ -25,7 +26,23 @@ class Stage1TrainerConfig:
     w_img_loss : float = 0.5    # weight for image contrast loss
     w_wbb_loss : float = 0.5    # weight for weak box contrast loss
     w_cam_loss : float = 0.5    # weight for cam loss
+    w_patch_loss : float = 0.5  # weight for patch loss
     mp_ema_alpha: float = 0.9   # ema alpha for updating prototypes, [0.9, 0.99]
+
+@dataclass
+class LinearProbTrainerConfig:
+    num_classes: int  # number of classes
+    device: torch.device  # "cpu" or "cuda"
+    epochs: int
+    lr: float  # base lr
+    warm_up_lr_factor: float  # min_lr = warm_up_lr_factor * lr
+    warmup_epochs: int
+    weight_decay: float
+    checkpoints_save_path: str
+    model_save_path: str
+    logger: Logger
+    continue_train: bool = False
+    checkpoint_path: str = None
 
 def _build_image_multi_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> torch.Tensor:
     """
@@ -85,6 +102,7 @@ class Stage1Trainer:
         self.w_img_loss = config.w_img_loss
         self.w_wbb_loss = config.w_wbb_loss
         self.w_cam_loss = config.w_cam_loss
+        self.w_patch_loss = config.w_patch_loss
         self.mp_ema_alpha = config.mp_ema_alpha
 
         self.device = config.device
@@ -178,6 +196,7 @@ class Stage1Trainer:
         epoch_wbb_loss = 0.0
         epoch_MFHA_loss = 0.0
         epoch_cam_loss = 0.0
+        epoch_patch_loss = 0.0
         for iter, (images, target) in pbar:
             images = [img.to(self.config.device) for img in images]
             targets = [{k: v.to(self.config.device) for k, v in t.items()} for t in target]
@@ -185,13 +204,13 @@ class Stage1Trainer:
             wboxes = _build_wboxes(targets).to(self.config.device)
             wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
             X = torch.stack(images, dim=0)
-            low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes = self.model(X, wboxes, wb_one_hot_labels)
+            low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, loss_patch = self.model(X, wboxes, wb_one_hot_labels)
             img_multi_hot_labels = _build_image_multi_hot(targets, self.config.num_classes).to(self.config.device)
 
             loss_img = get_img_contrast_loss(low_latent_features, img_multi_hot_labels)
             loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.wbb_loss_config)
             loss_MFHA = self.w_img_loss * loss_img + self.w_wbb_loss * loss_wbb
-            loss = loss_MFHA + self.w_cam_loss * loss_cam
+            loss = loss_MFHA + self.w_cam_loss * loss_cam + self.w_patch_loss * loss_patch
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -205,11 +224,13 @@ class Stage1Trainer:
             epoch_wbb_loss += loss_wbb.item()
             epoch_MFHA_loss += loss_MFHA.item()
             epoch_cam_loss += loss_cam.item()
+            epoch_patch_loss += loss_patch.item()
 
             pbar.set_postfix({
                 "Iter Loss: Total": f"{loss.item():.4f} ",
                 "MFHA": f"{loss_MFHA.item():.4f} ",
                 "CAM": f"{loss_cam.item():.4f} ",
+                "Patch": f"{loss_patch.item():.4f} ",
                 "img": f"{loss_img.item():.4f} ",
                 "wbb": f"{loss_wbb.item():.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
@@ -223,6 +244,7 @@ class Stage1Trainer:
         average_wbb_loss = epoch_wbb_loss / num_iters
         average_MFHA_loss = epoch_MFHA_loss / num_iters
         average_cam_loss = epoch_cam_loss / num_iters
+        average_patch_loss = epoch_patch_loss / num_iters
 
         self.logger.add_info(
             f"Epoch [{epoch}/{self.config.epochs}]"
@@ -231,6 +253,7 @@ class Stage1Trainer:
             f"Weak Box Contrast Loss: {average_wbb_loss:.4f}, "
             f"MFHA Loss: {average_MFHA_loss:.4f}, "
             f"CAM Loss: {average_cam_loss:.4f}\n"
+            f"Patch Loss: {average_patch_loss:.4f}\n"
         )
         metrics = {
             'Epoch': epoch,
@@ -239,6 +262,7 @@ class Stage1Trainer:
             'Weak Box Contrast Loss': average_wbb_loss,
             'MFHA Loss': average_MFHA_loss,
             'CAM Loss': average_cam_loss,
+            'Patch Loss': average_patch_loss,
         }
         self.logger.add_metrics(metrics)
 
@@ -258,9 +282,9 @@ class Stage1Trainer:
 
     def _save_model(self, model_save_path : str, model_name : str = 'Vgg16_backbone'):
         model_state_dict = self.model.encoder.state_dict()
-        file_path = f"{model_save_path}/{model_name}.pth"
-        torch.save(model_state_dict, file_path)
-        print(f"Model parameters saved to {file_path}")
+        model_file_path = f"{model_save_path}/{model_name[0]}.pth"
+        torch.save(model_state_dict, model_file_path)
+        print(f"Model parameters saved to {model_file_path}")
 
     def _save_dataset_mps(self, dataset_mps_save_path : str):
         file_path = f"{dataset_mps_save_path}/dataset_MPs.pth"
@@ -280,7 +304,173 @@ class Stage1Trainer:
         dataset_mps_save_path = self.config.dataset_mps_save_path
         self._save_dataset_mps(dataset_mps_save_path=dataset_mps_save_path)
 
+class LinearProbTrainer:
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        config: LinearProbTrainerConfig,
+    )->None:
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
 
+        self.model = self.model.to(self.config.device)
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay
+        )
+
+        self.lr_scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[
+                # Linear warm‑up
+                LinearLR(self.optimizer, start_factor=self.config.warm_up_lr_factor, end_factor=1.0),
+                # cosine decay
+                CosineAnnealingLR(self.optimizer, T_max=self.config.epochs - self.config.warmup_epochs,
+                                  eta_min=self.config.lr * self.config.warm_up_lr_factor)
+            ],
+            milestones=[self.config.warmup_epochs]
+        )
+
+        self.start_epoch = 1
+
+        self.logger = config.logger
+        self.log_path = self.logger.get_log_dir()
+
+        # 定义损失函数
+        self.loss_func = nn.BCEWithLogitsLoss()
+
+        if self.config.continue_train:
+            # 加载检查点
+            checkpoint = torch.load(self.config.checkpoint_path)
+
+            # 加载模型参数
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print("Model loaded successfully.")
+
+            # 设置当前训练轮数
+            self.start_epoch = checkpoint['epoch'] + 1
+
+            # 加载优化器状态
+            optimizer_state_dict = checkpoint['optimizer_state_dict']
+            self.optimizer.load_state_dict(optimizer_state_dict)
+            print("Optimizer state loaded successfully.")
+
+            # 加载学习率调度器状态
+            lr_scheduler_state_dict = checkpoint['lr_scheduler_state_dict']
+            self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+            print("Learning rate scheduler state loaded successfully.")
+
+    def train(self)-> None:
+        for epoch in range(self.start_epoch, self.config.epochs + 1):
+            self.model.train()
+            self._train_one_epoch(epoch)
+            checkpoints_save_path = self.config.checkpoints_save_path
+            self._save_checkpoint(current_epoch=epoch, checkpoints_save_path=checkpoints_save_path)
+
+        self.logger.end_train()
+        model_save_path = self.config.model_save_path
+        self._save_model(model_save_path=model_save_path)
+
+    def _train_one_epoch(self, epoch) -> None:
+        num_iters = len(self.train_loader)
+        pbar = tqdm(
+            enumerate(self.train_loader, start=1),
+            total=num_iters,
+            desc=f"Epoch {epoch}/{self.config.epochs}",
+            leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
+            dynamic_ncols=True,  # 自适应终端宽度
+        )
+
+        epoch_loss = 0.0
+        for iter, (X, Y) in pbar:
+            X, Y = X.to(self.config.device), Y.to(self.config.device)
+            logits = self.model(X)
+            pred_logits = torch.stack([logits[label].squeeze(1) for label in logits.keys()], dim=1)
+            loss = self.loss_func(pred_logits, Y)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            epoch_loss += loss.item()
+
+            pbar.set_postfix({
+                "Iter Loss: ": f"{loss.item():.4f} ",
+                "lr": f"{self.optimizer.param_groups[0]['lr']}",
+            })
+
+        self.lr_scheduler.step()
+
+        num_iters = len(self.train_loader)
+        average_loss = epoch_loss / num_iters
+
+        train_acc = self._get_accuracy("train")
+        val_acc = self._get_accuracy("val")
+
+        self.logger.add_info(
+            f"Epoch [{epoch}/{self.config.epochs}]"
+            f"Loss: {average_loss:.4f} "
+            f"Train Accuracy: {train_acc * 100:.2f}% "
+            f"Val Accuracy: {val_acc * 100:.2f}%\n"
+        )
+        metrics = {
+            'Epoch': epoch,
+            'Loss': average_loss,
+            'Train Accuracy': train_acc,
+            'Val Accuracy': val_acc,
+        }
+        self.logger.add_metrics(metrics)
+
+    def _get_accuracy(self, mode : str)-> float:
+        """
+        :param mode: 'train' or 'val'
+        :return: accuracy value
+        """
+        if mode == "train":
+            loader = self.train_loader
+        elif mode == "val":
+            loader = self.val_loader
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
+
+        self.model.eval()
+        metric = Accuracy(task="multilabel", num_labels=7, average="macro").to(self.config.device)
+
+        with torch.no_grad():
+            for X, Y in loader:
+                X, Y = X.to(self.config.device), Y.to(self.config.device)
+                logits = self.model(X)
+                pred_logits = torch.stack([torch.sigmoid(logits[label].squeeze(1)) for label in logits.keys()], dim=1)
+                predicted = (pred_logits > 0.5).float()
+                metric.update(predicted, Y.int())
+
+        result = metric.compute().cpu()
+        return result.item()
+
+    def _save_checkpoint(self, current_epoch : int, checkpoints_save_path : str):
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "epoch": current_epoch,
+            "log_path": self.log_path,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+        }
+
+        file_path = f"{checkpoints_save_path}/checkpoint_{current_epoch}.pth"
+        torch.save(checkpoint, file_path)
+        print(f"Checkpoint saved to {file_path}")
+
+    def _save_model(self, model_save_path : str, model_name : str = 'Vgg16_backbone_linear_prob'):
+        model_state_dict = self.model.encoder.state_dict()
+        file_path = f"{model_save_path}/{model_name}.pth"
+        torch.save(model_state_dict, file_path)
+        print(f"Model parameters saved to {file_path}")
 
 
 def build_stage1_trainer(
@@ -294,6 +484,21 @@ def build_stage1_trainer(
         train_loader=train_loader,
         config=trainer_config,
         wbb_loss_config=wbb_loss_config,
+    )
+
+    return trainer
+
+def build_LinearProb_trainer(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    trainer_config: LinearProbTrainerConfig,
+)-> LinearProbTrainer:
+    trainer = LinearProbTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=trainer_config,
     )
 
     return trainer
