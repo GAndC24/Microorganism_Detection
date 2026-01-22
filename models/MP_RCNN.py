@@ -1,7 +1,7 @@
 # Morphological Prototype R-CNN
 import torch
 import torch.nn as nn
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Any
 from dataclasses import dataclass
 from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps
 from torchvision.ops import RoIAlign
@@ -9,6 +9,8 @@ from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionPro
 from torchvision.models import vgg16
 from timm.models.vision_transformer import PatchEmbed
 import torch.nn.functional as F
+from torchvision.models.detection.image_list import ImageList
+
 
 @dataclass
 class Stage1Config:
@@ -29,16 +31,19 @@ class Stage1Config:
     roi_out_size_mid: Tuple[int, int]  # output size for middle feature maps
     roi_out_size_high: Tuple[int, int]  # output size for high feature maps
     spatial_scale_mid: float  # spatial scale for middle feature maps
-    spatial_scale_high : float # spatial scale for middle feature maps
+    spatial_scale_high : float # spatial scale for high feature maps
     sampling_ratio: int = 2  # sampling ratio
     aligned: bool = True  # aligned flag
 
 @dataclass
 class Stage2Config:
     img_size: Tuple[int, int]  # input image size
-    in_c : int  # input channels
-    # for RoI Align
-
+    num_classes: int  # number of classes
+    in_c : int  # high-level feature maps channels
+    dataset_mps : Dict[int, torch.Tensor]  # {class_id : prototype tensor}
+    # for projection head
+    hidden_dim: int     # MLP hidden dimension
+    embed_dim: int      # embedding dimension
     # for RPN
     rpn_anchor_sizes: Tuple[int]  # anchor sizes
     rpn_anchor_aspect_ratios: Tuple[float]  # anchor aspect ratios
@@ -48,6 +53,15 @@ class Stage2Config:
     rpn_pre_nms_top_n: Dict[str, int]  # pre NMS top N, {"training": int, "testing": int}
     rpn_post_nms_top_n: Dict[str, int]  # post NMS top N, {"training": int, "testing": int}
     rpn_nms_thresh: float  # RPN NMS threshold
+    # for RoI Align
+    roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
+    spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
+    roi_out_size_wb2p: Tuple[int, int]  # output size for weak box features to proposal box features
+    spatial_scale_wb2p: float  # spatial scale
+    roi_out_size_h2p: Tuple[int, int]  # output size for high feature maps to proposal box features
+    spatial_scale_h2p: float    # spatial scale for high feature maps to proposal box features
+    sampling_ratio: int = 2  # sampling ratio
+    aligned: bool = True    # aligned flag
 
 @dataclass
 class LinearProbConfig:
@@ -67,7 +81,7 @@ class PrototypeCheckerConfig:
     sampling_ratio: int = 2  # sampling ratio
     aligned: bool = True  # aligned flag
 
-# Stage 1: Multi-Hierarchy Feature Alignment and Construct Prototypes
+# MP R-CNN Stage 1: Multi-Hierarchy Feature Alignment and Construct Prototypes
 class Stage1(nn.Module):
     def __init__(
         self,
@@ -146,7 +160,7 @@ class Stage1(nn.Module):
         - high-level embedding features, [B, D]
         - CAM loss
         - prototypes, {class_id, prototype tensor}
-        - Patch loss
+        - Patch logits, [R * Np, D]
         """
         # -----get multi-level feature maps-----
         self.hook.clear()
@@ -179,11 +193,11 @@ class Stage1(nn.Module):
         high_aug_embedding_features = high_aug_embedding_features.view(R, V, self.embed_dim)  # [R, V, D]
 
         # -----construct prototypes-----
-        loss_cam, prototypes, loss_patch = self.mp_generator(mid_feature_maps, wboxes, wb_labels)        # {class_id : prototype tensor}
+        loss_cam, prototypes, patch_logits = self.mp_generator(mid_feature_maps, wboxes, wb_labels)        # {class_id : prototype tensor}
 
-        return low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, loss_patch
+        return low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, patch_logits
 
-# Stage 2: Unsupervised Proposal Generation
+# MP R-CNN Stage 2: Unsupervised Proposal Generation and Object Detection
 class Stage2(nn.Module):
     def __init__(
         self,
@@ -193,11 +207,34 @@ class Stage2(nn.Module):
         super(Stage2, self).__init__()
 
         self.encoder = backbone
-        # freeze backbone weights
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        # # freeze backbone weights
+        # for param in self.encoder.parameters():
+        #     param.requires_grad = False
         self.config = config
 
+        # (train)RoI Align for high-level feature maps to weak box feature maps
+        self.roi_align_h2wb = RoIAlign(
+            output_size=self.config.roi_out_size_h2wb,
+            spatial_scale=self.config.spatial_scale_h2wb,
+            sampling_ratio=self.config.sampling_ratio,
+            aligned=self.config.aligned,
+        )
+        # (train)RoI Align for weak box feature maps to proposal box feature maps
+        self.roi_align_wb2p = RoIAlign(
+            output_size=self.config.roi_out_size_wb2p,
+            spatial_scale=self.config.spatial_scale_wb2p,
+            sampling_ratio=self.config.sampling_ratio,
+            aligned=self.config.aligned,
+        )
+        # (inference) RoI Align for high-level feature maps to proposal box feature maps
+        self.roi_align_h2p = RoIAlign(
+            output_size=self.config.roi_out_size_h2p,
+            spatial_scale=self.config.spatial_scale_h2p,
+            sampling_ratio=self.config.sampling_ratio,
+            aligned=self.config.aligned,
+        )
+
+        # RPN
         anchor_generator = AnchorGenerator(
             sizes=self.config.rpn_anchor_sizes,
             aspect_ratios=self.config.rpn_anchor_aspect_ratios
@@ -215,6 +252,127 @@ class Stage2(nn.Module):
                     nms_thresh=self.config.rpn_nms_thresh
         )
 
+        # Global Average Pooling
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Projection Head
+        hidden_dim_in = self.config.in_c
+        self.proj = nn.Sequential(
+            nn.Linear(hidden_dim_in, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, config.embed_dim),
+            nn.ReLU(),
+            nn.BatchNorm1d(config.embed_dim)
+        )
+
+        # Object Classifier
+        self.obj_classifier = nn.Linear(config.embed_dim, self.config.num_classes + 1)  # num_classes + 1(for background class)
+
+
+
+    @torch.no_grad()
+    def _get_dense_proposals(
+        self,
+        wb_feature_maps : torch.Tensor,   # weak box feature maps, [R, C_h, H_wb, W_wb]
+        wboxes: torch.Tensor  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+    )-> List[torch.Tensor]:
+        ''':return dense_proposals : List[Tensor], len=R, each Tensor is [num_proposals, 4]'''
+        self.rpn.eval()
+
+        device = wb_feature_maps.device
+        R = wb_feature_maps.shape[0]
+
+        # prepare img_list
+        image_sizes = []
+        for i in range(R):
+            _, x1, y1, x2, y2 = wboxes[i]
+
+            # weak box 的真实尺寸（原图坐标系）
+            h = int(y2 - y1)
+            w = int(x2 - x1)
+
+            image_sizes.append((h, w))
+        dummy_images = torch.zeros((R, 3, 1, 1), device=device)     # 实际不使用，仅占位
+        img_list = ImageList(tensors=dummy_images, image_sizes=image_sizes)
+
+        features = {"0": wb_feature_maps}  # RPN features format, Dict[str, tensor]
+        dense_proposals_list, _ = self.rpn(img_list, features)
+
+        return dense_proposals_list
+
+    def _forward_train(
+        self,
+        imgs: torch.Tensor,  # input images, [B, C, H, W]
+        wboxes: torch.Tensor,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+    ):
+        # -----get high-level feature maps-----
+        self.encoder[-1] = nn.Identity()
+        high_feature_maps = self.encoder(imgs)  # [B, C_h, H_h, W_h]
+
+        # -----get weak box feature maps-----
+        wb_feature_maps = self.roi_align_h2wb(high_feature_maps, wboxes)  # [R, C_h, H_wb, W_wb]
+
+        # -----Branch 1: get sparse proposals-----
+        # get dense proposals
+        dense_proposals_list = self._get_dense_proposals(wb_feature_maps, wboxes)  # List[Tensor], len=R, each Tensor is [num_proposals, 4]
+        dense_proposal_boxes = torch.cat(dense_proposals_list, dim=0)  # [N_D = total_num_proposals, 4]
+        # get proposal features
+        dense_proposal_features = self.roi_align_wb2p(wb_feature_maps, dense_proposals_list)    # [N_D = total_num_proposals, C_h, H_p, W_p]
+        # Object Discovery
+        # Dense proposal features to embeddings
+        dense_proposal_features = self.gap(dense_proposal_features)  # [N_D, C_h, 1, 1]
+        dense_proposal_features = dense_proposal_features.view(dense_proposal_features.shape[0], -1)    # [N_D, C_h]
+        dense_proposal_embeddings = self.proj(dense_proposal_features)  # [N_D, D = embed_dim]
+        # get object scores
+        dense_proposal_object_scores = self.obj_classifier(dense_proposal_embeddings)  # [N_D, num_classes + 1]
+        dense_proposal_object_scores = F.softmax(dense_proposal_object_scores, dim=1)  # [N_D, num_classes + 1]
+        # get prototypes embeddings
+        prototypes = torch.stack([self.config.dataset_mps[k] for k in range(self.config.num_classes)], dim=0)  # [num_classes, D_p = C_h]
+        prototypes_embeddings = self.proj(prototypes)  # [num_classes, D]
+        # select Top-Scoring proposals for each class
+        top_scoring_proposal_indices = dense_proposal_object_scores.argmax(dim=0)  # [num_classes + 1]
+        top_scoring_proposal_embeddings = dense_proposal_embeddings[top_scoring_proposal_indices[:-1]]  # [num_classes, D]
+        top_scoring_proposal_boxes = dense_proposal_boxes[top_scoring_proposal_indices[:-1]]  # [num_classes, 4]
+        # L2 Normalize
+        dense_proposal_embeddings = F.normalize(dense_proposal_embeddings, dim=1)  # [N_D, D]
+        prototypes_embeddings = F.normalize(prototypes_embeddings, dim=1)  # [num_classes, D]
+        top_scoring_proposal_embeddings = F.normalize(top_scoring_proposal_embeddings, dim=1)  # [num_classes, D]
+        # get threshold for each class
+        thresholds = F.cosine_similarity(top_scoring_proposal_embeddings, prototypes_embeddings, dim=1)  # [num_classes]
+        sims_all = torch.matmul(dense_proposal_embeddings, prototypes_embeddings.t())  # [N_D, num_classes]
+        # get sparse proposals
+        sparse_mask = sims_all > thresholds.unsqueeze(0)  # [N_D, num_classes]
+        sparse_proposals : List[Dict] = []
+        for c in range(self.config.num_classes):
+            indices = torch.where(sparse_mask[:, c])[0]
+            for i in indices:
+                sparse_proposals.append({
+                    "box" : dense_proposal_boxes[i],
+                    "class_id" : c,
+                    "score": dense_proposal_object_scores[i, c]
+                })
+
+        # -----Branch 2: get seed proposals-----
+
+
+
+
+
+
+
+
+
+    def forward(
+        self,
+        mode: str,  # "train" or "inference"
+        imgs: torch.Tensor,  # input images, [B, C, H, W]
+        wboxes: torch.Tensor = None,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+    ):
+        if mode == "train":
+            return self._forward_train(imgs, wboxes)
+        elif mode == "inference":
+            return self._forward_inference(imgs)
+
 # For backbone verification
 class LinearProb(nn.Module):
     def __init__(
@@ -225,9 +383,9 @@ class LinearProb(nn.Module):
         super(LinearProb, self).__init__()
 
         self.encoder = backbone
-        # freeze backbone weights
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        # # freeze backbone weights
+        # for param in self.encoder.parameters():
+        #     param.requires_grad = False
         self.config = config
 
         self.avgpool = nn.AdaptiveAvgPool2d((self.config.in_size, self.config.in_size))
@@ -370,42 +528,122 @@ class PrototypeChecker(nn.Module):
         x: torch.Tensor,        # input images, [B, C, H, W]
         boxes: torch.Tensor,        # GT boxes for RoI Align, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
         boxes_labels : torch.Tensor,        # class labels for GT boxes, [R, num_classes]
-        prototypes : Dict[int, torch.Tensor]        # {class_id, prototype tensor}
-    ) -> Dict[int, float]:
+        prototypes : Dict[int, torch.Tensor],        # {class_id, prototype tensor}
+        return_details: bool = True
+    # )-> Dict[int, float]:
+    ) -> Dict[str, Any]:
         '''
         :return: Similarity of GT and prototypes, {class_id : average_similarity}
         '''
 
+        # self.encoder[-1] = nn.Identity()
+        # feature_maps = self.encoder(x)
+        #
+        # roi_features = self.roi_align(feature_maps, boxes)  # [R, C, H, W]
+        # patch_features = self.patch_embed(roi_features)  # [R, num_patches, D]
+        #
+        # prototypes = torch.stack([prototypes[k] for k in prototypes.keys()], dim=0)  # [num_classes, D]
+        #
+        # R, num_classes = boxes_labels.shape
+        # sims = {k: 0.0 for k in range(num_classes)}
+        # cnt = {k: 0 for k in range(num_classes)}
+        #
+        # for i in range(R):
+        #     gt_patch_features = patch_features[i]  # [num_patches, D]
+        #     gt_patch_features = F.normalize(gt_patch_features, dim=1)  # [num_patches, D]
+        #     gt_patch_features_mean = gt_patch_features.mean(dim=0, keepdim=True)  # [1, D]
+        #     gt_label = torch.argmax(boxes_labels[i]).item()
+        #     prototype = prototypes[gt_label]
+        #     sim = F.cosine_similarity(gt_patch_features_mean, prototype.unsqueeze(0), dim=1).item()  # [1]
+        #     sims[gt_label] += sim
+        #     cnt[gt_label] += 1
+        #
+        # average_sims : Dict[int, float] = {}
+        # for k in sims.keys():
+        #     if cnt[k] > 0:
+        #         average_sims[k] = sims[k] / cnt[k]
+        #     else:
+        #         average_sims[k] = 0.0
+        #
+        # return average_sims
         self.encoder[-1] = nn.Identity()
         feature_maps = self.encoder(x)
 
         roi_features = self.roi_align(feature_maps, boxes)  # [R, C, H, W]
         patch_features = self.patch_embed(roi_features)  # [R, num_patches, D]
 
-        prototypes = torch.stack([prototypes[k] for k in prototypes.keys()], dim=0)  # [num_classes, D]
+        # 固定 prototype 顺序：按 class_id 排序，避免 dict keys 顺序导致错位
+        class_ids = sorted(list(prototypes.keys()))
+        proto_mat = torch.stack([prototypes[k] for k in class_ids], dim=0)  # [num_classes, D]
 
         R, num_classes = boxes_labels.shape
-        sims = {k: 0.0 for k in range(num_classes)}
-        cnt = {k: 0 for k in range(num_classes)}
+
+        # 用于“全局加权均值”的统计量：sum / cnt
+        sims_sum = {k: 0.0 for k in range(num_classes)}
+        sims_cnt = {k: 0 for k in range(num_classes)}
+
+        # 细粒度分析：分布与间隔
+        details = {
+            "pos": {k: [] for k in range(num_classes)},  # 每个 GT 的 sim_pos
+            "neg_max": {k: [] for k in range(num_classes)},  # 每个 GT 的 max sim_neg
+            "margin": {k: [] for k in range(num_classes)},  # sim_pos - max sim_neg
+        }
+
+        # # 先把 prototype 归一化，后续用 matmul 计算全类相似度
+        # proto_mat = F.normalize(proto_mat, dim=1)
 
         for i in range(R):
-            gt_patch_features = patch_features[i]  # [num_patches, D]
-            gt_patch_features = F.normalize(gt_patch_features, dim=1)  # [num_patches, D]
-            gt_patch_features_mean = gt_patch_features.mean(dim=0, keepdim=True)  # [1, D]
             gt_label = torch.argmax(boxes_labels[i]).item()
-            prototype = prototypes[gt_label]
-            sim = F.cosine_similarity(gt_patch_features_mean, prototype.unsqueeze(0), dim=1).item()  # [1]
-            sims[gt_label] += sim
-            cnt[gt_label] += 1
 
-        average_sims : Dict[int, float] = {}
-        for k in sims.keys():
-            if cnt[k] > 0:
-                average_sims[k] = sims[k] / cnt[k]
+            gt_patch = patch_features[i]  # [num_patches, D]
+            gt_patch = F.normalize(gt_patch, dim=1)
+            # gt_vec = gt_patch.mean(dim=0, keepdim=True)  # [1, D]
+            # gt_vec = F.normalize(gt_vec, dim=1)  # [1, D]
+            gt_label = torch.argmax(boxes_labels[i]).item()
+            proto_pos = proto_mat[gt_label].unsqueeze(0)  # [1, D]
+
+            # 每个 patch 与正类 prototype 相似度 [P]
+            sim_patch = torch.matmul(gt_patch, proto_pos.t()).squeeze(1)  # cosine
+
+            # Top-k 选择（建议比例 0.2~0.3）
+            P = gt_patch.size(0)
+            k = max(1, int(P * 0.25))
+            topk_idx = torch.topk(sim_patch, k=k, largest=True).indices  # [k]
+
+            # 聚合 top-k patch
+            gt_vec = gt_patch[topk_idx].mean(dim=0, keepdim=True)  # [1, D]
+            gt_vec = F.normalize(gt_vec, dim=1)
+
+            # 所有类别相似度 [num_classes]
+            sims_all = torch.matmul(gt_vec, proto_mat.t()).squeeze(0)  # cosine since both normalized
+
+            sim_pos = sims_all[gt_label].item()
+            # 排除正类后的最大负类相似度
+            if num_classes > 1:
+                mask = torch.ones(num_classes, dtype=torch.bool, device=sims_all.device)
+                mask[gt_label] = False
+                sim_neg_max = sims_all[mask].max().item()
             else:
-                average_sims[k] = 0.0
+                sim_neg_max = float("-inf")
 
-        return average_sims
+            margin = sim_pos - sim_neg_max if sim_neg_max != float("-inf") else float("inf")
+
+            sims_sum[gt_label] += sim_pos
+            sims_cnt[gt_label] += 1
+
+            if return_details:
+                details["pos"][gt_label].append(sim_pos)
+                details["neg_max"][gt_label].append(sim_neg_max)
+                details["margin"][gt_label].append(margin)
+
+        out = {
+            "sum": sims_sum,
+            "cnt": sims_cnt,
+        }
+        if return_details:
+            out["details"] = details
+
+        return out
 
 def build_Stage1_model(
     stage1_config: Stage1Config,        # Stage1 configuration

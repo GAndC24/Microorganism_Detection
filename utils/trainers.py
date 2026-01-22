@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from utils import Logger, get_img_contrast_loss, WBBLossConfig, supervised_contrastive_loss
+from utils import Logger, get_img_contrast_loss, WBBLossConfig, supervised_contrastive_loss, get_patch_loss
 from tqdm.auto import tqdm
 from torchmetrics import MetricCollection, Precision, Recall, F1Score, AUROC, Accuracy
 
@@ -204,20 +204,21 @@ class Stage1Trainer:
             wboxes = _build_wboxes(targets).to(self.config.device)
             wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
             X = torch.stack(images, dim=0)
-            low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, loss_patch = self.model(X, wboxes, wb_one_hot_labels)
+            low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, patch_logits = self.model(X, wboxes, wb_one_hot_labels)
             img_multi_hot_labels = _build_image_multi_hot(targets, self.config.num_classes).to(self.config.device)
+
+            self._update_dataset_mps_ema(prototypes)
 
             loss_img = get_img_contrast_loss(low_latent_features, img_multi_hot_labels)
             loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.wbb_loss_config)
             loss_MFHA = self.w_img_loss * loss_img + self.w_wbb_loss * loss_wbb
+            loss_patch = get_patch_loss(patch_logits, wb_one_hot_labels)
             loss = loss_MFHA + self.w_cam_loss * loss_cam + self.w_patch_loss * loss_patch
 
             self.optimizer.zero_grad()
             loss.backward()
 
             self.optimizer.step()
-
-            self._update_dataset_mps_ema(prototypes)
 
             epoch_total_loss += loss.item()
             epoch_img_loss += loss_img.item()
@@ -282,7 +283,7 @@ class Stage1Trainer:
 
     def _save_model(self, model_save_path : str, model_name : str = 'Vgg16_backbone'):
         model_state_dict = self.model.encoder.state_dict()
-        model_file_path = f"{model_save_path}/{model_name[0]}.pth"
+        model_file_path = f"{model_save_path}/{model_name}.pth"
         torch.save(model_state_dict, model_file_path)
         print(f"Model parameters saved to {model_file_path}")
 

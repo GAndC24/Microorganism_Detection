@@ -15,6 +15,6 @@ prototypeChecker_config:
   roi_out_size: 7
   spatial_scale: 0.125
   sampling_ratio: 2
-  backbone_weights_path: ""
-  patch_embed_weights_path: ""
-  dataset_MPs_path: ""
+  backbone_weights_path: "./results/model_weights/Vgg16_backbone.pth"
+  patch_embed_weights_path: "./results/model_weights/patch_embed_weights.pth"
+  dataset_MPs_path: "./dataset_morphological_prototypes/dataset_MPs.pth"

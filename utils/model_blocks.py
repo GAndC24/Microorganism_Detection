@@ -9,7 +9,6 @@ import fvcore.nn.weight_init as weight_init
 from timm.models.vision_transformer import PatchEmbed
 import numpy as np
 from sklearn.mixture import GaussianMixture
-from utils import get_patch_loss
 
 # Feature Hook to extract Multi-level features of backbone
 class FeatureHook:
@@ -140,6 +139,19 @@ class MorphologicalPrototypeGenerator(nn.Module):
             embed_dim=embed_dim,
         )
 
+        self.cls_head = nn.Linear(embed_dim, num_classes)
+        self.cls_head.apply(self._init_weights)
+
+    def _init_weights(self, m)->None:
+        """
+        Initialize weights for Linear and BatchNorm layers.
+        :param m: Module to initialize
+        """
+        if isinstance(m, nn.Linear):  # Check if the module is a Linear layer
+            torch.nn.init.xavier_uniform_(m.weight)  # Xavier initialization for weights
+            if m.bias is not None:  # Initialize bias to zero if it exists
+                nn.init.constant_(m.bias, 0)
+
     def _cam_to_patch_fg_bg_scores(self, cams : torch.Tensor,wb_labels : torch.Tensor)-> torch.Tensor:
         """
         :param cams: CAMs, [R, K = num_classes, H, W]
@@ -261,9 +273,8 @@ class MorphologicalPrototypeGenerator(nn.Module):
         :return:
         - CAM loss
         - prototypes, {class_id: prototype tensor}
-        - Patch loss
+        - Patch logits, [R * Np, D]
         """
-
         # RoI Align to get weak box features
         roi_features = self.roi_align(x, wboxes)       # [R = num_wboxes, C, H, W]
 
@@ -272,12 +283,14 @@ class MorphologicalPrototypeGenerator(nn.Module):
 
         # patch embedding
         patch_features = self.patch_embed(roi_features)     # [R, Np = num_patches, D]
+        R, Np, D = patch_features.shape
+        cls_patch_features = patch_features.reshape(R * Np, D)
+        patch_logits = self.cls_head(cls_patch_features)      # [R * Np, num_classes]
 
         # get fg/bg scores for each patch
         patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, wb_labels)      # [R, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
 
         # get anchor feature of each weak box
-        R, Np, D = patch_features.shape
         anchor_features_list : List[torch.Tensor] = []
         for i in range(R):
             patch_feature = patch_features[i]
@@ -290,14 +303,17 @@ class MorphologicalPrototypeGenerator(nn.Module):
         patch_features = F.normalize(patch_features, p=2, dim=-1)
         anchor_features = F.normalize(anchor_features, p=2, dim=-1)
         weights = (patch_features * anchor_features.unsqueeze(1)).sum(dim=-1)  # [R, Np]
+        weights = F.relu(weights)  # ReLU, remove negative value
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)  # normalize to sum to 1
+        # with open("debug_data.txt", "w") as f:
+        #     for i in range(weights.size(0)):
+        #         f.write(f"Weights for weak box {i}:\n")
+        #         f.write(", ".join([f"{w:.4f}" for w in weights[i].cpu().detach().numpy()]) + "\n")
 
         # get morphological prototypes
         prototypes = self._get_morphological_prototypes(patch_features, weights, wb_labels)        # {class_id : prototype tensor}
 
-        # get patch loss
-        loss_patch = get_patch_loss(patch_features, wb_labels, prototypes)
-
-        return loss_cam, prototypes, loss_patch
+        return loss_cam, prototypes, patch_logits
 
 # Build backbone hook
 def build_backbone_hook(backbone : nn.Module, indices : List[int]) -> FeatureHook:
