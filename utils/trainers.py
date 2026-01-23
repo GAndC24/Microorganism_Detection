@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from utils import Logger, get_img_contrast_loss, WBBLossConfig, supervised_contrastive_loss, get_patch_loss
 from tqdm.auto import tqdm
-from torchmetrics import MetricCollection, Precision, Recall, F1Score, AUROC, Accuracy
+from torchmetrics import MetricCollection, Precision, Recall, F1Score, AUROC, Accuracy, AveragePrecision
 
 @dataclass
 class Stage1TrainerConfig:
@@ -411,27 +411,35 @@ class LinearProbTrainer:
         num_iters = len(self.train_loader)
         average_loss = epoch_loss / num_iters
 
-        train_acc = self._get_accuracy("train")
-        val_acc = self._get_accuracy("val")
+        train_metrics = self._get_metrics("train")
+        val_metrics = self._get_metrics("val")
+        train_acc = train_metrics["acc"]
+        val_acc = val_metrics["acc"]
+        train_mAP = train_metrics["mAP"]
+        val_mAP = val_metrics["mAP"]
 
         self.logger.add_info(
             f"Epoch [{epoch}/{self.config.epochs}]"
             f"Loss: {average_loss:.4f} "
             f"Train Accuracy: {train_acc * 100:.2f}% "
-            f"Val Accuracy: {val_acc * 100:.2f}%\n"
+            f"Val Accuracy: {val_acc * 100:.2f}% "
+            f"Train mAP: {train_mAP:.4f} "
+            f"Val mAP: {val_mAP:.4f} \n"
         )
         metrics = {
             'Epoch': epoch,
             'Loss': average_loss,
             'Train Accuracy': train_acc,
             'Val Accuracy': val_acc,
+            'Train mAP': train_mAP,
+            'Val mAP': val_mAP,
         }
         self.logger.add_metrics(metrics)
 
-    def _get_accuracy(self, mode : str)-> float:
+    def _get_metrics(self, mode : str)-> Dict[str, float]:
         """
         :param mode: 'train' or 'val'
-        :return: accuracy value
+        :return: metrics dict, {"acc": acc, "mAP": mAP}
         """
         if mode == "train":
             loader = self.train_loader
@@ -441,13 +449,16 @@ class LinearProbTrainer:
             raise ValueError(f"Invalid mode: {mode}")
 
         self.model.eval()
-        metric = Accuracy(task="multilabel", num_labels=7, average="macro").to(self.config.device)
+        num_classes = 7
+        device = self.config.device
+        acc_metric = Accuracy(task="multilabel", num_labels=num_classes, average="macro").to(device)
+        map_metric = AveragePrecision(task="multilabel", num_labels=num_classes, average="macro").to(device)
 
         num_iters = len(loader)
         pbar = tqdm(
             enumerate(loader, start=1),
             total=num_iters,
-            desc=f"Evaluating {mode} Accuracy",
+            desc=f"Evaluating {mode} Metrics",
             leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
             dynamic_ncols=True,  # 自适应终端宽度
         )
@@ -455,12 +466,19 @@ class LinearProbTrainer:
             for i, (X, Y) in pbar:
                 X, Y = X.to(self.config.device), Y.to(self.config.device)
                 logits = self.model(X)
-                pred_logits = torch.stack([torch.sigmoid(logits[label].squeeze(1)) for label in logits.keys()], dim=1)
-                predicted = (pred_logits > 0.5).float()
-                metric.update(predicted, Y.int())
+                logits_tensor = torch.stack(
+                    [logits[label].squeeze(1) for label in logits.keys()],
+                    dim=1
+                )  # [B, C]
+                probs = torch.sigmoid(logits_tensor)     # for mAP (continuous)
+                preds = (probs > 0.5).int()  # for Acc (binary)
+                acc_metric.update(preds, Y.int())
+                map_metric.update(probs, Y.int())
 
-        result = metric.compute().cpu()
-        return result.item()
+        acc = acc_metric.compute().cpu().item()
+        mAP = map_metric.compute().cpu().item()
+
+        return {"acc": acc, "mAP": mAP}
 
     def _save_checkpoint(self, current_epoch : int, checkpoints_save_path : str):
         checkpoint = {
