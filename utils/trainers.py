@@ -443,8 +443,16 @@ class LinearProbTrainer:
         self.model.eval()
         metric = Accuracy(task="multilabel", num_labels=7, average="macro").to(self.config.device)
 
+        num_iters = len(loader)
+        pbar = tqdm(
+            enumerate(loader, start=1),
+            total=num_iters,
+            desc=f"Evaluating {mode} Accuracy",
+            leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
+            dynamic_ncols=True,  # 自适应终端宽度
+        )
         with torch.no_grad():
-            for X, Y in loader:
+            for i, (X, Y) in pbar:
                 X, Y = X.to(self.config.device), Y.to(self.config.device)
                 logits = self.model(X)
                 pred_logits = torch.stack([torch.sigmoid(logits[label].squeeze(1)) for label in logits.keys()], dim=1)

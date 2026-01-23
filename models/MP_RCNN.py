@@ -67,9 +67,7 @@ class Stage2Config:
 class LinearProbConfig:
     in_c : int # feature map channels
     in_size: int  # feature map size
-    hidden_dim: int = 4096  # MLP hidden dimension
-    out_dim : int = 1  # MLP output dimension
-    dropout_ratio : float = 0.5  # dropout ratio
+    out_dim : int = 1  # output dimension
 
 @dataclass
 class PrototypeCheckerConfig:
@@ -160,7 +158,7 @@ class Stage1(nn.Module):
         - high-level embedding features, [B, D]
         - CAM loss
         - prototypes, {class_id, prototype tensor}
-        - Patch logits, [R * Np, D]
+        - Patch logits, [R * k, D]
         """
         # -----get multi-level feature maps-----
         self.hook.clear()
@@ -383,9 +381,9 @@ class LinearProb(nn.Module):
         super(LinearProb, self).__init__()
 
         self.encoder = backbone
-        # # freeze backbone weights
-        # for param in self.encoder.parameters():
-        #     param.requires_grad = False
+        # freeze backbone weights
+        for param in self.encoder.parameters():
+            param.requires_grad = False
         self.config = config
 
         self.avgpool = nn.AdaptiveAvgPool2d((self.config.in_size, self.config.in_size))
@@ -393,79 +391,37 @@ class LinearProb(nn.Module):
         in_dim = self.config.in_c * self.config.in_size * self.config.in_size
         self.classifier_0 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+            nn.Linear(in_features=in_dim, out_features=self.config.out_dim),
         )
 
         self.classifier_1 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+            nn.Linear(in_features=in_dim, out_features=self.config.out_dim),
         )
 
         self.classifier_2 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+            nn.Linear(in_features=in_dim, out_features=self.config.out_dim),
         )
 
         self.classifier_3 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+            nn.Linear(in_features=in_dim, out_features=self.config.out_dim),
         )
 
         self.classifier_4 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+            nn.Linear(in_features=in_dim, out_features=self.config.out_dim),
         )
 
         self.classifier_5 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+            nn.Linear(in_features=in_dim, out_features=self.config.out_dim),
         )
 
         self.classifier_6 = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(in_features=in_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.hidden_dim),
-            nn.ReLU(True),
-            nn.Dropout(p=self.config.dropout_ratio),
-            nn.Linear(in_features=self.config.hidden_dim, out_features=self.config.out_dim)
+            nn.Linear(in_features=in_dim, out_features=self.config.out_dim),
         )
 
         self.apply(self._init_weights)
@@ -528,97 +484,57 @@ class PrototypeChecker(nn.Module):
         x: torch.Tensor,        # input images, [B, C, H, W]
         boxes: torch.Tensor,        # GT boxes for RoI Align, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
         boxes_labels : torch.Tensor,        # class labels for GT boxes, [R, num_classes]
-        prototypes : Dict[int, torch.Tensor],        # {class_id, prototype tensor}
-        return_details: bool = True
-    # )-> Dict[int, float]:
+        prototypes : Dict[int, torch.Tensor],        # Normalized, {class_id, prototype tensor}
+        return_details: bool = True,
+        lse_alpha : float = 10.0,
+        lse_eps : float = 1e-6
     ) -> Dict[str, Any]:
         '''
         :return: Similarity of GT and prototypes, {class_id : average_similarity}
         '''
-
-        # self.encoder[-1] = nn.Identity()
-        # feature_maps = self.encoder(x)
-        #
-        # roi_features = self.roi_align(feature_maps, boxes)  # [R, C, H, W]
-        # patch_features = self.patch_embed(roi_features)  # [R, num_patches, D]
-        #
-        # prototypes = torch.stack([prototypes[k] for k in prototypes.keys()], dim=0)  # [num_classes, D]
-        #
-        # R, num_classes = boxes_labels.shape
-        # sims = {k: 0.0 for k in range(num_classes)}
-        # cnt = {k: 0 for k in range(num_classes)}
-        #
-        # for i in range(R):
-        #     gt_patch_features = patch_features[i]  # [num_patches, D]
-        #     gt_patch_features = F.normalize(gt_patch_features, dim=1)  # [num_patches, D]
-        #     gt_patch_features_mean = gt_patch_features.mean(dim=0, keepdim=True)  # [1, D]
-        #     gt_label = torch.argmax(boxes_labels[i]).item()
-        #     prototype = prototypes[gt_label]
-        #     sim = F.cosine_similarity(gt_patch_features_mean, prototype.unsqueeze(0), dim=1).item()  # [1]
-        #     sims[gt_label] += sim
-        #     cnt[gt_label] += 1
-        #
-        # average_sims : Dict[int, float] = {}
-        # for k in sims.keys():
-        #     if cnt[k] > 0:
-        #         average_sims[k] = sims[k] / cnt[k]
-        #     else:
-        #         average_sims[k] = 0.0
-        #
-        # return average_sims
+        # get GT patch features
         self.encoder[-1] = nn.Identity()
         feature_maps = self.encoder(x)
-
         roi_features = self.roi_align(feature_maps, boxes)  # [R, C, H, W]
         patch_features = self.patch_embed(roi_features)  # [R, num_patches, D]
 
-        # 固定 prototype 顺序：按 class_id 排序，避免 dict keys 顺序导致错位
+        # sort by class_id
         class_ids = sorted(list(prototypes.keys()))
         proto_mat = torch.stack([prototypes[k] for k in class_ids], dim=0)  # [num_classes, D]
 
+        # statistics：sum and cnt
         R, num_classes = boxes_labels.shape
-
-        # 用于“全局加权均值”的统计量：sum / cnt
         sims_sum = {k: 0.0 for k in range(num_classes)}
         sims_cnt = {k: 0 for k in range(num_classes)}
 
-        # 细粒度分析：分布与间隔
+        # statistics: results details
         details = {
-            "pos": {k: [] for k in range(num_classes)},  # 每个 GT 的 sim_pos
-            "neg_max": {k: [] for k in range(num_classes)},  # 每个 GT 的 max sim_neg
-            "margin": {k: [] for k in range(num_classes)},  # sim_pos - max sim_neg
+            "pos": {k: [] for k in range(num_classes)},  # sim_pos of each GT
+            "neg_max": {k: [] for k in range(num_classes)},  # max sim_neg of each GT
+            "margin": {k: [] for k in range(num_classes)},  # margin = sim_pos - max sim_neg
         }
-
-        # # 先把 prototype 归一化，后续用 matmul 计算全类相似度
-        # proto_mat = F.normalize(proto_mat, dim=1)
 
         for i in range(R):
             gt_label = torch.argmax(boxes_labels[i]).item()
 
             gt_patch = patch_features[i]  # [num_patches, D]
             gt_patch = F.normalize(gt_patch, dim=1)
+
+            # # mean pooling
             # gt_vec = gt_patch.mean(dim=0, keepdim=True)  # [1, D]
             # gt_vec = F.normalize(gt_vec, dim=1)  # [1, D]
-            gt_label = torch.argmax(boxes_labels[i]).item()
-            proto_pos = proto_mat[gt_label].unsqueeze(0)  # [1, D]
 
-            # 每个 patch 与正类 prototype 相似度 [P]
-            sim_patch = torch.matmul(gt_patch, proto_pos.t()).squeeze(1)  # cosine
+            # LogSumExp pooling
+            m = gt_patch.max(dim=0, keepdim=True).values  # [1, D]
+            lse = m + torch.log(torch.exp(lse_alpha * (gt_patch - m)).mean(dim=0, keepdim=True) + lse_eps) / lse_alpha
+            gt_vec = F.normalize(lse, dim=1, eps=lse_eps)  # [1, D]
 
-            # Top-k 选择（建议比例 0.2~0.3）
-            P = gt_patch.size(0)
-            k = max(1, int(P * 0.25))
-            topk_idx = torch.topk(sim_patch, k=k, largest=True).indices  # [k]
+            # similarity of GT and prototypes(all classes)
+            sims_all = torch.matmul(gt_vec, proto_mat.t()).squeeze(0)  # [num_classes]
 
-            # 聚合 top-k patch
-            gt_vec = gt_patch[topk_idx].mean(dim=0, keepdim=True)  # [1, D]
-            gt_vec = F.normalize(gt_vec, dim=1)
+            sim_pos = sims_all[gt_label].item()     # positive class similarity
 
-            # 所有类别相似度 [num_classes]
-            sims_all = torch.matmul(gt_vec, proto_mat.t()).squeeze(0)  # cosine since both normalized
-
-            sim_pos = sims_all[gt_label].item()
-            # 排除正类后的最大负类相似度
+            # max negative class similarity
             if num_classes > 1:
                 mask = torch.ones(num_classes, dtype=torch.bool, device=sims_all.device)
                 mask[gt_label] = False

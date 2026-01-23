@@ -97,17 +97,13 @@ def main()-> None:
     linearProb_model_config = config["linearProb_model_config"]
     in_c = linearProb_model_config["in_c"]
     in_size = linearProb_model_config["in_size"]
-    hidden_dim = linearProb_model_config["hidden_dim"]
     out_dim = linearProb_model_config["out_dim"]
-    dropout_ratio = linearProb_model_config["dropout_ratio"]
     backbone_weights_path = linearProb_model_config["backbone_weights_path"]
     print(
         "-----LinearProb Model Configurations-----\n"
         f"  Input Channels: {in_c}\n"
         f"  Input Size: {in_size}\n"
-        f"  Hidden Dimension: {hidden_dim}\n"
         f"  Output Dimension: {out_dim}\n"
-        f"  Dropout Ratio: {dropout_ratio}\n"
         f"  Backbone Weights Path: {backbone_weights_path}\n"
     )
 
@@ -138,22 +134,14 @@ def main()-> None:
 
     # Initialize Dataset
     # data preprocessing and augmentations transforms
-    transform_aug = T.Compose([
+    transform = T.Compose([
         T.Resize((img_size, img_size)),
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        # 轻度几何扰动
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.5),
-        # T.RandomRotation(degrees=15),
-        # 亮度/对比度扰动
-        T.RandomApply([T.ColorJitter(brightness=0.25, contrast=0.25)], p=0.8),
-        T.RandomAutocontrast(p=0.2),
-        # T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
     ])
 
-    train_dataset = LinearProbDataset(root=data_root, split="train", transforms=transform_aug)
-    val_dataset = LinearProbDataset(root=data_root, split="val", transforms=transform_aug)
+    train_dataset = LinearProbDataset(root=data_root, split="train", transforms=transform)
+    val_dataset = LinearProbDataset(root=data_root, split="val", transforms=transform)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
@@ -161,9 +149,7 @@ def main()-> None:
     linearProb_model_config = LinearProbConfig(
         in_c=in_c,
         in_size=in_size,
-        hidden_dim=hidden_dim,
         out_dim=out_dim,
-        dropout_ratio=dropout_ratio
     )
     model = build_LinearProb_model(linearProb_model_config, backbone_weights_path)
 

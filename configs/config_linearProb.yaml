@@ -4,16 +4,14 @@ runtime:
 
 data:
   data_root: "./data/processed/Urinary Sediment Dataset"
-  batch_size: 16    # (16, 32)
-  img_size: 224
+  batch_size: 32    # (16, 32)
+  img_size: 384
 
 linearProb_model_config:
   in_c: 512
-  in_size: 14   # 1/16 img_size
-  hidden_dim: 1024
+  in_size: 24   # 1/16 img_size
   out_dim: 1
-  dropout_ratio: 0.5
-  backbone_weights_path: "./results/model_weights/Vgg16_backbone.pth"
+  backbone_weights_path: "./results/model_weights/Vgg16_backbone_260122.pth"
 
 linearProb_trainer_config:
   num_classes: 7  # number of classes
@@ -24,5 +22,5 @@ linearProb_trainer_config:
   weight_decay: 0.05
   checkpoints_save_path: "./checkpoints/linearProb/"
   model_save_path: "./results/model_weights/"
-  continue_train: True
-  checkpoint_path: "./checkpoints/linearProb/checkpoint_10.pth"   # ./checkpoints/linearProb/checkpoint_{epoch}.pth
+  continue_train: False
+  checkpoint_path: ""   # ./checkpoints/linearProb/checkpoint_{epoch}.pth

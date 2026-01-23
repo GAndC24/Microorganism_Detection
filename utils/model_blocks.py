@@ -1,3 +1,9 @@
+'''
+ref. from https://github.com/CVI-SZU/CCAM
+ref. from https://github.com/zxhuang1698/interpretability-by-parts
+ref. from https://github.com/Sierkinhane/ORNet
+modified by
+'''
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +15,7 @@ import fvcore.nn.weight_init as weight_init
 from timm.models.vision_transformer import PatchEmbed
 import numpy as np
 from sklearn.mixture import GaussianMixture
+from utils import SimMaxLoss, SimMinLoss
 
 # Feature Hook to extract Multi-level features of backbone
 class FeatureHook:
@@ -284,11 +291,19 @@ class MorphologicalPrototypeGenerator(nn.Module):
         # patch embedding
         patch_features = self.patch_embed(roi_features)     # [R, Np = num_patches, D]
         R, Np, D = patch_features.shape
-        cls_patch_features = patch_features.reshape(R * Np, D)
-        patch_logits = self.cls_head(cls_patch_features)      # [R * Np, num_classes]
+        # cls_patch_features = patch_features.reshape(R * Np, D)
+        # patch_logits = self.cls_head(cls_patch_features)      # [R * Np, num_classes]
 
         # get fg/bg scores for each patch
         patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, wb_labels)      # [R, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
+
+        # select top-k patches based on fg scores
+        top_k_ratio = 0.25      # [0.2, 0.3]
+        k = int(max(1, Np * top_k_ratio))
+        topk_fg_scores, topk_indices = torch.topk(patch_fg_bg_scores[:, :, 0], k=k, dim=1)    # [R, k]
+        patch_indices = torch.arange(R, device=x.device).unsqueeze(1).expand(-1, k)    # [R, k]
+        cls_patch_features = patch_features[patch_indices, topk_indices]    # [R, k, D]
+        patch_logits = self.cls_head(cls_patch_features.reshape(R * k, D))      # [R * k, num_classes]
 
         # get anchor feature of each weak box
         anchor_features_list : List[torch.Tensor] = []
@@ -314,6 +329,50 @@ class MorphologicalPrototypeGenerator(nn.Module):
         prototypes = self._get_morphological_prototypes(patch_features, weights, wb_labels)        # {class_id : prototype tensor}
 
         return loss_cam, prototypes, patch_logits
+
+# CCAM Generator, generate CCAMs and compute CCAM loss
+class CCAMGenerator(nn.Module):
+    def __init__(
+        self,
+        in_c : int,     # input channels
+        alpha : float = 0.05
+    )-> None:
+        super(CCAMGenerator, self).__init__()
+
+        self.activation_head = nn.Conv2d(in_c, 1, kernel_size=3, padding=1, bias=False)
+        self.bn_head = nn.BatchNorm2d(1)
+        self.criterion = [
+            SimMaxLoss(metric='cos', alpha=alpha), # BG-BG positive contrast
+            SimMinLoss(metric='cos'),   # BG-FG negative contrast
+            SimMaxLoss(metric='cos', alpha=alpha)   # FG-FG positive contrast
+        ]
+
+    def forward(self, x : torch.Tensor)-> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        :param x: input feature maps, [N, C, H, W]
+        :return:
+        - ccam: class activation map, [N, 1, H, W]
+        - loss_ccam: CCAM loss
+        """
+        N, C, H, W = x.size()
+
+        ccam = torch.sigmoid(self.bn_head(self.activation_head(x)))
+        ccam_ = ccam.reshape(N, 1, H * W)                          # [N, 1, H*W]
+
+        x = x.reshape(N, C, H * W).permute(0, 2, 1).contiguous()   # [N, H*W, C]
+        fg_feats = torch.matmul(ccam_, x) / (H * W)                # [N, 1, C]
+        bg_feats = torch.matmul(1 - ccam_, x) / (H * W)            # [N, 1, C]
+        fg_feats = fg_feats.reshape(x.size(0), -1)      # [N, C]
+        bg_feats = bg_feats.reshape(x.size(0), -1)      # [N, C]
+        for loss in self.criterion:
+            loss.to(x.device)
+
+        loss_bg_bg = self.criterion[0](bg_feats)
+        loss_bg_fg = self.criterion[1](bg_feats, fg_feats)
+        loss_fg_fg = self.criterion[2](fg_feats)
+        loss_ccam = loss_bg_bg + loss_bg_fg + loss_fg_fg
+
+        return ccam, loss_ccam
 
 # Build backbone hook
 def build_backbone_hook(backbone : nn.Module, indices : List[int]) -> FeatureHook:
