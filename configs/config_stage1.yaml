@@ -32,14 +32,14 @@ stage1_trainer_config:
   model_save_path: "./results/model_weights/"
   dataset_mps_save_path: "./dataset_morphological_prototypes/"
   continue_train: True
-  checkpoint_path: "./checkpoints/stage1/checkpoint_40.pth"  # ./checkpoints/stage1/checkpoint_{epoch}.pth
+  checkpoint_path: "./checkpoints/stage1/checkpoint_37.pth"  # ./checkpoints/stage1/checkpoint_{epoch}.pth
   w_img_loss: 0.2   # [0.1, 1.0]
   w_wbb_loss: 0.8   # [0.1, 1.0]  w_img_loss + w_wbb_loss = 1.0
   w_cam_loss: 0.8   # [0.1, 1.0]
   w_patch_loss: 1.0   # [0.1, 1.0]
-  mp_ema_alpha: 0.9   # [0.9, 0.99]
+  mp_ema_alpha: 0.99   # [0.9, 0.99]
 
-wbb_loss_config:
+supcon_loss_config:
   temperature: 0.07   # [0.05, 0.2]
   positives_cap: -1   # -1 for no cap, (2V, 4V, 6V, 8V) for cap
 

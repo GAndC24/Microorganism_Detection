@@ -274,13 +274,15 @@ class MorphologicalPrototypeGenerator(nn.Module):
         self,
         x : torch.Tensor,       # middle feature maps, [B, C, H, W]
         wboxes : torch.Tensor,    # weak boxes, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        wb_labels : torch.Tensor    # class label for weak boxes, [R, num_classes]
-    )-> Tuple[torch.Tensor, Dict[int, torch.Tensor], torch.Tensor]:
+        wb_labels : torch.Tensor,    # class label for weak boxes, [R, num_classes]
+        lse_alpha : float = 10.0    # LSE alpha
+    )-> Tuple[torch.Tensor, Dict[int, torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         :return:
         - CAM loss
         - prototypes, {class_id: prototype tensor}
-        - Patch logits, [R * Np, D]
+        - patch logits, [R * Np, D]
+        - patch features for SupCon, [R, view = 1, D]
         """
         # RoI Align to get weak box features
         roi_features = self.roi_align(x, wboxes)       # [R = num_wboxes, C, H, W]
@@ -289,10 +291,9 @@ class MorphologicalPrototypeGenerator(nn.Module):
         cams, loss_cam = self.cam_head(roi_features, wb_labels)        # cams, [R, num_classes, H, W]
 
         # patch embedding
-        patch_features = self.patch_embed(roi_features)     # [R, Np = num_patches, D]
+        roi_features_detached = roi_features.detach()   # detach to avoid affecting backbone
+        patch_features = self.patch_embed(roi_features_detached)     # [R, Np = num_patches, D]
         R, Np, D = patch_features.shape
-        # cls_patch_features = patch_features.reshape(R * Np, D)
-        # patch_logits = self.cls_head(cls_patch_features)      # [R * Np, num_classes]
 
         # get fg/bg scores for each patch
         patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, wb_labels)      # [R, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
@@ -302,8 +303,16 @@ class MorphologicalPrototypeGenerator(nn.Module):
         k = int(max(1, Np * top_k_ratio))
         topk_fg_scores, topk_indices = torch.topk(patch_fg_bg_scores[:, :, 0], k=k, dim=1)    # [R, k]
         patch_indices = torch.arange(R, device=x.device).unsqueeze(1).expand(-1, k)    # [R, k]
-        cls_patch_features = patch_features[patch_indices, topk_indices]    # [R, k, D]
-        patch_logits = self.cls_head(cls_patch_features.reshape(R * k, D))      # [R * k, num_classes]
+        topk_patch_features = patch_features[patch_indices, topk_indices]    # [R, k, D]
+
+        # get patch logits for classification
+        patch_logits = self.cls_head(topk_patch_features.reshape(R * k, D))      # [R * k, num_classes]
+
+        # LogSumExp for topk_patch_features
+        x_lse = lse_alpha * topk_patch_features  # [R, k, D]
+        contrast_patch_features = torch.logsumexp(x_lse, dim=1) / lse_alpha   # [R, D]
+        contrast_patch_features = F.normalize(contrast_patch_features, p=2, dim=-1)  # [R, D]
+        contrast_patch_features = contrast_patch_features.view(R, 1, D)     # for SupCon format, [R, view = 1, D]
 
         # get anchor feature of each weak box
         anchor_features_list : List[torch.Tensor] = []
@@ -320,15 +329,11 @@ class MorphologicalPrototypeGenerator(nn.Module):
         weights = (patch_features * anchor_features.unsqueeze(1)).sum(dim=-1)  # [R, Np]
         weights = F.relu(weights)  # ReLU, remove negative value
         weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)  # normalize to sum to 1
-        # with open("debug_data.txt", "w") as f:
-        #     for i in range(weights.size(0)):
-        #         f.write(f"Weights for weak box {i}:\n")
-        #         f.write(", ".join([f"{w:.4f}" for w in weights[i].cpu().detach().numpy()]) + "\n")
 
         # get morphological prototypes
         prototypes = self._get_morphological_prototypes(patch_features, weights, wb_labels)        # {class_id : prototype tensor}
 
-        return loss_cam, prototypes, patch_logits
+        return loss_cam, prototypes, patch_logits, contrast_patch_features
 
 # CCAM Generator, generate CCAMs and compute CCAM loss
 class CCAMGenerator(nn.Module):

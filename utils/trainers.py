@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from utils import Logger, get_img_contrast_loss, WBBLossConfig, supervised_contrastive_loss, get_patch_loss
+from utils import Logger, get_img_contrast_loss, SupConLossConfig, LossContrastMode, supervised_contrastive_loss, get_patch_loss
 from tqdm.auto import tqdm
 from torchmetrics import MetricCollection, Precision, Recall, F1Score, AUROC, Accuracy, AveragePrecision
 
@@ -93,12 +93,12 @@ class Stage1Trainer:
         model: nn.Module,
         train_loader: DataLoader,
         config: Stage1TrainerConfig,
-        wbb_loss_config : WBBLossConfig,
+        supcon_loss_config : SupConLossConfig,
     )-> None:
         self.model = model
         self.train_loader = train_loader
         self.config = config
-        self.wbb_loss_config = wbb_loss_config
+        self.supcon_loss_config = supcon_loss_config
         self.w_img_loss = config.w_img_loss
         self.w_wbb_loss = config.w_wbb_loss
         self.w_cam_loss = config.w_cam_loss
@@ -197,6 +197,8 @@ class Stage1Trainer:
         epoch_MFHA_loss = 0.0
         epoch_cam_loss = 0.0
         epoch_patch_loss = 0.0
+        epoch_patch_cls_loss = 0.0
+        epoch_patch_supcon_loss = 0.0
         for iter, (images, target) in pbar:
             images = [img.to(self.config.device) for img in images]
             targets = [{k: v.to(self.config.device) for k, v in t.items()} for t in target]
@@ -204,15 +206,19 @@ class Stage1Trainer:
             wboxes = _build_wboxes(targets).to(self.config.device)
             wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
             X = torch.stack(images, dim=0)
-            low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, patch_logits = self.model(X, wboxes, wb_one_hot_labels)
+            low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, patch_logits, contrast_patch_features = self.model(X, wboxes, wb_one_hot_labels)
             img_multi_hot_labels = _build_image_multi_hot(targets, self.config.num_classes).to(self.config.device)
 
             self._update_dataset_mps_ema(prototypes)
 
             loss_img = get_img_contrast_loss(low_latent_features, img_multi_hot_labels)
-            loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.wbb_loss_config)
+            loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.supcon_loss_config)
             loss_MFHA = self.w_img_loss * loss_img + self.w_wbb_loss * loss_wbb
-            loss_patch = get_patch_loss(patch_logits, wb_one_hot_labels)
+            loss_patch_cls = get_patch_loss(patch_logits, wb_one_hot_labels)
+            supcon_loss_config = self.supcon_loss_config
+            supcon_loss_config.contrast_mode = LossContrastMode.ONE_VIEW
+            loss_patch_supcon = supervised_contrastive_loss(contrast_patch_features, wb_one_hot_labels, supcon_loss_config)
+            loss_patch = loss_patch_cls + loss_patch_supcon
             loss = loss_MFHA + self.w_cam_loss * loss_cam + self.w_patch_loss * loss_patch
 
             self.optimizer.zero_grad()
@@ -226,12 +232,16 @@ class Stage1Trainer:
             epoch_MFHA_loss += loss_MFHA.item()
             epoch_cam_loss += loss_cam.item()
             epoch_patch_loss += loss_patch.item()
+            epoch_patch_cls_loss += loss_patch_cls.item()
+            epoch_patch_supcon_loss += loss_patch_supcon.item()
 
             pbar.set_postfix({
                 "Iter Loss: Total": f"{loss.item():.4f} ",
                 "MFHA": f"{loss_MFHA.item():.4f} ",
                 "CAM": f"{loss_cam.item():.4f} ",
                 "Patch": f"{loss_patch.item():.4f} ",
+                "patch_cls" : f"{loss_patch_cls.item():.4f} ",
+                "patch_supcon" : f"{loss_patch_supcon.item():.4f} ",
                 "img": f"{loss_img.item():.4f} ",
                 "wbb": f"{loss_wbb.item():.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
@@ -246,6 +256,8 @@ class Stage1Trainer:
         average_MFHA_loss = epoch_MFHA_loss / num_iters
         average_cam_loss = epoch_cam_loss / num_iters
         average_patch_loss = epoch_patch_loss / num_iters
+        average_patch_cls_loss = epoch_patch_cls_loss / num_iters
+        average_patch_supcon_loss = epoch_patch_supcon_loss / num_iters
 
         self.logger.add_info(
             f"Epoch [{epoch}/{self.config.epochs}]"
@@ -254,7 +266,9 @@ class Stage1Trainer:
             f"Weak Box Contrast Loss: {average_wbb_loss:.4f}, "
             f"MFHA Loss: {average_MFHA_loss:.4f}, "
             f"CAM Loss: {average_cam_loss:.4f}\n"
-            f"Patch Loss: {average_patch_loss:.4f}\n"
+            f"Patch Loss: {average_patch_loss:.4f} "
+            f"Patch CLS Loss : {average_patch_cls_loss:.4f} "
+            f"Patch SupCon Loss : {average_patch_supcon_loss:.4f} \n"
         )
         metrics = {
             'Epoch': epoch,
@@ -264,6 +278,8 @@ class Stage1Trainer:
             'MFHA Loss': average_MFHA_loss,
             'CAM Loss': average_cam_loss,
             'Patch Loss': average_patch_loss,
+            'Patch CLS Loss': average_patch_cls_loss,
+            'Patch SupCon Loss': average_patch_supcon_loss,
         }
         self.logger.add_metrics(metrics)
 
@@ -504,13 +520,13 @@ def build_stage1_trainer(
     model: nn.Module,
     train_loader: DataLoader,
     trainer_config: Stage1TrainerConfig,
-    wbb_loss_config : WBBLossConfig,
+    supcon_loss_config : SupConLossConfig,
 )-> Stage1Trainer:
     trainer = Stage1Trainer(
         model=model,
         train_loader=train_loader,
         config=trainer_config,
-        wbb_loss_config=wbb_loss_config,
+        supcon_loss_config=supcon_loss_config,
     )
 
     return trainer

@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
 from datasets import UrinarySedimentDataset, detection_collate_fn
 from models import Stage1Config, build_Stage1_model
-from utils import Stage1TrainerConfig, WBBLossConfig, build_stage1_trainer, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps, Logger
+from utils import Stage1TrainerConfig, SupConLossConfig, build_stage1_trainer, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps, Logger
 
 def _load_yaml(config_path : str)-> Dict[str, Any]:
     config_path = Path(config_path)
@@ -164,12 +164,12 @@ def main()-> None:
         f"  MP EMA Alpha: {mp_ema_alpha}\n"
     )
 
-    # weak box contrast loss configurations
-    wbb_loss_config = config["wbb_loss_config"]
-    temperature = wbb_loss_config["temperature"]
-    positives_cap = wbb_loss_config["positives_cap"]
+    # SupCon contrast loss configurations
+    supcon_loss_config = config["supcon_loss_config"]
+    temperature = supcon_loss_config["temperature"]
+    positives_cap = supcon_loss_config["positives_cap"]
     print(
-        "-----Weak Box Contrast Loss Configurations-----\n"
+        "-----Supervised Contrast Loss Configurations-----\n"
         f"  Temperature: {temperature}\n"
         f"  Positives Cap: {positives_cap}\n"
     )
@@ -221,7 +221,7 @@ def main()-> None:
     model = build_Stage1_model(stage1_config)
 
     # Initialize Trainer
-    wbb_loss_config = WBBLossConfig(
+    supcon_loss_config = SupConLossConfig(
         temperature=temperature,
         positives_cap=positives_cap
     )
@@ -252,7 +252,7 @@ def main()-> None:
         w_patch_loss=w_patch_loss,
         mp_ema_alpha=mp_ema_alpha
     )
-    trainer = build_stage1_trainer(model, train_loader, stage1_trainer_config, wbb_loss_config)
+    trainer = build_stage1_trainer(model, train_loader, stage1_trainer_config, supcon_loss_config)
 
     # Start Training
     trainer.train()

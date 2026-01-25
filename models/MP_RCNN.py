@@ -3,14 +3,15 @@ import torch
 import torch.nn as nn
 from typing import Tuple, List, Dict, Any
 from dataclasses import dataclass
-from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps
+from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, CCAMGenerator
 from torchvision.ops import RoIAlign
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models import vgg16
 from timm.models.vision_transformer import PatchEmbed
 import torch.nn.functional as F
 from torchvision.models.detection.image_list import ImageList
-
+import numpy as np
+import cv2
 
 @dataclass
 class Stage1Config:
@@ -53,6 +54,8 @@ class Stage2Config:
     rpn_pre_nms_top_n: Dict[str, int]  # pre NMS top N, {"training": int, "testing": int}
     rpn_post_nms_top_n: Dict[str, int]  # post NMS top N, {"training": int, "testing": int}
     rpn_nms_thresh: float  # RPN NMS threshold
+    # for CCAM
+    ccam_threshold : float # CCAM threshold
     # for RoI Align
     roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
     spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
@@ -78,6 +81,8 @@ class PrototypeCheckerConfig:
     spatial_scale : float  # spatial scale for high feature maps
     sampling_ratio: int = 2  # sampling ratio
     aligned: bool = True  # aligned flag
+
+_CONTOUR_INDEX = 1 if cv2.__version__.split('.')[0] == '3' else 0
 
 # MP R-CNN Stage 1: Multi-Hierarchy Feature Alignment and Construct Prototypes
 class Stage1(nn.Module):
@@ -143,14 +148,7 @@ class Stage1(nn.Module):
         x: torch.Tensor,
         wboxes: torch.Tensor,  # weak boxes, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels: torch.Tensor  # class label for weak boxes, [R, num_classes]
-    )-> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Dict[str, torch.Tensor],
-        torch.Tensor
-    ]:
+    )-> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         :return:
         - low-level latent features, [B, C1]
@@ -158,7 +156,8 @@ class Stage1(nn.Module):
         - high-level embedding features, [B, D]
         - CAM loss
         - prototypes, {class_id, prototype tensor}
-        - Patch logits, [R * k, D]
+        - patch logits, [R * k, D]
+        - patch features for SupCon, [R, view = 1, D]
         """
         # -----get multi-level feature maps-----
         self.hook.clear()
@@ -191,9 +190,9 @@ class Stage1(nn.Module):
         high_aug_embedding_features = high_aug_embedding_features.view(R, V, self.embed_dim)  # [R, V, D]
 
         # -----construct prototypes-----
-        loss_cam, prototypes, patch_logits = self.mp_generator(mid_feature_maps, wboxes, wb_labels)        # {class_id : prototype tensor}
+        loss_cam, prototypes, patch_logits, contrast_patch_features = self.mp_generator(mid_feature_maps, wboxes, wb_labels)        # {class_id : prototype tensor}
 
-        return low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, patch_logits
+        return low_latent_features, high_feature_maps, high_aug_embedding_features, loss_cam, prototypes, patch_logits, contrast_patch_features
 
 # MP R-CNN Stage 2: Unsupervised Proposal Generation and Object Detection
 class Stage2(nn.Module):
@@ -266,6 +265,8 @@ class Stage2(nn.Module):
         # Object Classifier
         self.obj_classifier = nn.Linear(config.embed_dim, self.config.num_classes + 1)  # num_classes + 1(for background class)
 
+        # CCAM Generator
+        self.ccam_generator = CCAMGenerator(in_c=self.config.in_c)
 
 
     @torch.no_grad()
@@ -298,10 +299,83 @@ class Stage2(nn.Module):
 
         return dense_proposals_list
 
+    def _check_scoremap_validity(self, scoremap : np.ndarray)-> None:
+        if not isinstance(scoremap, np.ndarray):
+            raise TypeError("Scoremap must be a numpy array; it is {}."
+                            .format(type(scoremap)))
+        if scoremap.dtype != np.float32:
+            raise TypeError("Scoremap must be of np.float type; it is of {} type."
+                            .format(scoremap.dtype))
+        if len(scoremap.shape) != 2:
+            raise ValueError("Scoremap must be a 2D array; it is {}D."
+                             .format(len(scoremap.shape)))
+        if np.isnan(scoremap).any():
+            raise ValueError("Scoremap must not contain nans.")
+        if (scoremap > 1).any() or (scoremap < 0).any():
+            raise ValueError("Scoremap must be in range [0, 1]."
+                             "scoremap.min()={}, scoremap.max()={}."
+                             .format(scoremap.min(), scoremap.max()))
+
+    def _compute_bboxes_from_scoremaps(
+        self,
+        scoremap : np.ndarray,      # numpy.ndarray(dtype=np.float32, size=(H, W)) between 0 and 1
+        scoremap_threshold_list : List,     # iterable, list of threshold
+        factor : float,     # scale factor from score map to original image
+        multi_contour_eval : bool = False   # flag for multi-contour evaluation
+    )-> Tuple[List[np.ndarray], List[int]]:
+        """
+        Copy from: https://github.com/clovaai/wsolevaluation
+        :returns:
+        - estimated_boxes_at_each_thr: list of estimated boxes (list of np.array) at each cam threshold
+        - number_of_box_list: list of the number of boxes at each cam threshold
+        """
+
+        self._check_scoremap_validity(scoremap)
+        height, width = scoremap.shape
+        scoremap_image = np.expand_dims((scoremap * 255).astype(np.uint8), 2)
+
+        def scoremap2bbox(threshold):
+            _, thr_gray_heatmap = cv2.threshold(
+                src=scoremap_image,
+                thresh=int(threshold * np.max(scoremap_image)),
+                maxval=255,
+                type=cv2.THRESH_BINARY)
+            contours = cv2.findContours(
+                image=thr_gray_heatmap,
+                mode=cv2.RETR_TREE,
+                method=cv2.CHAIN_APPROX_SIMPLE)[_CONTOUR_INDEX]
+
+            if len(contours) == 0:
+                return np.asarray([[0, 0, 0, 0]]), 1
+
+            if not multi_contour_eval:
+                contours = [max(contours, key=cv2.contourArea)]
+
+            estimated_boxes = []
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                x0, y0, x1, y1 = x, y, x + w, y + h
+                x1 = min(x1, width - 1)
+                y1 = min(y1, height - 1)
+
+                estimated_boxes.append([x0 * factor, y0 * factor, x1 * factor, y1 * factor])
+
+            return np.asarray(estimated_boxes), len(contours)
+
+        estimated_boxes_at_each_thr = []
+        number_of_box_list = []
+        for threshold in scoremap_threshold_list:
+            boxes, number_of_box = scoremap2bbox(threshold)
+            estimated_boxes_at_each_thr.append(boxes)
+            number_of_box_list.append(number_of_box)
+
+        return estimated_boxes_at_each_thr, number_of_box_list
+
     def _forward_train(
         self,
         imgs: torch.Tensor,  # input images, [B, C, H, W]
         wboxes: torch.Tensor,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+        wb_labels: torch.Tensor  # class label for weak boxes, [R, num_classes]
     ):
         # -----get high-level feature maps-----
         self.encoder[-1] = nn.Identity()
@@ -314,30 +388,38 @@ class Stage2(nn.Module):
         # get dense proposals
         dense_proposals_list = self._get_dense_proposals(wb_feature_maps, wboxes)  # List[Tensor], len=R, each Tensor is [num_proposals, 4]
         dense_proposal_boxes = torch.cat(dense_proposals_list, dim=0)  # [N_D = total_num_proposals, 4]
+
         # get proposal features
         dense_proposal_features = self.roi_align_wb2p(wb_feature_maps, dense_proposals_list)    # [N_D = total_num_proposals, C_h, H_p, W_p]
+
         # Object Discovery
         # Dense proposal features to embeddings
         dense_proposal_features = self.gap(dense_proposal_features)  # [N_D, C_h, 1, 1]
         dense_proposal_features = dense_proposal_features.view(dense_proposal_features.shape[0], -1)    # [N_D, C_h]
         dense_proposal_embeddings = self.proj(dense_proposal_features)  # [N_D, D = embed_dim]
+
         # get object scores
         dense_proposal_object_scores = self.obj_classifier(dense_proposal_embeddings)  # [N_D, num_classes + 1]
         dense_proposal_object_scores = F.softmax(dense_proposal_object_scores, dim=1)  # [N_D, num_classes + 1]
+
         # get prototypes embeddings
         prototypes = torch.stack([self.config.dataset_mps[k] for k in range(self.config.num_classes)], dim=0)  # [num_classes, D_p = C_h]
         prototypes_embeddings = self.proj(prototypes)  # [num_classes, D]
+
         # select Top-Scoring proposals for each class
         top_scoring_proposal_indices = dense_proposal_object_scores.argmax(dim=0)  # [num_classes + 1]
         top_scoring_proposal_embeddings = dense_proposal_embeddings[top_scoring_proposal_indices[:-1]]  # [num_classes, D]
         top_scoring_proposal_boxes = dense_proposal_boxes[top_scoring_proposal_indices[:-1]]  # [num_classes, 4]
+
         # L2 Normalize
         dense_proposal_embeddings = F.normalize(dense_proposal_embeddings, dim=1)  # [N_D, D]
         prototypes_embeddings = F.normalize(prototypes_embeddings, dim=1)  # [num_classes, D]
         top_scoring_proposal_embeddings = F.normalize(top_scoring_proposal_embeddings, dim=1)  # [num_classes, D]
+
         # get threshold for each class
         thresholds = F.cosine_similarity(top_scoring_proposal_embeddings, prototypes_embeddings, dim=1)  # [num_classes]
         sims_all = torch.matmul(dense_proposal_embeddings, prototypes_embeddings.t())  # [N_D, num_classes]
+
         # get sparse proposals
         sparse_mask = sims_all > thresholds.unsqueeze(0)  # [N_D, num_classes]
         sparse_proposals : List[Dict] = []
@@ -351,6 +433,25 @@ class Stage2(nn.Module):
                 })
 
         # -----Branch 2: get seed proposals-----
+        # get CCAM and loss_ccam
+        ccam, loss_ccam = self.ccam_generator(wb_feature_maps)      # [R, 1, H_wb, W_wb]
+
+        # get seed proposals from CCAM
+        seed_proposals : List[Dict] = []
+        R, _, _, _ = ccam.shape
+        for i in range(R):
+            ccam_i = ccam[i, 0, :, :].detach().cpu().numpy().astype(np.float32)  # scoremap, [H_wb, W_wb]
+            scale = self.config.img_size[-1] / ccam_i[-1]       # scale from feature map to original image
+            class_id = wb_labels[i].argmax().item()
+            boxes_list_at_each_thr, _  = self._compute_bboxes_from_scoremaps(ccam_i, [self.config.ccam_threshold], scale)
+            for box in boxes_list_at_each_thr[0]:
+                seed_proposals.append({
+                    "box" : torch.tensor(box, device=wb_feature_maps.device, dtype=torch.float32),
+                    "class_id" : class_id,
+                })
+
+        # get augment seed proposals
+
 
 
 
@@ -365,9 +466,10 @@ class Stage2(nn.Module):
         mode: str,  # "train" or "inference"
         imgs: torch.Tensor,  # input images, [B, C, H, W]
         wboxes: torch.Tensor = None,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+        wb_labels : torch.Tensor = None     # class label for weak boxes, [R, num_classes]
     ):
         if mode == "train":
-            return self._forward_train(imgs, wboxes)
+            return self._forward_train(imgs, wboxes, wb_labels)
         elif mode == "inference":
             return self._forward_inference(imgs)
 

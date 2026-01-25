@@ -112,7 +112,7 @@ class LossDenominatorMode(str, Enum):
 
 # Loss Config
 @dataclass
-class WBBLossConfig:
+class SupConLossConfig:
     temperature: float = 0.07
     contrast_mode: LossContrastMode = LossContrastMode.ALL_VIEWS
     summation_location: LossSummationLocation = LossSummationLocation.OUTSIDE
@@ -220,7 +220,7 @@ def _cap_positives_mask(
 def supervised_contrastive_loss(
     features: torch.Tensor,                 # [B = num_wbb, V = num_views, D]
     labels: Optional[torch.Tensor] = None,  # [B = num_wbb, num_classes] one-hot
-    cfg: WBBLossConfig = WBBLossConfig(),
+    cfg: SupConLossConfig = SupConLossConfig(),
 ) -> torch.Tensor:
     """:return: loss: Weal Box Contrastive Loss pre sample, [B]"""
     # Minimal inline checks

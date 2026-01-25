@@ -17,6 +17,7 @@ stage2_model_config:
   rpn_pre_nms_top_n: 4000, 2000  # train: [2000, 6000], test: [1000, 3000]
   rpn_post_nms_top_n: 2000, 1000 # train: [2000, 4000], test: [1000, 2000]
   rpn_nms_thresh: 0.8  # [0.7, 0.9]
+  ccam_threshold:
   roi_out_size_h2wb: 21   # [21, 24]
   roi_out_size_wb2p: 7
   spatial_scale_wb2p: 1.0
