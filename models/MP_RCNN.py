@@ -1,7 +1,7 @@
 # Morphological Prototype R-CNN
 import torch
 import torch.nn as nn
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Union
 from dataclasses import dataclass
 from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, CCAMGenerator
 from torchvision.ops import RoIAlign
@@ -299,77 +299,106 @@ class Stage2(nn.Module):
 
         return dense_proposals_list
 
-    def _check_scoremap_validity(self, scoremap : np.ndarray)-> None:
-        if not isinstance(scoremap, np.ndarray):
-            raise TypeError("Scoremap must be a numpy array; it is {}."
-                            .format(type(scoremap)))
-        if scoremap.dtype != np.float32:
-            raise TypeError("Scoremap must be of np.float type; it is of {} type."
-                            .format(scoremap.dtype))
-        if len(scoremap.shape) != 2:
-            raise ValueError("Scoremap must be a 2D array; it is {}D."
-                             .format(len(scoremap.shape)))
-        if np.isnan(scoremap).any():
-            raise ValueError("Scoremap must not contain nans.")
-        if (scoremap > 1).any() or (scoremap < 0).any():
-            raise ValueError("Scoremap must be in range [0, 1]."
-                             "scoremap.min()={}, scoremap.max()={}."
-                             .format(scoremap.min(), scoremap.max()))
-
-    def _compute_bboxes_from_scoremaps(
+    def _get_multi_bboxes(
         self,
-        scoremap : np.ndarray,      # numpy.ndarray(dtype=np.float32, size=(H, W)) between 0 and 1
-        scoremap_threshold_list : List,     # iterable, list of threshold
-        factor : float,     # scale factor from score map to original image
-        multi_contour_eval : bool = False   # flag for multi-contour evaluation
-    )-> Tuple[List[np.ndarray], List[int]]:
+        cam : np.ndarray,     # [h, w, 1]
+        cam_thr : float = 0.2,        # threshold, [0, 1]
+        area_ratio : float =0.5
+    )-> List[List[int]]:
         """
-        Copy from: https://github.com/clovaai/wsolevaluation
-        :returns:
-        - estimated_boxes_at_each_thr: list of estimated boxes (list of np.array) at each cam threshold
-        - number_of_box_list: list of the number of boxes at each cam threshold
+        Copy from : https://github.com/MingXiangL/SPE
+        :return: estimated bounding box: len(contours), each is [x1, y1, x2, y2]
         """
+        cam = (cam * 255.).astype(np.uint8)
+        map_thr = cam_thr * np.max(cam)
 
-        self._check_scoremap_validity(scoremap)
-        height, width = scoremap.shape
-        scoremap_image = np.expand_dims((scoremap * 255).astype(np.uint8), 2)
+        _, thr_gray_heatmap = cv2.threshold(cam,
+                                            int(map_thr), 255,
+                                            cv2.THRESH_TOZERO)
+        # thr_gray_heatmap = (thr_gray_heatmap*255.).astype(np.uint8)
 
-        def scoremap2bbox(threshold):
-            _, thr_gray_heatmap = cv2.threshold(
-                src=scoremap_image,
-                thresh=int(threshold * np.max(scoremap_image)),
-                maxval=255,
-                type=cv2.THRESH_BINARY)
-            contours = cv2.findContours(
-                image=thr_gray_heatmap,
-                mode=cv2.RETR_TREE,
-                method=cv2.CHAIN_APPROX_SIMPLE)[_CONTOUR_INDEX]
+        contours, _ = cv2.findContours(thr_gray_heatmap,
+                                       cv2.RETR_TREE,
+                                       cv2.CHAIN_APPROX_SIMPLE)
 
-            if len(contours) == 0:
-                return np.asarray([[0, 0, 0, 0]]), 1
+        if len(contours) != 0:
+            estimated_bbox = []
+            areas = list(map(cv2.contourArea, contours))
+            area_idx = sorted(range(len(areas)), key=areas.__getitem__, reverse=True)
+            for idx in area_idx:
+                if areas[idx] >= areas[area_idx[0]] * area_ratio:
+                    c = contours[idx]
+                    x, y, w, h = cv2.boundingRect(c)
+                    estimated_bbox.append([x, y, x + w, y + h])
+            # areas1 = sorted(areas, reverse=True)
 
-            if not multi_contour_eval:
-                contours = [max(contours, key=cv2.contourArea)]
+            # pdb.set_trace()
 
-            estimated_boxes = []
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                x0, y0, x1, y1 = x, y, x + w, y + h
-                x1 = min(x1, width - 1)
-                y1 = min(y1, height - 1)
+            # estimated_bbox = [x, y, x + w, y + h]
+        else:
+            estimated_bbox = [[0, 0, 1, 1]]
 
-                estimated_boxes.append([x0 * factor, y0 * factor, x1 * factor, y1 * factor])
+        return estimated_bbox  # , thr_gray_heatmap, len(contours)
 
-            return np.asarray(estimated_boxes), len(contours)
+    def _map_boxes_roi_to_image_xyxy(
+        self,
+        boxes_local: Union[List[List[float]], torch.Tensor],    # list of [lx1, ly1, lx2, ly2] in ccam pixel coords, or Tensor [N, 4]
+        wbox: torch.Tensor,     # Tensor [5] = [batch_idx, x1, y1, x2, y2] in image coords
+        cam_hw: Tuple[int, int],    # (Hc, Wc) spatial size of ccam
+        img_hw: Tuple[int, int],    # (Himg, Wimg) spatial size of original image
+    ) -> torch.Tensor:
+        """
+        Map boxes from ROI-local coordinate system (ccam space) to image coordinate system.
+        :returns: boxes_global: Tensor [N, 4] in image coords (xyxy), float32
+        """
+        device = wbox.device
+        dtype = torch.float32
 
-        estimated_boxes_at_each_thr = []
-        number_of_box_list = []
-        for threshold in scoremap_threshold_list:
-            boxes, number_of_box = scoremap2bbox(threshold)
-            estimated_boxes_at_each_thr.append(boxes)
-            number_of_box_list.append(number_of_box)
+        if isinstance(boxes_local, list):
+            if len(boxes_local) == 0:
+                return torch.zeros((0, 4), device=device, dtype=dtype)
+            boxes_local = torch.tensor(boxes_local, device=device, dtype=dtype)
+        else:
+            boxes_local = boxes_local.to(device=device, dtype=dtype)
 
-        return estimated_boxes_at_each_thr, number_of_box_list
+        # Unpack
+        _, x1, y1, x2, y2 = wbox.to(dtype=dtype)
+        Hc, Wc = cam_hw
+        Himg, Wimg = img_hw
+
+        # Avoid division by zero
+        Wc = max(int(Wc), 1)
+        Hc = max(int(Hc), 1)
+
+        roi_w = (x2 - x1).clamp(min=1e-6)
+        roi_h = (y2 - y1).clamp(min=1e-6)
+
+        # Scale from cam pixels to image pixels within ROI
+        sx = roi_w / float(Wc)
+        sy = roi_h / float(Hc)
+
+        # Map
+        gx1 = x1 + boxes_local[:, 0] * sx
+        gy1 = y1 + boxes_local[:, 1] * sy
+        gx2 = x1 + boxes_local[:, 2] * sx
+        gy2 = y1 + boxes_local[:, 3] * sy
+
+        boxes_global = torch.stack([gx1, gy1, gx2, gy2], dim=-1)
+
+        # Clamp to image bounds
+        boxes_global[:, 0].clamp_(0, Wimg - 1)
+        boxes_global[:, 2].clamp_(0, Wimg - 1)
+        boxes_global[:, 1].clamp_(0, Himg - 1)
+        boxes_global[:, 3].clamp_(0, Himg - 1)
+
+        # Ensure x1<=x2, y1<=y2 (robustness)
+        x_min = torch.min(boxes_global[:, 0], boxes_global[:, 2])
+        x_max = torch.max(boxes_global[:, 0], boxes_global[:, 2])
+        y_min = torch.min(boxes_global[:, 1], boxes_global[:, 3])
+        y_max = torch.max(boxes_global[:, 1], boxes_global[:, 3])
+        boxes_global = torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+
+        return boxes_global
 
     def _forward_train(
         self,
@@ -387,7 +416,14 @@ class Stage2(nn.Module):
         # -----Branch 1: get sparse proposals-----
         # get dense proposals
         dense_proposals_list = self._get_dense_proposals(wb_feature_maps, wboxes)  # List[Tensor], len=R, each Tensor is [num_proposals, 4]
-        dense_proposal_boxes = torch.cat(dense_proposals_list, dim=0)  # [N_D = total_num_proposals, 4]
+        wbox_batch_idx = wboxes[:, 0].to(device=wb_feature_maps.device)  # [R]
+        dense_proposal_boxes_list = []
+        for i, props_xyxy in enumerate(dense_proposals_list):
+            # props_xyxy: [num_proposals, 4]
+            bi = wbox_batch_idx[i].expand(props_xyxy.shape[0], 1).to(dtype=props_xyxy.dtype)  # [num_proposals, 1]
+            props_5 = torch.cat([bi, props_xyxy], dim=1)  # [num_proposals, 5]
+            dense_proposal_boxes_list.append(props_5)
+        dense_proposal_boxes = torch.cat(dense_proposal_boxes_list, dim=0)  # [N_D = num_proposals, 5]
 
         # get proposal features
         dense_proposal_features = self.roi_align_wb2p(wb_feature_maps, dense_proposals_list)    # [N_D = total_num_proposals, C_h, H_p, W_p]
@@ -409,7 +445,7 @@ class Stage2(nn.Module):
         # select Top-Scoring proposals for each class
         top_scoring_proposal_indices = dense_proposal_object_scores.argmax(dim=0)  # [num_classes + 1]
         top_scoring_proposal_embeddings = dense_proposal_embeddings[top_scoring_proposal_indices[:-1]]  # [num_classes, D]
-        top_scoring_proposal_boxes = dense_proposal_boxes[top_scoring_proposal_indices[:-1]]  # [num_classes, 4]
+        # top_scoring_proposal_boxes = dense_proposal_boxes[top_scoring_proposal_indices[:-1]]  # [num_classes, 5]
 
         # L2 Normalize
         dense_proposal_embeddings = F.normalize(dense_proposal_embeddings, dim=1)  # [N_D, D]
@@ -427,7 +463,7 @@ class Stage2(nn.Module):
             indices = torch.where(sparse_mask[:, c])[0]
             for i in indices:
                 sparse_proposals.append({
-                    "box" : dense_proposal_boxes[i],
+                    "box" : dense_proposal_boxes[i],  # [5], (batch_idx, x1, y1, x2, y2)
                     "class_id" : c,
                     "score": dense_proposal_object_scores[i, c]
                 })
@@ -436,21 +472,36 @@ class Stage2(nn.Module):
         # get CCAM and loss_ccam
         ccam, loss_ccam = self.ccam_generator(wb_feature_maps)      # [R, 1, H_wb, W_wb]
 
-        # get seed proposals from CCAM
+        # get augmented seed proposals from CCAM
         seed_proposals : List[Dict] = []
         R, _, _, _ = ccam.shape
         for i in range(R):
-            ccam_i = ccam[i, 0, :, :].detach().cpu().numpy().astype(np.float32)  # scoremap, [H_wb, W_wb]
-            scale = self.config.img_size[-1] / ccam_i[-1]       # scale from feature map to original image
+            ccam_i = ccam[i].detach().cpu().numpy().transpose(1, 2, 0)      # [h, w, 1]
+            local_boxes_list = self._get_multi_bboxes(ccam_i, self.config.ccam_threshold)
+            # 过滤“无 contours”的默认返回框
+            if len(local_boxes_list) == 1 and local_boxes_list[0] == [0, 0, 1, 1]:
+                continue
+            # map local boxes to image boxes
+            wbox_i = wboxes[i]  # [5]
+            Himg, Wimg = imgs.shape[2], imgs.shape[3]
+            global_boxes_xyxy = self._map_boxes_roi_to_image_xyxy(
+                boxes_local=local_boxes_list,
+                wbox=wbox_i,
+                cam_hw=(ccam_i.shape[0], ccam_i.shape[1]),
+                img_hw=(Himg, Wimg)
+            )   # Tensor [N, 4]
+            batch_idx = wbox_i[0].to(global_boxes_xyxy).view(1, 1).repeat(global_boxes_xyxy.size(0), 1)
+            global_boxes_wbatch = torch.cat([batch_idx, global_boxes_xyxy], dim=1)      # [N, 5]
+
             class_id = wb_labels[i].argmax().item()
-            boxes_list_at_each_thr, _  = self._compute_bboxes_from_scoremaps(ccam_i, [self.config.ccam_threshold], scale)
-            for box in boxes_list_at_each_thr[0]:
+            for j in range(global_boxes_wbatch.size(0)):
                 seed_proposals.append({
-                    "box" : torch.tensor(box, device=wb_feature_maps.device, dtype=torch.float32),
+                    "box" : global_boxes_wbatch[j],  # Tensor [5], (batch_idx, x1, y1, x2, y2)
                     "class_id" : class_id,
                 })
 
-        # get augment seed proposals
+        # ----- one-to-one match-----
+
 
 
 
