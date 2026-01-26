@@ -10,6 +10,8 @@ stage2_model_config:
   img_size: 800  # (600, 800)
   in_c: 512
   freeze_backbone: False
+  hidden_dim: 512   # (256, 512, 768, 1024)
+  embed_dim: 512
   rpn_anchor_sizes : 32, 40, 64, 120, 208   # statistics-based sizes
   rpn_anchor_aspect_ratios: 0.89, 1.0, 1.15   # statistics-based ratios
   rpn_fg_iou_thresh: 0.6  # [0.5, 0.7]
@@ -24,6 +26,18 @@ stage2_model_config:
   cost_giou: 2.0
   rpn_pseudo_nms_thr: 0.7  # [0.6, 0.8]
   rpn_pseudo_topk: 200  # [100, 300]
+  match_focal_alpha: 0.25
+  match_focal_gamma: 2.0
+  lambda_match_cls: 2.0
+  lambda_match_l1: 2.0
+  lambda_match_giou: 2.0
+  det_fg_iou_thresh: 0.5  # [0.3, 0.5]
+  det_bg_iou_thresh: 0.1  # [0.0, 0.2]
+  det_batch_size_per_image: 128  # [128, 256]
+  det_positive_fraction: 0.25
+  det_score_thresh: 0.0   # for training = 0.0, for inference = [0.3, 0.5]
+  det_nms_thresh: 0.5
+  detections_per_img: 100
   roi_out_size_h2wb: 21   # [21, 24]
   roi_out_size_wb2p: 7
   spatial_scale_wb2p: 1.0

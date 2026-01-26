@@ -13,6 +13,11 @@ from torchvision.models.detection.image_list import ImageList
 import numpy as np
 import cv2
 from torchvision.ops import nms
+from torchvision.ops.boxes import generalized_box_iou
+import torch.nn.functional as F
+from torchvision.models.detection.roi_heads import RoIHeads
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, TwoMLPHead
+
 
 @dataclass
 class Stage1Config:
@@ -64,7 +69,21 @@ class Stage2Config:
     cost_giou: float  # bbox GIoU cost weight
     # for Pseudo Labels
     rpn_pseudo_nms_thr : float  # NMS threshold for pseudo labels
-    rpn_pseudo_topk : float  # top-k proposals for pseudo labels
+    rpn_pseudo_topk : int  # top-k proposals for pseudo labels
+    # for Match Loss
+    match_focal_alpha : float   # focal loss alpha
+    match_focal_gamma : float   # focal loss gamma
+    lambda_match_cls: float     # weight for match classification loss
+    lambda_match_l1: float    # weight for match L1 loss
+    lambda_match_giou: float    # weight for match giou loss
+    # for RoI Head
+    det_fg_iou_thresh: float  # foreground IoU threshold
+    det_bg_iou_thresh: float  # background IoU threshold
+    det_batch_size_per_image: int  # detection batch size per image
+    det_positive_fraction: float  # detection positive fraction
+    det_score_thresh: float  # detection score threshold
+    det_nms_thresh: float   # detection NMS threshold
+    detections_per_img: int # number of detections per image
     # for RoI Align
     roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
     spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
@@ -232,7 +251,7 @@ class Stage2(nn.Module):
             sampling_ratio=self.config.sampling_ratio,
             aligned=self.config.aligned,
         )
-        # (inference) RoI Align for high-level feature maps to proposal box feature maps
+        # (train and inference) RoI Align for high-level feature maps to proposal box feature maps
         self.roi_align_h2p = RoIAlign(
             output_size=self.config.roi_out_size_h2p,
             spatial_scale=self.config.spatial_scale_h2p,
@@ -282,6 +301,36 @@ class Stage2(nn.Module):
             cost_class=self.config.cost_class,
             cost_bbox=self.config.cost_bbox,
             cost_giou=self.config.cost_giou
+        )
+
+        # Box Head
+        resolution = self.config.roi_out_size_h2p[0]
+        box_head = TwoMLPHead(
+            in_channels=self.config.in_c * resolution * resolution,
+            representation_size=self.config.hidden_dim,
+        )
+
+        # Box Predictor（cls + reg）
+        box_predictor = FastRCNNPredictor(
+            in_channels=self.config.hidden_dim,
+            num_classes=self.config.num_classes + 1,  # include background
+        )
+
+        # RoI Heads (roi align + box head + box predictor)
+        self.roi_heads = RoIHeads(
+            box_roi_pool=self.roi_align_h2p,
+            box_head=box_head,
+            box_predictor=box_predictor,
+
+            fg_iou_thresh=self.config.det_fg_iou_thresh,
+            bg_iou_thresh=self.config.det_bg_iou_thresh,
+            batch_size_per_image=self.config.det_batch_size_per_image,
+            positive_fraction=self.config.det_positive_fraction,
+
+            bbox_reg_weights=None,
+            score_thresh=self.config.det_score_thresh,
+            nms_thresh=self.config.det_nms_thresh,
+            detections_per_img=self.config.detections_per_img,
         )
 
 
@@ -425,40 +474,26 @@ class Stage2(nn.Module):
         h = (y2 - y1).clamp(min=1e-6)
         return torch.stack([cx, cy, w, h], dim=-1)
 
-    def _score_to_logit(self, p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        # p in [0,1] -> logit
-        p = p.clamp(eps, 1 - eps)
-        return torch.log(p / (1 - p))
-
-    @torch.no_grad()
     def _match_sparse_seed_with_hungarian(
         self,
         sparse_proposals: List[Dict],
         seed_proposals: List[Dict],
         num_classes: int,
-        other_class_logit: float = -20.0,  # 非本类给极低 logit，强制按类匹配
-    ) -> List[Tuple[Dict, Dict]]:
+        other_class_logit: float = -20.0,
+    ) -> Tuple[List[Tuple[Dict, Dict]], List[Dict]]:
         """
-        :param sparse_proposals: List[Dict], each has:
-                                - "box": Tensor[5] = [batch_idx, x1, y1, x2, y2] (image coords, xyxy)
-                                - "class_id": int
-                                - "score": float, classification score(softmax probability)
-                                - "logit": float, classification logit
-        :param seed_proposals:  List[Dict], each has:
-                                - "box": Tensor[5] = [batch_idx, x1, y1, x2, y2] (image coords, xyxy)
-                                - "class_id": int
-        :param num_classes: int, number of classes
-        :param default_sparse_score:
-        :param other_class_logit:
-        :return: matched_pairs: List[(sparse_dict, seed_dict)] one-to-one per image
+        :return:
+          - matched_pairs: List[(sparse_dict, seed_dict)]
+          - unmatched_sparse: List[sparse_dict]  (treated as background for cls focal)
         """
         if len(sparse_proposals) == 0 or len(seed_proposals) == 0:
-            return []
+            return [], list(sparse_proposals)
 
         device = sparse_proposals[0]["box"].device
         matched_pairs: List[Tuple[Dict, Dict]] = []
+        unmatched_sparse: List[Dict] = []
 
-        # 1) 找出所有出现过的 batch_idx
+        # all batch ids
         batch_ids = sorted(set(
             [int(p["box"][0].item()) for p in sparse_proposals] +
             [int(t["box"][0].item()) for t in seed_proposals]
@@ -467,57 +502,158 @@ class Stage2(nn.Module):
         for b in batch_ids:
             sparse_b = [p for p in sparse_proposals if int(p["box"][0].item()) == b]
             seed_b = [t for t in seed_proposals if int(t["box"][0].item()) == b]
-            if len(sparse_b) == 0 or len(seed_b) == 0:
+
+            if len(sparse_b) == 0:
+                continue
+            if len(seed_b) == 0:
+                # no target => all sparse are unmatched(background)
+                unmatched_sparse.extend(sparse_b)
                 continue
 
-            # 2) 组装 outputs（pred_logits / pred_boxes）
             Ns = len(sparse_b)
-            pred_boxes_xyxy = torch.stack([p["box"][1:5] for p in sparse_b], dim=0).to(device=device, dtype=torch.float32)
-            pred_boxes = self._xyxy_to_cxcywh(pred_boxes_xyxy)  # matcher 默认按 cxcywh 做 L1 和 giou 转换
 
-            # pred_logits: [1, Ns, C]
+            # boxes for matcher
+            pred_boxes_xyxy = torch.stack([p["box"][1:5] for p in sparse_b], dim=0).to(device=device,
+                                                                                       dtype=torch.float32)
+            pred_boxes = self._xyxy_to_cxcywh(pred_boxes_xyxy)
+
+            # pred_logits for matcher: use only foreground C dims (exclude background dim)
             pred_logits = torch.full((1, Ns, num_classes), other_class_logit, device=device, dtype=torch.float32)
             for i, p in enumerate(sparse_b):
                 cls = int(p["class_id"])
-                logit = p.get("logit", None)
-                if logit is None:
-                    # 兜底：如果没提供 logit，就退化用 score 的 log 概率
-                    score = p.get("score", 0.5)
-                    score = float(score) if not torch.is_tensor(score) else float(score.item())
-                    logit = torch.tensor(score, device=device, dtype=torch.float32).clamp(1e-6, 1 - 1e-6)
-                    logit = torch.log(logit)  # log p
+                if "cls_logits" in p:
+                    # take foreground logit
+                    fg_logit = p["cls_logits"][cls].to(device=device, dtype=torch.float32)
                 else:
-                    logit = logit if torch.is_tensor(logit) else torch.tensor(float(logit), device=device)
-                    logit = logit.to(device=device, dtype=torch.float32)
+                    logit = p.get("logit", None)
+                    if logit is None:
+                        score = p.get("score", 0.5)
+                        score = float(score) if not torch.is_tensor(score) else float(score.item())
+                        fg_logit = torch.log(
+                            torch.tensor(score, device=device, dtype=torch.float32).clamp(1e-6, 1 - 1e-6))
+                    else:
+                        fg_logit = logit if torch.is_tensor(logit) else torch.tensor(float(logit), device=device)
+                        fg_logit = fg_logit.to(device=device, dtype=torch.float32)
+                pred_logits[0, i, cls] = fg_logit
 
-                pred_logits[0, i, cls] = logit
             outputs = {
                 "pred_logits": pred_logits,  # [1, Ns, C]
                 "pred_boxes": pred_boxes.unsqueeze(0),  # [1, Ns, 4]
             }
 
-            # 3) 组装 targets（labels / boxes）
+            # targets
             tgt_labels = torch.tensor([int(t["class_id"]) for t in seed_b], device=device, dtype=torch.long)
             tgt_boxes_xyxy = torch.stack([t["box"][1:5] for t in seed_b], dim=0).to(device=device, dtype=torch.float32)
             tgt_boxes = self._xyxy_to_cxcywh(tgt_boxes_xyxy)
             targets = [{"labels": tgt_labels, "boxes": tgt_boxes}]
 
-            # 4) 匹配
+            # hungarian
             indices = self.matcher(outputs, targets)
             src_idx, tgt_idx = indices[0]
 
+            matched_src = set(src_idx.tolist())
             for si, ti in zip(src_idx.tolist(), tgt_idx.tolist()):
                 matched_pairs.append((sparse_b[si], seed_b[ti]))
 
-        return matched_pairs
+            # collect unmatched
+            for i in range(Ns):
+                if i not in matched_src:
+                    unmatched_sparse.append(sparse_b[i])
+
+        return matched_pairs, unmatched_sparse
+
+    def _softmax_focal_loss(
+        self,
+        logits: torch.Tensor,  # [N, C+1]
+        targets: torch.Tensor,  # [N] in [0..C] (C=background)
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+    ) -> torch.Tensor:
+        log_probs = torch.log_softmax(logits, dim=-1)  # [N, C+1]
+        probs = torch.softmax(logits, dim=-1)  # [N, C+1]
+
+        idx = torch.arange(logits.size(0), device=logits.device)
+        pt = probs[idx, targets]  # [N]
+        logpt = log_probs[idx, targets]  # [N]
+
+        loss = - (alpha * (1.0 - pt).pow(gamma) * logpt)  # [N]
+        return loss.mean()
+
+    def _compute_loss_match(
+        self,
+        sparse_proposals: List[Dict],  # all sparse (matched+unmatched)
+        matched_pairs: List[Tuple[Dict, Dict]],  # matched pairs
+        imgs: torch.Tensor,  # [B, C, H, W]
+    ) -> Dict[str, torch.Tensor]:
+
+        device = imgs.device
+        C = self.config.num_classes
+        bg_id = C  # background index in [0..C]
+
+        N = len(sparse_proposals)
+        if N == 0:
+            z = torch.tensor(0.0, device=device)
+            return {"loss_match": z, "loss_match_cls": z, "loss_match_l1": z, "loss_match_giou": z}
+
+        # ---------- (1) classification targets for ALL sparse ----------
+        # default all background
+        cls_targets = torch.full((N,), bg_id, device=device, dtype=torch.long)
+
+        # matched -> set to seed class_id (or sparse class_id; usually一致)
+        matched_sp_idx = []
+        for sp, sd in matched_pairs:
+            matched_sp_idx.append(int(sp["sp_idx"]))
+            cls_targets[int(sp["sp_idx"])] = int(sd["class_id"])  # safer: use seed label as GT
+
+        # logits [N, C+1]
+        cls_logits = torch.stack([p["cls_logits"].to(device=device, dtype=torch.float32) for p in sparse_proposals],
+                                 dim=0)
+
+        alpha = self.config.match_focal_alpha
+        gamma = self.config.match_focal_gamma
+        loss_cls = self._softmax_focal_loss(cls_logits, cls_targets, alpha=alpha, gamma=gamma)
+
+        # ---------- (2) regression only for matched ----------
+        K = len(matched_pairs)
+        if K == 0:
+            loss_l1 = torch.tensor(0.0, device=device)
+            loss_giou = torch.tensor(0.0, device=device)
+        else:
+            matched_sparse_boxes = torch.stack([p[0]["box"] for p in matched_pairs], dim=0).to(device=device)
+            matched_seed_boxes = torch.stack([p[1]["box"] for p in matched_pairs], dim=0).to(device=device)
+
+            sparse_xyxy = matched_sparse_boxes[:, 1:5].float()
+            seed_xyxy = matched_seed_boxes[:, 1:5].float()
+
+            # normalize L1 by image size
+            H, W = imgs.shape[-2], imgs.shape[-1]
+            scale = torch.tensor([W, H, W, H], device=device, dtype=torch.float32).unsqueeze(0)
+            loss_l1 = F.l1_loss(sparse_xyxy / scale, seed_xyxy / scale, reduction="none").sum(dim=1).mean()
+
+            giou = generalized_box_iou(sparse_xyxy, seed_xyxy)
+            loss_giou = (1.0 - giou.diag()).mean()
+
+        lam_cls = self.config.lambda_match_cls
+        lam_l1 = self.config.lambda_match_l1
+        lam_giou = self.config.lambda_match_giou
+
+        loss_match = lam_cls * loss_cls + lam_l1 * loss_l1 + lam_giou * loss_giou
+
+        return {
+            "loss_match": loss_match,
+            "loss_match_cls": loss_cls,
+            "loss_match_l1": loss_l1,
+            "loss_match_giou": loss_giou,
+        }
 
     def _build_rpn_pseudo_labels_from_matched_sparse(
         self,
         matched_sparse_boxes: torch.Tensor,  # [K,5] (batch_idx,x1,y1,x2,y2)
         matched_sparse_scores: torch.Tensor,  # [K]
+        matched_labels: torch.Tensor,  # [K]
         batch_size: int,
     ) -> List[Dict[str, torch.Tensor]]:
-        """:return:  list length B, each element: {"boxes": [Nb,4] xyxy in image coords, "scores": [Nb]}"""
+        """:return:  list length B, each element: {"boxes": [Nb,4] xyxy in image coords, "scores": [Nb], "labels": [Nb]  (1..C, 0 reserved for background)}"""
         device = matched_sparse_boxes.device
         pseudo = []
 
@@ -526,6 +662,7 @@ class Stage2(nn.Module):
                 pseudo.append({
                     "boxes": torch.zeros((0, 4), device=device, dtype=torch.float32),
                     "scores": torch.zeros((0,), device=device, dtype=torch.float32),
+                    "labels": torch.zeros((0,), device=device, dtype=torch.long),
                 })
             return pseudo
 
@@ -533,12 +670,18 @@ class Stage2(nn.Module):
         boxes_xyxy = matched_sparse_boxes[:, 1:5].float()  # [K,4]
         scores = matched_sparse_scores.float()  # [K]
 
+        # IMPORTANT:
+        # RoIHeads expects labels in [1..C], with 0 reserved for background
+        labels = matched_labels.long() + 1  # [K]
+
         for b in range(batch_size):
             mask = (batch_idx == b)
             pseudo.append({
                 "boxes": boxes_xyxy[mask],
                 "scores": scores[mask],
+                "labels": labels[mask],
             })
+
         return pseudo
 
     def _refine_pseudo_labels_nms_topk(
@@ -624,17 +767,28 @@ class Stage2(nn.Module):
         sims_all = torch.matmul(dense_proposal_embeddings, prototypes_embeddings.t())  # [N_D, num_classes]
 
         # get sparse proposals
-        sparse_mask = sims_all > thresholds.unsqueeze(0)  # [N_D, num_classes]
-        sparse_proposals : List[Dict] = []
-        for c in range(self.config.num_classes):
-            indices = torch.where(sparse_mask[:, c])[0]
-            for i in indices:
-                sparse_proposals.append({
-                    "box" : dense_proposal_boxes[i],  # [5], (batch_idx, x1, y1, x2, y2)
-                    "class_id" : c,
-                    "score": dense_proposal_object_scores[i, c],
-                    "logit": dense_proposal_object_logits[i, c]
-                })
+        N_D = sims_all.shape[0]  # number of dense proposals
+        # For each dense proposal i, pick ONE best class (by similarity)
+        best_cls = torch.argmax(sims_all, dim=1)  # [N_D], each in [0, C-1]
+        best_sim = sims_all[torch.arange(N_D, device=sims_all.device), best_cls]  # [N_D]
+        # Keep it only if the best class passes its threshold
+        best_thr = thresholds[best_cls]  # [N_D]
+        keep_mask = best_sim > best_thr
+        keep_indices = torch.where(keep_mask)[0]  # [N_keep]
+        sparse_proposals: List[Dict] = []
+        for i in keep_indices:
+            c = int(best_cls[i].item())
+            sparse_proposals.append({
+                "sp_idx": len(sparse_proposals),  # global index for background padding
+                "box": dense_proposal_boxes[i],  # [5], (batch_idx, x1, y1, x2, y2)
+                "class_id": c,  # chosen unique class for this box
+                "score": dense_proposal_object_scores[i, c],  # scalar
+                "logit": dense_proposal_object_logits[i, c],  # scalar
+                "cls_logits": dense_proposal_object_logits[i],  # [C+1] include background
+                # for debugging/analysis
+                "sim": best_sim[i].detach(),
+                "dense_idx": int(i.item()),
+            })
 
         # -----Branch 2: get seed proposals-----
         # get CCAM and loss_ccam
@@ -669,21 +823,22 @@ class Stage2(nn.Module):
                 })
 
         # ----- one-to-one match-----
-        matched_pairs = self._match_sparse_seed_with_hungarian(
+        matched_pairs, unmatched_sparse = self._match_sparse_seed_with_hungarian(
             sparse_proposals=sparse_proposals,
             seed_proposals=seed_proposals,
             num_classes=self.config.num_classes,
         )
+
         # split matched pairs
         if len(matched_pairs) > 0:
             matched_sparse_boxes = torch.stack(
                 [p[0]["box"] for p in matched_pairs], dim=0
             )  # [K = matched boxes, 5]
-            matched_seed_boxes = torch.stack(
-                [p[1]["box"] for p in matched_pairs], dim=0
-            )  # [K, 5]
+            # matched_seed_boxes = torch.stack(
+            #     [p[1]["box"] for p in matched_pairs], dim=0
+            # )  # [K, 5]
             matched_labels = torch.tensor(
-                [p[0]["class_id"] for p in matched_pairs],
+                [p[1]["class_id"] for p in matched_pairs],
                 device=matched_sparse_boxes.device,
                 dtype=torch.long
             )
@@ -696,26 +851,87 @@ class Stage2(nn.Module):
             )  # [K]
         else:
             matched_sparse_boxes = torch.zeros((0, 5), device=imgs.device)
-            matched_seed_boxes = torch.zeros((0, 5), device=imgs.device)
+            # matched_seed_boxes = torch.zeros((0, 5), device=imgs.device)
             matched_labels = torch.zeros((0,), device=imgs.device, dtype=torch.long)
             matched_sparse_scores = torch.zeros((0,), device=imgs.device, dtype=torch.float32)
 
+        # compute match loss
+        loss_match_dict = self._compute_loss_match(
+            sparse_proposals=sparse_proposals,  # ALL sparse (matched+unmatched)
+            matched_pairs=matched_pairs,
+            imgs=imgs,
+        )
+
         # -----build pseudo labels-----
-        rpn_pseudo_labels = self._build_rpn_pseudo_labels_from_matched_sparse(
+        pseudo_labels = self._build_rpn_pseudo_labels_from_matched_sparse(
             matched_sparse_boxes=matched_sparse_boxes,
             matched_sparse_scores=matched_sparse_scores,
+            matched_labels=matched_labels,
             batch_size=imgs.shape[0],
         )
         # NMS + Top-K Refinement
-        rpn_pseudo_labels = self.refine_pseudo_labels_nms_topk(
-            rpn_pseudo_labels,
+        pseudo_labels = self._refine_pseudo_labels_nms_topk(
+            pseudo_labels,
             iou_thr=self.config.rpn_pseudo_nms_thr,
             topk=self.config.rpn_pseudo_topk
-        )
+        )       # list length B, each element: {"boxes": [Nb,4] xyxy in image coords, "scores": [Nb]}
 
+        # -----get proposals-----
+        self.rpn.train()
+        B, _, Himg, Wimg = imgs.shape
+        device = imgs.device
 
+        # build ImageList
+        image_sizes = [(Himg, Wimg) for _ in range(B)]
+        dummy_images = torch.zeros((B, 3, 1, 1), device=device)  # placeholder only
+        img_list = ImageList(tensors=dummy_images, image_sizes=image_sizes)
 
+        # build targets in the format expected by RPN: List[Dict], each requires "boxes"
+        rpn_targets: List[Dict[str, torch.Tensor]] = []
+        for b in range(B):
+            boxes = pseudo_labels[b]["boxes"]  # [Nb,4] xyxy in image coords
+            if boxes.numel() == 0:
+                # keep empty, RPN will treat as no GT for this image
+                rpn_targets.append({"boxes": boxes.to(device=device, dtype=torch.float32)})
+            else:
+                # safety: ensure float32 + valid boxes
+                boxes = boxes.to(device=device, dtype=torch.float32)
+                # clamp to image bounds
+                boxes[:, 0].clamp_(0, Wimg - 1)
+                boxes[:, 2].clamp_(0, Wimg - 1)
+                boxes[:, 1].clamp_(0, Himg - 1)
+                boxes[:, 3].clamp_(0, Himg - 1)
+                # ensure x1<=x2, y1<=y2
+                x1 = torch.min(boxes[:, 0], boxes[:, 2])
+                x2 = torch.max(boxes[:, 0], boxes[:, 2])
+                y1 = torch.min(boxes[:, 1], boxes[:, 3])
+                y2 = torch.max(boxes[:, 1], boxes[:, 3])
+                boxes = torch.stack([x1, y1, x2, y2], dim=-1)
 
+                rpn_targets.append({"boxes": boxes})
+
+        # build features dict for RPN
+        features = {"0": high_feature_maps}
+        # get proposals
+        proposals, rpn_losses_dict = self.rpn(img_list, features, rpn_targets)
+
+        # -----R-CNN Head-----
+        batch_size = imgs.shape[0]
+        det_targets = [
+            {
+                "boxes": pseudo_labels[b]["boxes"],
+                "labels": pseudo_labels[b]["labels"],
+            }
+            for b in range(batch_size)
+        ]
+        detections, det_losses_dict = self.roi_heads(
+            features={"0": high_feature_maps},
+            proposals=proposals,
+            image_sizes=image_sizes,
+            targets=det_targets,
+        )   # List[Dict], len=B, each Dict has {"boxes" : [N_boxes, 4], "labels" : [N_boxes](1...C), "scores" : [N_boxes], softmax confidence}
+
+        return
 
 
     def forward(
