@@ -214,12 +214,11 @@ class Stage1Trainer:
             loss_img = get_img_contrast_loss(low_latent_features, img_multi_hot_labels)
             loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.supcon_loss_config)
             loss_MFHA = self.w_img_loss * loss_img + self.w_wbb_loss * loss_wbb
-            # loss_patch_cls = get_patch_loss(patch_logits, wb_one_hot_labels)
+            loss_patch_cls = get_patch_loss(patch_logits, wb_one_hot_labels)
             supcon_loss_config = self.supcon_loss_config
             supcon_loss_config.contrast_mode = LossContrastMode.ONE_VIEW
             loss_patch_supcon = supervised_contrastive_loss(contrast_patch_features, wb_one_hot_labels, supcon_loss_config)
-            # loss_patch = loss_patch_cls + loss_patch_supcon
-            loss_patch = loss_patch_supcon
+            loss_patch = loss_patch_cls + loss_patch_supcon
             loss = loss_MFHA + self.w_cam_loss * loss_cam + self.w_patch_loss * loss_patch
 
             self.optimizer.zero_grad()
@@ -233,16 +232,16 @@ class Stage1Trainer:
             epoch_MFHA_loss += loss_MFHA.item()
             epoch_cam_loss += loss_cam.item()
             epoch_patch_loss += loss_patch.item()
-            # epoch_patch_cls_loss += loss_patch_cls.item()
-            # epoch_patch_supcon_loss += loss_patch_supcon.item()
+            epoch_patch_cls_loss += loss_patch_cls.item()
+            epoch_patch_supcon_loss += loss_patch_supcon.item()
 
             pbar.set_postfix({
                 "Iter Loss: Total": f"{loss.item():.4f} ",
                 "MFHA": f"{loss_MFHA.item():.4f} ",
                 "CAM": f"{loss_cam.item():.4f} ",
                 "Patch": f"{loss_patch.item():.4f} ",
-                # "patch_cls" : f"{loss_patch_cls.item():.4f} ",
-                # "patch_supcon" : f"{loss_patch_supcon.item():.4f} ",
+                "patch_cls" : f"{loss_patch_cls.item():.4f} ",
+                "patch_supcon" : f"{loss_patch_supcon.item():.4f} ",
                 "img": f"{loss_img.item():.4f} ",
                 "wbb": f"{loss_wbb.item():.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
@@ -257,8 +256,8 @@ class Stage1Trainer:
         average_MFHA_loss = epoch_MFHA_loss / num_iters
         average_cam_loss = epoch_cam_loss / num_iters
         average_patch_loss = epoch_patch_loss / num_iters
-        # average_patch_cls_loss = epoch_patch_cls_loss / num_iters
-        # average_patch_supcon_loss = epoch_patch_supcon_loss / num_iters
+        average_patch_cls_loss = epoch_patch_cls_loss / num_iters
+        average_patch_supcon_loss = epoch_patch_supcon_loss / num_iters
 
         self.logger.add_info(
             f"Epoch [{epoch}/{self.config.epochs}]"
@@ -266,10 +265,10 @@ class Stage1Trainer:
             f"Image Contrast Loss: {average_img_loss:.4f}, "
             f"Weak Box Contrast Loss: {average_wbb_loss:.4f}, "
             f"MFHA Loss: {average_MFHA_loss:.4f}, "
-            f"CAM Loss: {average_cam_loss:.4f} "
-            f"Patch Loss: {average_patch_loss:.4f}\n"
-            # f"Patch CLS Loss : {average_patch_cls_loss:.4f} "
-            # f"Patch SupCon Loss : {average_patch_supcon_loss:.4f} \n"
+            f"CAM Loss: {average_cam_loss:.4f}\n"
+            f"Patch Loss: {average_patch_loss:.4f} "
+            f"Patch CLS Loss : {average_patch_cls_loss:.4f} "
+            f"Patch SupCon Loss : {average_patch_supcon_loss:.4f} \n"
         )
         metrics = {
             'Epoch': epoch,
@@ -279,8 +278,8 @@ class Stage1Trainer:
             'MFHA Loss': average_MFHA_loss,
             'CAM Loss': average_cam_loss,
             'Patch Loss': average_patch_loss,
-            # 'Patch CLS Loss': average_patch_cls_loss,
-            # 'Patch SupCon Loss': average_patch_supcon_loss,
+            'Patch CLS Loss': average_patch_cls_loss,
+            'Patch SupCon Loss': average_patch_supcon_loss,
         }
         self.logger.add_metrics(metrics)
 

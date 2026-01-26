@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, List, Dict, Any, Union
 from dataclasses import dataclass
-from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, CCAMGenerator
+from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, CCAMGenerator, HungarianMatcher
 from torchvision.ops import RoIAlign
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models import vgg16
@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torchvision.models.detection.image_list import ImageList
 import numpy as np
 import cv2
+from torchvision.ops import nms
 
 @dataclass
 class Stage1Config:
@@ -42,6 +43,7 @@ class Stage2Config:
     num_classes: int  # number of classes
     in_c : int  # high-level feature maps channels
     dataset_mps : Dict[int, torch.Tensor]  # {class_id : prototype tensor}
+    freeze_backbone: bool  # freeze backbone weights
     # for projection head
     hidden_dim: int     # MLP hidden dimension
     embed_dim: int      # embedding dimension
@@ -56,6 +58,13 @@ class Stage2Config:
     rpn_nms_thresh: float  # RPN NMS threshold
     # for CCAM
     ccam_threshold : float # CCAM threshold
+    # for HungarianMatcher
+    cost_class: float  # classification cost weight
+    cost_bbox: float  # bbox L1 cost weight
+    cost_giou: float  # bbox GIoU cost weight
+    # for Pseudo Labels
+    rpn_pseudo_nms_thr : float  # NMS threshold for pseudo labels
+    rpn_pseudo_topk : float  # top-k proposals for pseudo labels
     # for RoI Align
     roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
     spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
@@ -204,9 +213,9 @@ class Stage2(nn.Module):
         super(Stage2, self).__init__()
 
         self.encoder = backbone
-        # # freeze backbone weights
-        # for param in self.encoder.parameters():
-        #     param.requires_grad = False
+        if self.config.freeze_backbone:     # freeze backbone weights
+            for param in self.encoder.parameters():
+                param.requires_grad = False
         self.config = config
 
         # (train)RoI Align for high-level feature maps to weak box feature maps
@@ -267,6 +276,13 @@ class Stage2(nn.Module):
 
         # CCAM Generator
         self.ccam_generator = CCAMGenerator(in_c=self.config.in_c)
+
+        # One-to-One Matcher
+        self.matcher = HungarianMatcher(
+            cost_class=self.config.cost_class,
+            cost_bbox=self.config.cost_bbox,
+            cost_giou=self.config.cost_giou
+        )
 
 
     @torch.no_grad()
@@ -400,6 +416,157 @@ class Stage2(nn.Module):
 
         return boxes_global
 
+    def _xyxy_to_cxcywh(self, xyxy: torch.Tensor) -> torch.Tensor:
+        # xyxy: [N,4]
+        x1, y1, x2, y2 = xyxy.unbind(dim=-1)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        w = (x2 - x1).clamp(min=1e-6)
+        h = (y2 - y1).clamp(min=1e-6)
+        return torch.stack([cx, cy, w, h], dim=-1)
+
+    def _score_to_logit(self, p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        # p in [0,1] -> logit
+        p = p.clamp(eps, 1 - eps)
+        return torch.log(p / (1 - p))
+
+    @torch.no_grad()
+    def _match_sparse_seed_with_hungarian(
+        self,
+        sparse_proposals: List[Dict],
+        seed_proposals: List[Dict],
+        num_classes: int,
+        other_class_logit: float = -20.0,  # 非本类给极低 logit，强制按类匹配
+    ) -> List[Tuple[Dict, Dict]]:
+        """
+        :param sparse_proposals: List[Dict], each has:
+                                - "box": Tensor[5] = [batch_idx, x1, y1, x2, y2] (image coords, xyxy)
+                                - "class_id": int
+                                - "score": float, classification score(softmax probability)
+                                - "logit": float, classification logit
+        :param seed_proposals:  List[Dict], each has:
+                                - "box": Tensor[5] = [batch_idx, x1, y1, x2, y2] (image coords, xyxy)
+                                - "class_id": int
+        :param num_classes: int, number of classes
+        :param default_sparse_score:
+        :param other_class_logit:
+        :return: matched_pairs: List[(sparse_dict, seed_dict)] one-to-one per image
+        """
+        if len(sparse_proposals) == 0 or len(seed_proposals) == 0:
+            return []
+
+        device = sparse_proposals[0]["box"].device
+        matched_pairs: List[Tuple[Dict, Dict]] = []
+
+        # 1) 找出所有出现过的 batch_idx
+        batch_ids = sorted(set(
+            [int(p["box"][0].item()) for p in sparse_proposals] +
+            [int(t["box"][0].item()) for t in seed_proposals]
+        ))
+
+        for b in batch_ids:
+            sparse_b = [p for p in sparse_proposals if int(p["box"][0].item()) == b]
+            seed_b = [t for t in seed_proposals if int(t["box"][0].item()) == b]
+            if len(sparse_b) == 0 or len(seed_b) == 0:
+                continue
+
+            # 2) 组装 outputs（pred_logits / pred_boxes）
+            Ns = len(sparse_b)
+            pred_boxes_xyxy = torch.stack([p["box"][1:5] for p in sparse_b], dim=0).to(device=device, dtype=torch.float32)
+            pred_boxes = self._xyxy_to_cxcywh(pred_boxes_xyxy)  # matcher 默认按 cxcywh 做 L1 和 giou 转换
+
+            # pred_logits: [1, Ns, C]
+            pred_logits = torch.full((1, Ns, num_classes), other_class_logit, device=device, dtype=torch.float32)
+            for i, p in enumerate(sparse_b):
+                cls = int(p["class_id"])
+                logit = p.get("logit", None)
+                if logit is None:
+                    # 兜底：如果没提供 logit，就退化用 score 的 log 概率
+                    score = p.get("score", 0.5)
+                    score = float(score) if not torch.is_tensor(score) else float(score.item())
+                    logit = torch.tensor(score, device=device, dtype=torch.float32).clamp(1e-6, 1 - 1e-6)
+                    logit = torch.log(logit)  # log p
+                else:
+                    logit = logit if torch.is_tensor(logit) else torch.tensor(float(logit), device=device)
+                    logit = logit.to(device=device, dtype=torch.float32)
+
+                pred_logits[0, i, cls] = logit
+            outputs = {
+                "pred_logits": pred_logits,  # [1, Ns, C]
+                "pred_boxes": pred_boxes.unsqueeze(0),  # [1, Ns, 4]
+            }
+
+            # 3) 组装 targets（labels / boxes）
+            tgt_labels = torch.tensor([int(t["class_id"]) for t in seed_b], device=device, dtype=torch.long)
+            tgt_boxes_xyxy = torch.stack([t["box"][1:5] for t in seed_b], dim=0).to(device=device, dtype=torch.float32)
+            tgt_boxes = self._xyxy_to_cxcywh(tgt_boxes_xyxy)
+            targets = [{"labels": tgt_labels, "boxes": tgt_boxes}]
+
+            # 4) 匹配
+            indices = self.matcher(outputs, targets)
+            src_idx, tgt_idx = indices[0]
+
+            for si, ti in zip(src_idx.tolist(), tgt_idx.tolist()):
+                matched_pairs.append((sparse_b[si], seed_b[ti]))
+
+        return matched_pairs
+
+    def _build_rpn_pseudo_labels_from_matched_sparse(
+        self,
+        matched_sparse_boxes: torch.Tensor,  # [K,5] (batch_idx,x1,y1,x2,y2)
+        matched_sparse_scores: torch.Tensor,  # [K]
+        batch_size: int,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """:return:  list length B, each element: {"boxes": [Nb,4] xyxy in image coords, "scores": [Nb]}"""
+        device = matched_sparse_boxes.device
+        pseudo = []
+
+        if matched_sparse_boxes.numel() == 0:
+            for _ in range(batch_size):
+                pseudo.append({
+                    "boxes": torch.zeros((0, 4), device=device, dtype=torch.float32),
+                    "scores": torch.zeros((0,), device=device, dtype=torch.float32),
+                })
+            return pseudo
+
+        batch_idx = matched_sparse_boxes[:, 0].long()  # [K]
+        boxes_xyxy = matched_sparse_boxes[:, 1:5].float()  # [K,4]
+        scores = matched_sparse_scores.float()  # [K]
+
+        for b in range(batch_size):
+            mask = (batch_idx == b)
+            pseudo.append({
+                "boxes": boxes_xyxy[mask],
+                "scores": scores[mask],
+            })
+        return pseudo
+
+    def _refine_pseudo_labels_nms_topk(
+        self,
+        pseudo_by_img: List[Dict[str, torch.Tensor]],
+        iou_thr: float = 0.7,
+        topk: int = 200
+    ) -> List[Dict[str, torch.Tensor]]:
+        refined = []
+        for item in pseudo_by_img:
+            boxes = item["boxes"]
+            scores = item["scores"]
+
+            if boxes.numel() == 0:
+                refined.append(item)
+                continue
+
+            # topk
+            if scores.numel() > topk:
+                idx = torch.topk(scores, k=topk, largest=True).indices
+                boxes = boxes[idx]
+                scores = scores[idx]
+
+            # nms
+            keep = nms(boxes, scores, iou_thr)
+            refined.append({"boxes": boxes[keep], "scores": scores[keep]})
+        return refined
+
     def _forward_train(
         self,
         imgs: torch.Tensor,  # input images, [B, C, H, W]
@@ -435,8 +602,8 @@ class Stage2(nn.Module):
         dense_proposal_embeddings = self.proj(dense_proposal_features)  # [N_D, D = embed_dim]
 
         # get object scores
-        dense_proposal_object_scores = self.obj_classifier(dense_proposal_embeddings)  # [N_D, num_classes + 1]
-        dense_proposal_object_scores = F.softmax(dense_proposal_object_scores, dim=1)  # [N_D, num_classes + 1]
+        dense_proposal_object_logits = self.obj_classifier(dense_proposal_embeddings)  # [N_D, num_classes + 1]
+        dense_proposal_object_scores = F.softmax(dense_proposal_object_logits, dim=1)  # [N_D, num_classes + 1]
 
         # get prototypes embeddings
         prototypes = torch.stack([self.config.dataset_mps[k] for k in range(self.config.num_classes)], dim=0)  # [num_classes, D_p = C_h]
@@ -465,7 +632,8 @@ class Stage2(nn.Module):
                 sparse_proposals.append({
                     "box" : dense_proposal_boxes[i],  # [5], (batch_idx, x1, y1, x2, y2)
                     "class_id" : c,
-                    "score": dense_proposal_object_scores[i, c]
+                    "score": dense_proposal_object_scores[i, c],
+                    "logit": dense_proposal_object_logits[i, c]
                 })
 
         # -----Branch 2: get seed proposals-----
@@ -501,11 +669,49 @@ class Stage2(nn.Module):
                 })
 
         # ----- one-to-one match-----
+        matched_pairs = self._match_sparse_seed_with_hungarian(
+            sparse_proposals=sparse_proposals,
+            seed_proposals=seed_proposals,
+            num_classes=self.config.num_classes,
+        )
+        # split matched pairs
+        if len(matched_pairs) > 0:
+            matched_sparse_boxes = torch.stack(
+                [p[0]["box"] for p in matched_pairs], dim=0
+            )  # [K = matched boxes, 5]
+            matched_seed_boxes = torch.stack(
+                [p[1]["box"] for p in matched_pairs], dim=0
+            )  # [K, 5]
+            matched_labels = torch.tensor(
+                [p[0]["class_id"] for p in matched_pairs],
+                device=matched_sparse_boxes.device,
+                dtype=torch.long
+            )
+            matched_sparse_scores = torch.tensor(
+                [float(p[0].get("score", 1.0)) if not torch.is_tensor(p[0].get("score", 1.0))
+                 else float(p[0]["score"].detach().cpu().item())
+                 for p in matched_pairs],
+                device=matched_sparse_boxes.device,
+                dtype=torch.float32
+            )  # [K]
+        else:
+            matched_sparse_boxes = torch.zeros((0, 5), device=imgs.device)
+            matched_seed_boxes = torch.zeros((0, 5), device=imgs.device)
+            matched_labels = torch.zeros((0,), device=imgs.device, dtype=torch.long)
+            matched_sparse_scores = torch.zeros((0,), device=imgs.device, dtype=torch.float32)
 
-
-
-
-
+        # -----build pseudo labels-----
+        rpn_pseudo_labels = self._build_rpn_pseudo_labels_from_matched_sparse(
+            matched_sparse_boxes=matched_sparse_boxes,
+            matched_sparse_scores=matched_sparse_scores,
+            batch_size=imgs.shape[0],
+        )
+        # NMS + Top-K Refinement
+        rpn_pseudo_labels = self.refine_pseudo_labels_nms_topk(
+            rpn_pseudo_labels,
+            iou_thr=self.config.rpn_pseudo_nms_thr,
+            topk=self.config.rpn_pseudo_topk
+        )
 
 
 
@@ -780,4 +986,3 @@ def build_PrototypeChecker_model(
     )
 
     return model
-

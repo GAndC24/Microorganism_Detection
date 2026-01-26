@@ -9,6 +9,7 @@ data:
 stage2_model_config:
   img_size: 800  # (600, 800)
   in_c: 512
+  freeze_backbone: False
   rpn_anchor_sizes : 32, 40, 64, 120, 208   # statistics-based sizes
   rpn_anchor_aspect_ratios: 0.89, 1.0, 1.15   # statistics-based ratios
   rpn_fg_iou_thresh: 0.6  # [0.5, 0.7]
@@ -18,6 +19,11 @@ stage2_model_config:
   rpn_post_nms_top_n: 2000, 1000 # train: [2000, 4000], test: [1000, 2000]
   rpn_nms_thresh: 0.8  # [0.7, 0.9]
   ccam_threshold:
+  cost_class: 2.0
+  cost_bbox: 5.0
+  cost_giou: 2.0
+  rpn_pseudo_nms_thr: 0.7  # [0.6, 0.8]
+  rpn_pseudo_topk: 200  # [100, 300]
   roi_out_size_h2wb: 21   # [21, 24]
   roi_out_size_wb2p: 7
   spatial_scale_wb2p: 1.0
