@@ -1,0 +1,113 @@
+--------------------Start train Stage1-------------------
+Start Time: 2026-01-25 01:01:25.705573
+
+Epoch [1/50]Total Loss: 5.1133, Image Contrast Loss: 4.3615, Weak Box Contrast Loss: 0.7764, MFHA Loss: 1.4935, CAM Loss: 2.1822
+Patch Loss: 1.8741 Patch CLS Loss : 1.5929 Patch SupCon Loss : 0.2812
+Epoch [2/50]Total Loss: 3.3261, Image Contrast Loss: 3.9350, Weak Box Contrast Loss: 0.5250, MFHA Loss: 1.2070, CAM Loss: 1.1370
+Patch Loss: 1.2096 Patch CLS Loss : 0.9637 Patch SupCon Loss : 0.2459
+Epoch [3/50]Total Loss: 2.6975, Image Contrast Loss: 3.3029, Weak Box Contrast Loss: 0.3970, MFHA Loss: 0.9782, CAM Loss: 0.7890
+Patch Loss: 1.0880 Patch CLS Loss : 0.8617 Patch SupCon Loss : 0.2264
+Epoch [4/50]Total Loss: 2.8456, Image Contrast Loss: 2.8466, Weak Box Contrast Loss: 0.4055, MFHA Loss: 0.8937, CAM Loss: 0.9245
+Patch Loss: 1.2122 Patch CLS Loss : 0.9807 Patch SupCon Loss : 0.2316
+Epoch [5/50]Total Loss: 2.3413, Image Contrast Loss: 2.3667, Weak Box Contrast Loss: 0.3685, MFHA Loss: 0.7682, CAM Loss: 0.7299
+Patch Loss: 0.9892 Patch CLS Loss : 0.7681 Patch SupCon Loss : 0.2210
+Epoch [6/50]Total Loss: 2.1845, Image Contrast Loss: 2.2260, Weak Box Contrast Loss: 0.3338, MFHA Loss: 0.7122, CAM Loss: 0.6353
+Patch Loss: 0.9640 Patch CLS Loss : 0.7468 Patch SupCon Loss : 0.2172
+Epoch [7/50]Total Loss: 2.0512, Image Contrast Loss: 1.9810, Weak Box Contrast Loss: 0.3133, MFHA Loss: 0.6468, CAM Loss: 0.6071
+Patch Loss: 0.9187 Patch CLS Loss : 0.7045 Patch SupCon Loss : 0.2141
+Epoch [8/50]Total Loss: 1.8947, Image Contrast Loss: 1.6601, Weak Box Contrast Loss: 0.3006, MFHA Loss: 0.5725, CAM Loss: 0.5630
+Patch Loss: 0.8718 Patch CLS Loss : 0.6585 Patch SupCon Loss : 0.2133
+Epoch [9/50]Total Loss: 1.6968, Image Contrast Loss: 1.4512, Weak Box Contrast Loss: 0.2845, MFHA Loss: 0.5178, CAM Loss: 0.4819
+Patch Loss: 0.7935 Patch CLS Loss : 0.5850 Patch SupCon Loss : 0.2085
+Epoch [10/50]Total Loss: 1.7144, Image Contrast Loss: 1.3766, Weak Box Contrast Loss: 0.2826, MFHA Loss: 0.5014, CAM Loss: 0.4860
+Patch Loss: 0.8242 Patch CLS Loss : 0.6134 Patch SupCon Loss : 0.2108
+Epoch [11/50]Total Loss: 1.6899, Image Contrast Loss: 1.3514, Weak Box Contrast Loss: 0.2764, MFHA Loss: 0.4914, CAM Loss: 0.4668
+Patch Loss: 0.8251 Patch CLS Loss : 0.6176 Patch SupCon Loss : 0.2075
+Epoch [12/50]Total Loss: 1.5852, Image Contrast Loss: 1.2635, Weak Box Contrast Loss: 0.2759, MFHA Loss: 0.4734, CAM Loss: 0.4294
+Patch Loss: 0.7683 Patch CLS Loss : 0.5609 Patch SupCon Loss : 0.2074
+Epoch [13/50]Total Loss: 1.5225, Image Contrast Loss: 1.2028, Weak Box Contrast Loss: 0.2681, MFHA Loss: 0.4550, CAM Loss: 0.3944
+Patch Loss: 0.7519 Patch CLS Loss : 0.5470 Patch SupCon Loss : 0.2049
+Epoch [14/50]Total Loss: 1.4128, Image Contrast Loss: 1.1738, Weak Box Contrast Loss: 0.2610, MFHA Loss: 0.4436, CAM Loss: 0.3576
+Patch Loss: 0.6831 Patch CLS Loss : 0.4811 Patch SupCon Loss : 0.2020
+Epoch [15/50]Total Loss: 1.5597, Image Contrast Loss: 1.1169, Weak Box Contrast Loss: 0.2658, MFHA Loss: 0.4360, CAM Loss: 0.4310
+Patch Loss: 0.7789 Patch CLS Loss : 0.5714 Patch SupCon Loss : 0.2074
+Epoch [16/50]Total Loss: 1.3876, Image Contrast Loss: 1.0997, Weak Box Contrast Loss: 0.2563, MFHA Loss: 0.4250, CAM Loss: 0.3370
+Patch Loss: 0.6929 Patch CLS Loss : 0.4907 Patch SupCon Loss : 0.2022
+Epoch [17/50]Total Loss: 1.3848, Image Contrast Loss: 1.0775, Weak Box Contrast Loss: 0.2535, MFHA Loss: 0.4183, CAM Loss: 0.3383
+Patch Loss: 0.6958 Patch CLS Loss : 0.4950 Patch SupCon Loss : 0.2008
+Epoch [18/50]Total Loss: 1.3671, Image Contrast Loss: 1.0616, Weak Box Contrast Loss: 0.2516, MFHA Loss: 0.4136, CAM Loss: 0.3299
+Patch Loss: 0.6896 Patch CLS Loss : 0.4878 Patch SupCon Loss : 0.2019
+Epoch [19/50]Total Loss: 1.3163, Image Contrast Loss: 1.0883, Weak Box Contrast Loss: 0.2483, MFHA Loss: 0.4163, CAM Loss: 0.2967
+Patch Loss: 0.6626 Patch CLS Loss : 0.4623 Patch SupCon Loss : 0.2003
+Epoch [20/50]Total Loss: 1.2791, Image Contrast Loss: 1.0349, Weak Box Contrast Loss: 0.2456, MFHA Loss: 0.4034, CAM Loss: 0.2644
+Patch Loss: 0.6641 Patch CLS Loss : 0.4652 Patch SupCon Loss : 0.1989
+Epoch [21/50]Total Loss: 1.3755, Image Contrast Loss: 1.0684, Weak Box Contrast Loss: 0.2466, MFHA Loss: 0.4110, CAM Loss: 0.3205
+Patch Loss: 0.7081 Patch CLS Loss : 0.5071 Patch SupCon Loss : 0.2009
+Epoch [22/50]Total Loss: 1.2503, Image Contrast Loss: 0.9863, Weak Box Contrast Loss: 0.2430, MFHA Loss: 0.3916, CAM Loss: 0.2583
+Patch Loss: 0.6520 Patch CLS Loss : 0.4531 Patch SupCon Loss : 0.1989
+Epoch [23/50]Total Loss: 1.2124, Image Contrast Loss: 0.9588, Weak Box Contrast Loss: 0.2405, MFHA Loss: 0.3842, CAM Loss: 0.2370
+Patch Loss: 0.6386 Patch CLS Loss : 0.4424 Patch SupCon Loss : 0.1962
+Epoch [24/50]Total Loss: 1.1724, Image Contrast Loss: 0.9875, Weak Box Contrast Loss: 0.2388, MFHA Loss: 0.3885, CAM Loss: 0.2217
+Patch Loss: 0.6065 Patch CLS Loss : 0.4099 Patch SupCon Loss : 0.1966
+Epoch [25/50]Total Loss: 1.1908, Image Contrast Loss: 0.9919, Weak Box Contrast Loss: 0.2403, MFHA Loss: 0.3906, CAM Loss: 0.2373
+Patch Loss: 0.6103 Patch CLS Loss : 0.4143 Patch SupCon Loss : 0.1961
+Epoch [26/50]Total Loss: 1.1706, Image Contrast Loss: 0.9596, Weak Box Contrast Loss: 0.2362, MFHA Loss: 0.3809, CAM Loss: 0.2150
+Patch Loss: 0.6177 Patch CLS Loss : 0.4210 Patch SupCon Loss : 0.1967
+Epoch [27/50]Total Loss: 1.1513, Image Contrast Loss: 0.9624, Weak Box Contrast Loss: 0.2341, MFHA Loss: 0.3798, CAM Loss: 0.2058
+Patch Loss: 0.6069 Patch CLS Loss : 0.4125 Patch SupCon Loss : 0.1944
+Epoch [28/50]Total Loss: 1.1036, Image Contrast Loss: 0.9262, Weak Box Contrast Loss: 0.2331, MFHA Loss: 0.3718, CAM Loss: 0.1782
+Patch Loss: 0.5892 Patch CLS Loss : 0.3946 Patch SupCon Loss : 0.1947
+Epoch [29/50]Total Loss: 1.0943, Image Contrast Loss: 0.9472, Weak Box Contrast Loss: 0.2329, MFHA Loss: 0.3757, CAM Loss: 0.1779
+Patch Loss: 0.5763 Patch CLS Loss : 0.3822 Patch SupCon Loss : 0.1940
+Epoch [30/50]Total Loss: 1.0595, Image Contrast Loss: 0.9502, Weak Box Contrast Loss: 0.2298, MFHA Loss: 0.3739, CAM Loss: 0.1390
+Patch Loss: 0.5743 Patch CLS Loss : 0.3818 Patch SupCon Loss : 0.1925
+Epoch [31/50]Total Loss: 1.0629, Image Contrast Loss: 0.9406, Weak Box Contrast Loss: 0.2293, MFHA Loss: 0.3716, CAM Loss: 0.1577
+Patch Loss: 0.5652 Patch CLS Loss : 0.3729 Patch SupCon Loss : 0.1923
+
+--------------------Continue train Stage1-------------------
+Continue Time: 2026-01-25 10:58:30.342852
+
+Epoch [32/50]Total Loss: 1.0219, Image Contrast Loss: 0.9104, Weak Box Contrast Loss: 0.2283, MFHA Loss: 0.3647, CAM Loss: 0.1348
+Patch Loss: 0.5494 Patch CLS Loss : 0.3585 Patch SupCon Loss : 0.1909 
+Epoch [33/50]Total Loss: 1.0533, Image Contrast Loss: 0.9147, Weak Box Contrast Loss: 0.2285, MFHA Loss: 0.3657, CAM Loss: 0.1522
+Patch Loss: 0.5658 Patch CLS Loss : 0.3741 Patch SupCon Loss : 0.1918 
+Epoch [34/50]Total Loss: 1.0118, Image Contrast Loss: 0.9296, Weak Box Contrast Loss: 0.2268, MFHA Loss: 0.3673, CAM Loss: 0.1333
+Patch Loss: 0.5378 Patch CLS Loss : 0.3473 Patch SupCon Loss : 0.1905 
+Epoch [35/50]Total Loss: 0.9660, Image Contrast Loss: 0.8974, Weak Box Contrast Loss: 0.2237, MFHA Loss: 0.3584, CAM Loss: 0.1125
+Patch Loss: 0.5175 Patch CLS Loss : 0.3281 Patch SupCon Loss : 0.1894 
+Epoch [36/50]Total Loss: 0.9482, Image Contrast Loss: 0.8758, Weak Box Contrast Loss: 0.2239, MFHA Loss: 0.3542, CAM Loss: 0.1056
+Patch Loss: 0.5095 Patch CLS Loss : 0.3200 Patch SupCon Loss : 0.1895 
+Epoch [37/50]Total Loss: 0.9668, Image Contrast Loss: 0.8635, Weak Box Contrast Loss: 0.2228, MFHA Loss: 0.3509, CAM Loss: 0.1135
+Patch Loss: 0.5251 Patch CLS Loss : 0.3367 Patch SupCon Loss : 0.1884 
+--------------------Continue train Stage1-------------------
+Continue Time: 2026-01-25 14:09:28.563196
+
+Epoch [38/50]Total Loss: 0.8989, Image Contrast Loss: 0.8563, Weak Box Contrast Loss: 0.2182, MFHA Loss: 0.3459, CAM Loss: 0.0665
+Patch Loss: 0.4998 Patch CLS Loss : 0.3133 Patch SupCon Loss : 0.1865 
+Epoch [39/50]Total Loss: 0.9063, Image Contrast Loss: 0.8657, Weak Box Contrast Loss: 0.2176, MFHA Loss: 0.3472, CAM Loss: 0.0579
+Patch Loss: 0.5127 Patch CLS Loss : 0.3245 Patch SupCon Loss : 0.1882 
+Epoch [40/50]Total Loss: 0.8910, Image Contrast Loss: 0.8839, Weak Box Contrast Loss: 0.2172, MFHA Loss: 0.3505, CAM Loss: 0.0576
+Patch Loss: 0.4944 Patch CLS Loss : 0.3072 Patch SupCon Loss : 0.1872 
+Epoch [41/50]Total Loss: 0.8635, Image Contrast Loss: 0.8552, Weak Box Contrast Loss: 0.2155, MFHA Loss: 0.3435, CAM Loss: 0.0476
+Patch Loss: 0.4820 Patch CLS Loss : 0.2954 Patch SupCon Loss : 0.1866 
+Epoch [42/50]Total Loss: 0.8518, Image Contrast Loss: 0.8408, Weak Box Contrast Loss: 0.2149, MFHA Loss: 0.3401, CAM Loss: 0.0413
+Patch Loss: 0.4787 Patch CLS Loss : 0.2924 Patch SupCon Loss : 0.1862 
+Epoch [43/50]Total Loss: 0.8447, Image Contrast Loss: 0.8210, Weak Box Contrast Loss: 0.2139, MFHA Loss: 0.3353, CAM Loss: 0.0368
+Patch Loss: 0.4800 Patch CLS Loss : 0.2946 Patch SupCon Loss : 0.1854 
+Epoch [44/50]Total Loss: 0.8949, Image Contrast Loss: 0.8452, Weak Box Contrast Loss: 0.2175, MFHA Loss: 0.3430, CAM Loss: 0.0648
+Patch Loss: 0.5000 Patch CLS Loss : 0.3134 Patch SupCon Loss : 0.1867 
+Epoch [45/50]Total Loss: 0.8670, Image Contrast Loss: 0.8120, Weak Box Contrast Loss: 0.2173, MFHA Loss: 0.3363, CAM Loss: 0.0603
+Patch Loss: 0.4825 Patch CLS Loss : 0.2956 Patch SupCon Loss : 0.1869 
+Epoch [46/50]Total Loss: 0.8572, Image Contrast Loss: 0.8002, Weak Box Contrast Loss: 0.2164, MFHA Loss: 0.3332, CAM Loss: 0.0519
+Patch Loss: 0.4825 Patch CLS Loss : 0.2961 Patch SupCon Loss : 0.1864 
+Epoch [47/50]Total Loss: 0.8672, Image Contrast Loss: 0.8291, Weak Box Contrast Loss: 0.2171, MFHA Loss: 0.3395, CAM Loss: 0.0541
+Patch Loss: 0.4844 Patch CLS Loss : 0.2972 Patch SupCon Loss : 0.1872 
+Epoch [48/50]Total Loss: 0.8628, Image Contrast Loss: 0.8322, Weak Box Contrast Loss: 0.2150, MFHA Loss: 0.3385, CAM Loss: 0.0533
+Patch Loss: 0.4817 Patch CLS Loss : 0.2958 Patch SupCon Loss : 0.1859 
+Epoch [49/50]Total Loss: 0.8598, Image Contrast Loss: 0.8296, Weak Box Contrast Loss: 0.2157, MFHA Loss: 0.3385, CAM Loss: 0.0512
+Patch Loss: 0.4804 Patch CLS Loss : 0.2932 Patch SupCon Loss : 0.1872 
+Epoch [50/50]Total Loss: 0.8613, Image Contrast Loss: 0.8404, Weak Box Contrast Loss: 0.2142, MFHA Loss: 0.3395, CAM Loss: 0.0475
+Patch Loss: 0.4839 Patch CLS Loss : 0.2977 Patch SupCon Loss : 0.1861 
+--------------------End train-------------------
+End Time: 2026-01-25 18:55:11.583134
+

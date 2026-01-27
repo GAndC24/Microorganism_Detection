@@ -295,7 +295,8 @@ class MorphologicalPrototypeGenerator(nn.Module):
         cams, loss_cam = self.cam_head(roi_features, wb_labels)        # cams, [R, num_classes, H, W]
 
         # patch embedding
-        patch_features = self.patch_embed(roi_features)     # [R, Np = num_patches, D]
+        roi_features_detached = roi_features.detach()
+        patch_features = self.patch_embed(roi_features_detached)     # [R, Np = num_patches, D]
         R, Np, D = patch_features.shape
 
         # get fg/bg scores for each patch

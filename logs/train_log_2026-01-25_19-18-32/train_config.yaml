@@ -1,0 +1,23 @@
+runtime:
+  seed: 42
+  device: cuda
+data:
+  data_root: ./data/processed/Urinary Sediment Dataset
+  batch_size: 32
+  img_size: 384
+linearProb_model_config:
+  in_c: 512
+  in_size: 24
+  out_dim: 1
+  backbone_weights_path: ./results/model_weights/Vgg16_backbone_260125.pth
+linearProb_trainer_config:
+  num_classes: 7
+  epochs: 50
+  lr: 0.001
+  warm_up_lr_factor: 0.01
+  warmup_epochs: 5
+  weight_decay: 0.05
+  checkpoints_save_path: ./checkpoints/linearProb/
+  model_save_path: ./results/model_weights/
+  continue_train: false
+  checkpoint_path: ''

@@ -43,7 +43,15 @@ stage2_model_config:
   spatial_scale_wb2p: 1.0
   roi_out_size_h2p: 7
 
-
 stage2_trainer_config:
+  epochs: 50
+  lr: 0.001
+  warm_up_lr_factor: 0.01    # min_lr = warm_up_lr_factor * lr
+  warmup_epochs: 5    # 1/10 epochs
+  weight_decay: 0.05    # [0.05, 0.1]
+  checkpoints_save_path: "./checkpoints/stage2/"
+  model_save_path: "./results/model_weights/"
+  continue_train: False
+  checkpoint_path: ""  # ./checkpoints/stage2/checkpoint_{epoch}.pth
 
 

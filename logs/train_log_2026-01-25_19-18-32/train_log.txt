@@ -1,0 +1,56 @@
+--------------------Start train LinearProb-------------------
+Start Time: 2026-01-25 19:18:32.969458
+
+Epoch [1/50]Loss: 1.5825 Train Accuracy: 91.45% Val Accuracy: 89.87% Train mAP: 0.8238 Val mAP: 0.7320 
+Epoch [2/50]Loss: 1.8905 Train Accuracy: 94.83% Val Accuracy: 91.92% Train mAP: 0.9048 Val mAP: 0.8044 
+Epoch [3/50]Loss: 2.7502 Train Accuracy: 95.72% Val Accuracy: 93.22% Train mAP: 0.9246 Val mAP: 0.8212 
+Epoch [4/50]Loss: 3.8037 Train Accuracy: 96.18% Val Accuracy: 92.92% Train mAP: 0.8904 Val mAP: 0.7565 
+Epoch [5/50]Loss: 3.8441 Train Accuracy: 95.05% Val Accuracy: 91.67% Train mAP: 0.8423 Val mAP: 0.6798 
+Epoch [6/50]Loss: 4.4475 Train Accuracy: 95.37% Val Accuracy: 91.94% Train mAP: 0.8676 Val mAP: 0.7032 
+Epoch [7/50]Loss: 3.7726 Train Accuracy: 97.93% Val Accuracy: 93.93% Train mAP: 0.9338 Val mAP: 0.7542 
+Epoch [8/50]Loss: 2.8754 Train Accuracy: 98.62% Val Accuracy: 94.25% Train mAP: 0.9521 Val mAP: 0.7571 
+Epoch [9/50]Loss: 2.0660 Train Accuracy: 97.32% Val Accuracy: 92.70% Train mAP: 0.9106 Val mAP: 0.7154 
+Epoch [10/50]Loss: 1.3014 Train Accuracy: 98.93% Val Accuracy: 93.71% Train mAP: 0.9641 Val mAP: 0.7444 
+Epoch [11/50]Loss: 1.4450 Train Accuracy: 98.95% Val Accuracy: 94.04% Train mAP: 0.9779 Val mAP: 0.7618 
+Epoch [12/50]Loss: 0.9476 Train Accuracy: 98.84% Val Accuracy: 93.89% Train mAP: 0.9608 Val mAP: 0.7325 
+Epoch [13/50]Loss: 0.7659 Train Accuracy: 99.56% Val Accuracy: 94.50% Train mAP: 0.9872 Val mAP: 0.7660 
+Epoch [14/50]Loss: 0.8163 Train Accuracy: 98.48% Val Accuracy: 93.52% Train mAP: 0.9422 Val mAP: 0.7188 
+Epoch [15/50]Loss: 0.9936 Train Accuracy: 99.55% Val Accuracy: 94.51% Train mAP: 0.9825 Val mAP: 0.7621 
+Epoch [16/50]Loss: 0.8588 Train Accuracy: 99.67% Val Accuracy: 94.43% Train mAP: 0.9849 Val mAP: 0.7499 
+Epoch [17/50]Loss: 0.6533 Train Accuracy: 99.63% Val Accuracy: 93.91% Train mAP: 0.9877 Val mAP: 0.7441 
+Epoch [18/50]Loss: 0.8818 Train Accuracy: 99.63% Val Accuracy: 94.16% Train mAP: 0.9854 Val mAP: 0.7460 
+Epoch [19/50]Loss: 0.7737 Train Accuracy: 99.59% Val Accuracy: 94.58% Train mAP: 0.9908 Val mAP: 0.7648 
+Epoch [20/50]Loss: 0.7594 Train Accuracy: 99.65% Val Accuracy: 94.55% Train mAP: 0.9894 Val mAP: 0.7562 
+Epoch [21/50]Loss: 0.3131 Train Accuracy: 99.49% Val Accuracy: 94.13% Train mAP: 0.9836 Val mAP: 0.7482 
+Epoch [22/50]Loss: 0.2335 Train Accuracy: 99.52% Val Accuracy: 94.08% Train mAP: 0.9794 Val mAP: 0.7418 
+Epoch [23/50]Loss: 0.2490 Train Accuracy: 99.79% Val Accuracy: 94.28% Train mAP: 0.9929 Val mAP: 0.7550 
+Epoch [24/50]Loss: 0.3656 Train Accuracy: 99.68% Val Accuracy: 94.41% Train mAP: 0.9943 Val mAP: 0.7440 
+Epoch [25/50]Loss: 0.3263 Train Accuracy: 99.82% Val Accuracy: 94.50% Train mAP: 0.9946 Val mAP: 0.7651 
+Epoch [26/50]Loss: 0.2155 Train Accuracy: 99.90% Val Accuracy: 94.48% Train mAP: 0.9965 Val mAP: 0.7576 
+Epoch [27/50]Loss: 0.1167 Train Accuracy: 99.85% Val Accuracy: 94.58% Train mAP: 0.9956 Val mAP: 0.7574 
+Epoch [28/50]Loss: 0.1096 Train Accuracy: 99.58% Val Accuracy: 94.36% Train mAP: 0.9848 Val mAP: 0.7552 
+Epoch [29/50]Loss: 0.1825 Train Accuracy: 99.94% Val Accuracy: 94.75% Train mAP: 0.9982 Val mAP: 0.7633 
+Epoch [30/50]Loss: 0.1350 Train Accuracy: 99.67% Val Accuracy: 94.36% Train mAP: 0.9837 Val mAP: 0.7409 
+Epoch [31/50]Loss: 0.2118 Train Accuracy: 99.93% Val Accuracy: 94.82% Train mAP: 0.9983 Val mAP: 0.7726 
+Epoch [32/50]Loss: 0.0995 Train Accuracy: 99.94% Val Accuracy: 94.68% Train mAP: 0.9987 Val mAP: 0.7630 
+Epoch [33/50]Loss: 0.0459 Train Accuracy: 99.98% Val Accuracy: 94.65% Train mAP: 0.9991 Val mAP: 0.7638 
+Epoch [34/50]Loss: 0.0639 Train Accuracy: 99.99% Val Accuracy: 94.72% Train mAP: 0.9996 Val mAP: 0.7641 
+Epoch [35/50]Loss: 0.0426 Train Accuracy: 99.99% Val Accuracy: 94.72% Train mAP: 0.9995 Val mAP: 0.7682 
+Epoch [36/50]Loss: 0.0331 Train Accuracy: 99.99% Val Accuracy: 94.72% Train mAP: 0.9994 Val mAP: 0.7684 
+Epoch [37/50]Loss: 0.0454 Train Accuracy: 99.99% Val Accuracy: 94.68% Train mAP: 0.9994 Val mAP: 0.7684 
+Epoch [38/50]Loss: 0.0336 Train Accuracy: 99.99% Val Accuracy: 94.60% Train mAP: 0.9997 Val mAP: 0.7640 
+Epoch [39/50]Loss: 0.0229 Train Accuracy: 99.99% Val Accuracy: 94.70% Train mAP: 0.9995 Val mAP: 0.7686 
+Epoch [40/50]Loss: 0.0184 Train Accuracy: 99.99% Val Accuracy: 94.68% Train mAP: 0.9995 Val mAP: 0.7639 
+Epoch [41/50]Loss: 0.0116 Train Accuracy: 99.99% Val Accuracy: 94.72% Train mAP: 0.9995 Val mAP: 0.7688 
+Epoch [42/50]Loss: 0.0135 Train Accuracy: 99.99% Val Accuracy: 94.73% Train mAP: 0.9995 Val mAP: 0.7640 
+Epoch [43/50]Loss: 0.0096 Train Accuracy: 99.99% Val Accuracy: 94.67% Train mAP: 0.9995 Val mAP: 0.7696 
+Epoch [44/50]Loss: 0.0109 Train Accuracy: 99.99% Val Accuracy: 94.73% Train mAP: 1.0000 Val mAP: 0.7647 
+Epoch [45/50]Loss: 0.0077 Train Accuracy: 99.99% Val Accuracy: 94.75% Train mAP: 0.9996 Val mAP: 0.7704 
+Epoch [46/50]Loss: 0.0101 Train Accuracy: 99.99% Val Accuracy: 94.75% Train mAP: 0.9996 Val mAP: 0.7704 
+Epoch [47/50]Loss: 0.0096 Train Accuracy: 99.99% Val Accuracy: 94.75% Train mAP: 0.9995 Val mAP: 0.7685 
+Epoch [48/50]Loss: 0.0017 Train Accuracy: 99.99% Val Accuracy: 94.73% Train mAP: 0.9999 Val mAP: 0.7646 
+Epoch [49/50]Loss: 0.0048 Train Accuracy: 99.99% Val Accuracy: 94.77% Train mAP: 0.9999 Val mAP: 0.7672 
+Epoch [50/50]Loss: 0.0019 Train Accuracy: 99.99% Val Accuracy: 94.75% Train mAP: 0.9996 Val mAP: 0.7690 
+--------------------End train-------------------
+End Time: 2026-01-25 20:38:49.851269
+

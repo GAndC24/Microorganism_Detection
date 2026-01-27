@@ -11,7 +11,7 @@ linearProb_model_config:
   in_c: 512
   in_size: 24   # 1/16 img_size
   out_dim: 1
-  backbone_weights_path: "./results/model_weights/Vgg16_backbone_260125.pth"
+  backbone_weights_path: "./results/model_weights/Vgg16_backbone.pth"
 
 linearProb_trainer_config:
   num_classes: 7  # number of classes

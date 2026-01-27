@@ -30,6 +30,21 @@ class Stage1TrainerConfig:
     mp_ema_alpha: float = 0.9   # ema alpha for updating prototypes, [0.9, 0.99]
 
 @dataclass
+class Stage2TrainerConfig:
+    num_classes: int  # number of classes
+    device: torch.device  # "cpu" or "cuda"
+    epochs: int
+    lr: float  # base lr
+    warm_up_lr_factor: float  # min_lr = warm_up_lr_factor * lr
+    warmup_epochs: int
+    weight_decay: float
+    checkpoints_save_path: str
+    model_save_path: str
+    logger: Logger
+    continue_train: bool = False
+    checkpoint_path: str = None
+
+@dataclass
 class LinearProbTrainerConfig:
     num_classes: int  # number of classes
     device: torch.device  # "cpu" or "cuda"
@@ -320,6 +335,192 @@ class Stage1Trainer:
         self._save_model(model_save_path=model_save_path)
         dataset_mps_save_path = self.config.dataset_mps_save_path
         self._save_dataset_mps(dataset_mps_save_path=dataset_mps_save_path)
+
+class Stage2Trainer:
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        config: Stage2TrainerConfig,
+    )-> None:
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+
+        self.model.to(self.config.device)
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay
+        )
+
+        self.lr_scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[
+                # Linear warm‑up
+                LinearLR(self.optimizer, start_factor=self.config.warm_up_lr_factor, end_factor=1.0),
+                # cosine decay
+                CosineAnnealingLR(self.optimizer, T_max=self.config.epochs - self.config.warmup_epochs,
+                                  eta_min=self.config.lr * self.config.warm_up_lr_factor)
+            ],
+            milestones=[self.config.warmup_epochs]
+        )
+
+        self.start_epoch = 1
+
+        self.log_path = self.config.logger.get_log_dir()
+
+        if self.config.continue_train:
+            # 加载检查点
+            checkpoint = torch.load(self.config.checkpoint_path)
+
+            # 加载模型参数
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print("Model loaded successfully.")
+
+            # 设置当前训练轮数
+            self.start_epoch = checkpoint['epoch'] + 1
+
+            # 加载优化器状态
+            optimizer_state_dict = checkpoint['optimizer_state_dict']
+            self.optimizer.load_state_dict(optimizer_state_dict)
+            print("Optimizer state loaded successfully.")
+
+            # 加载学习率调度器状态
+            lr_scheduler_state_dict = checkpoint['lr_scheduler_state_dict']
+            self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+            print("Learning rate scheduler state loaded successfully.")
+
+    def _train_one_epoch(self, epoch) -> None:
+        num_iters = len(self.train_loader)
+        pbar = tqdm(
+            enumerate(self.train_loader, start=1),
+            total=num_iters,
+            desc=f"Epoch {epoch}/{self.config.epochs}",
+            leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
+            dynamic_ncols=True,  # 自适应终端宽度
+        )
+
+        epoch_total_loss = 0.0
+
+        epoch_ccam_loss = 0.0
+
+        epoch_rpn_loss = 0.0
+        epoch_rpn_obj_loss = 0.0
+        epoch_rpn_reg_loss = 0.0
+
+        epoch_proto_loss = 0.0
+
+        epoch_match_loss = 0.0
+        epoch_match_cls_loss = 0.0
+        epoch_match_l1_loss = 0.0
+        epoch_match_giou_loss = 0.0
+
+        epoch_det_loss = 0.0
+        epoch_det_cls_loss = 0.0
+        epoch_det_reg_loss = 0.0
+
+        for iter, (images, target) in pbar:
+            images = [img.to(self.config.device) for img in images]
+            targets = [{k: v.to(self.config.device) for k, v in t.items()} for t in target]
+
+            wboxes = _build_wboxes(targets).to(self.config.device)
+            wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
+            X = torch.stack(images, dim=0)
+            dense_proposal_embeddings, prototypes_embeddings, loss_ccam, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels, detections = self.model("train", X, wboxes, wb_one_hot_labels)
+
+
+
+
+        #     self._update_dataset_mps_ema(prototypes)
+        #
+        #     loss_img = get_img_contrast_loss(low_latent_features, img_multi_hot_labels)
+        #     loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.supcon_loss_config)
+        #     loss_MFHA = self.w_img_loss * loss_img + self.w_wbb_loss * loss_wbb
+        #     loss_patch_cls = get_patch_loss(patch_logits, wb_one_hot_labels)
+        #     supcon_loss_config = self.supcon_loss_config
+        #     supcon_loss_config.contrast_mode = LossContrastMode.ONE_VIEW
+        #     loss_patch_supcon = supervised_contrastive_loss(contrast_patch_features, wb_one_hot_labels, supcon_loss_config)
+        #     loss_patch = loss_patch_cls + loss_patch_supcon
+        #     loss = loss_MFHA + self.w_cam_loss * loss_cam + self.w_patch_loss * loss_patch
+        #
+        #     self.optimizer.zero_grad()
+        #     loss.backward()
+        #
+        #     self.optimizer.step()
+        #
+        #     epoch_total_loss += loss.item()
+        #     epoch_img_loss += loss_img.item()
+        #     epoch_wbb_loss += loss_wbb.item()
+        #     epoch_MFHA_loss += loss_MFHA.item()
+        #     epoch_cam_loss += loss_cam.item()
+        #     epoch_patch_loss += loss_patch.item()
+        #     epoch_patch_cls_loss += loss_patch_cls.item()
+        #     epoch_patch_supcon_loss += loss_patch_supcon.item()
+        #
+        #     pbar.set_postfix({
+        #         "Iter Loss: Total": f"{loss.item():.4f} ",
+        #         "MFHA": f"{loss_MFHA.item():.4f} ",
+        #         "CAM": f"{loss_cam.item():.4f} ",
+        #         "Patch": f"{loss_patch.item():.4f} ",
+        #         "patch_cls" : f"{loss_patch_cls.item():.4f} ",
+        #         "patch_supcon" : f"{loss_patch_supcon.item():.4f} ",
+        #         "img": f"{loss_img.item():.4f} ",
+        #         "wbb": f"{loss_wbb.item():.4f} ",
+        #         "lr": f"{self.optimizer.param_groups[0]['lr']}",
+        #     })
+        #
+        # self.lr_scheduler.step()
+        #
+        # num_iters = len(self.train_loader)
+        # average_total_loss = epoch_total_loss / num_iters
+        # average_img_loss = epoch_img_loss / num_iters
+        # average_wbb_loss = epoch_wbb_loss / num_iters
+        # average_MFHA_loss = epoch_MFHA_loss / num_iters
+        # average_cam_loss = epoch_cam_loss / num_iters
+        # average_patch_loss = epoch_patch_loss / num_iters
+        # average_patch_cls_loss = epoch_patch_cls_loss / num_iters
+        # average_patch_supcon_loss = epoch_patch_supcon_loss / num_iters
+        #
+        # self.logger.add_info(
+        #     f"Epoch [{epoch}/{self.config.epochs}]"
+        #     f"Total Loss: {average_total_loss:.4f}, "
+        #     f"Image Contrast Loss: {average_img_loss:.4f}, "
+        #     f"Weak Box Contrast Loss: {average_wbb_loss:.4f}, "
+        #     f"MFHA Loss: {average_MFHA_loss:.4f}, "
+        #     f"CAM Loss: {average_cam_loss:.4f}\n"
+        #     f"Patch Loss: {average_patch_loss:.4f} "
+        #     f"Patch CLS Loss : {average_patch_cls_loss:.4f} "
+        #     f"Patch SupCon Loss : {average_patch_supcon_loss:.4f} \n"
+        # )
+        # metrics = {
+        #     'Epoch': epoch,
+        #     'Total Loss': average_total_loss,
+        #     'Image Contrast Loss': average_img_loss,
+        #     'Weak Box Contrast Loss': average_wbb_loss,
+        #     'MFHA Loss': average_MFHA_loss,
+        #     'CAM Loss': average_cam_loss,
+        #     'Patch Loss': average_patch_loss,
+        #     'Patch CLS Loss': average_patch_cls_loss,
+        #     'Patch SupCon Loss': average_patch_supcon_loss,
+        # }
+        # self.logger.add_metrics(metrics)
+
+    def train(self)-> None:
+        for epoch in range(self.start_epoch, self.config.epochs + 1):
+            self.model.train()
+            self._train_one_epoch(epoch)
+            checkpoints_save_path = self.config.checkpoints_save_path
+            self._save_checkpoint(current_epoch=epoch, checkpoints_save_path=checkpoints_save_path)
+
+        self.config.logger.end_train()
+        model_save_path = self.config.model_save_path
+        self._save_model(model_save_path=model_save_path)
+
+
 
 class LinearProbTrainer:
     def __init__(
