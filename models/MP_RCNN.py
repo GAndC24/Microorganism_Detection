@@ -47,7 +47,6 @@ class Stage2Config:
     img_size: Tuple[int, int]  # input image size
     num_classes: int  # number of classes
     in_c : int  # high-level feature maps channels
-    dataset_mps : Dict[int, torch.Tensor]  # {class_id : prototype tensor}
     freeze_backbone: bool  # freeze backbone weights
     # for projection head
     hidden_dim: int     # MLP hidden dimension
@@ -228,6 +227,7 @@ class Stage2(nn.Module):
         self,
         config : Stage2Config,       # Stage2 configuration
         backbone : nn.Module,  # Default VGG-16 with aligned weights
+        dataset_mps: Dict[int, torch.Tensor]  # {class_id : prototype tensor}
     )-> None:
         super(Stage2, self).__init__()
 
@@ -236,6 +236,7 @@ class Stage2(nn.Module):
             for param in self.encoder.parameters():
                 param.requires_grad = False
         self.config = config
+        self.dataset_mps = dataset_mps
 
         # (train)RoI Align for high-level feature maps to weak box feature maps
         self.roi_align_h2wb = RoIAlign(
@@ -332,7 +333,6 @@ class Stage2(nn.Module):
             nms_thresh=self.config.det_nms_thresh,
             detections_per_img=self.config.detections_per_img,
         )
-
 
     @torch.no_grad()
     def _get_dense_proposals(
@@ -715,7 +715,42 @@ class Stage2(nn.Module):
         imgs: torch.Tensor,  # input images, [B, C, H, W]
         wboxes: torch.Tensor,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels: torch.Tensor  # class label for weak boxes, [R, num_classes]
-    ):
+    )-> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
+        """
+        :return:
+        - dense_proposal_embeddings: torch.Tensor, L2 normalized, [N_D = num_dense, D]
+        - prototypes_embeddings: torch.Tensor, L2 normalized, [num_classes, D]
+        - loss_ccam: torch.Tensor, CCAM loss
+        - match_losses_dict: Dict[str, torch.Tensor], One-to-One Match losses
+                            {
+                                "loss_match": loss_match,
+                                "loss_match_cls": loss_cls,
+                                "loss_match_l1": loss_l1,
+                                "loss_match_giou": loss_giou,
+                            }
+        - rpn_losses_dict: Dict[str, torch.Tensor], RPN losses
+                            {
+                                "loss_objectness": loss_objectness,
+                                "loss_rpn_box_reg": loss_rpn_box_reg,
+                            }
+        - det_losses_dict: Dict[str, torch.Tensor], Detection losses
+                            {
+                                "loss_classifier": loss_classifier,
+                                "loss_box_reg": loss_box_reg
+                            }
+        - pseudo_labels: List[Dict[str, torch.Tensor]], length B, each element:
+                            {
+                                "boxes": Tensor [Nb, 4] in image coords (xyxy),
+                                "scores": Tensor [Nb],
+                                "labels": Tensor [Nb] in [1..C] (0 reserved for background)
+                            }
+        - detections: List[Dict[str, torch.Tensor]], length B, each element:
+                            {
+                                "boxes": Tensor [Nd, 4] in image coords (xyxy),
+                                "labels": Tensor [Nd] in [1..C] (0 reserved for background),
+                                "scores": Tensor [Nd],
+                            }
+        """
         # -----get high-level feature maps-----
         self.encoder[-1] = nn.Identity()
         high_feature_maps = self.encoder(imgs)  # [B, C_h, H_h, W_h]
@@ -749,7 +784,7 @@ class Stage2(nn.Module):
         dense_proposal_object_scores = F.softmax(dense_proposal_object_logits, dim=1)  # [N_D, num_classes + 1]
 
         # get prototypes embeddings
-        prototypes = torch.stack([self.config.dataset_mps[k] for k in range(self.config.num_classes)], dim=0)  # [num_classes, D_p = C_h]
+        prototypes = torch.stack([self.dataset_mps[k] for k in range(self.config.num_classes)], dim=0)  # [num_classes, D_p = C_h]
         prototypes_embeddings = self.proj(prototypes)  # [num_classes, D]
 
         # select Top-Scoring proposals for each class
@@ -856,7 +891,7 @@ class Stage2(nn.Module):
             matched_sparse_scores = torch.zeros((0,), device=imgs.device, dtype=torch.float32)
 
         # compute match loss
-        loss_match_dict = self._compute_loss_match(
+        match_losses_dict = self._compute_loss_match(
             sparse_proposals=sparse_proposals,  # ALL sparse (matched+unmatched)
             matched_pairs=matched_pairs,
             imgs=imgs,
@@ -874,7 +909,7 @@ class Stage2(nn.Module):
             pseudo_labels,
             iou_thr=self.config.rpn_pseudo_nms_thr,
             topk=self.config.rpn_pseudo_topk
-        )       # list length B, each element: {"boxes": [Nb,4] xyxy in image coords, "scores": [Nb]}
+        )
 
         # -----get proposals-----
         self.rpn.train()
@@ -924,15 +959,56 @@ class Stage2(nn.Module):
             }
             for b in range(batch_size)
         ]
+        # detections : List[Dict], len=B, each Dict has {"boxes" : [N_boxes, 4], "labels" : [N_boxes](1...C), "scores" : [N_boxes], softmax confidence}
         detections, det_losses_dict = self.roi_heads(
             features={"0": high_feature_maps},
             proposals=proposals,
             image_sizes=image_sizes,
             targets=det_targets,
-        )   # List[Dict], len=B, each Dict has {"boxes" : [N_boxes, 4], "labels" : [N_boxes](1...C), "scores" : [N_boxes], softmax confidence}
+        )
 
-        return
+        return dense_proposal_embeddings, prototypes_embeddings, loss_ccam, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels, detections
 
+    def _forward_inference(
+        self,
+        imgs: torch.Tensor,  # input images, [B, C, H, W]
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        :return:
+        - detections: List[Dict[str, torch.Tensor]], length B, each element:
+                            {
+                                "boxes": Tensor [Nd, 4] in image coords (xyxy),
+                                "labels": Tensor [Nd] in [1..C] (0 reserved for background),
+                                "scores": Tensor [Nd],
+                            }
+        """
+        # -----get high-level feature maps-----
+        self.encoder[-1] = nn.Identity()
+        high_feature_maps = self.encoder(imgs)  # [B, C_h, H_h, W_h]
+
+        # -----RPN-----
+        self.rpn.eval()
+        B, _, Himg, Wimg = imgs.shape
+        device = imgs.device
+        # build ImageList
+        image_sizes = [(Himg, Wimg) for _ in range(B)]
+        dummy_images = torch.zeros((B, 3, 1, 1), device=device)
+        img_list = ImageList(tensors=dummy_images, image_sizes=image_sizes)
+        # build features dict for RPN
+        features = {"0": high_feature_maps}
+        # get proposals
+        proposals, _ = self.rpn(img_list, features, None)
+
+        # -----R-CNN Head-----
+        self.roi_heads.eval()
+        detections, _ = self.roi_heads(
+            features={"0": high_feature_maps},
+            proposals=proposals,
+            image_sizes=image_sizes,
+            targets=None,
+        )
+
+        return detections
 
     def forward(
         self,
@@ -1136,6 +1212,7 @@ class PrototypeChecker(nn.Module):
 
         return out
 
+
 def build_Stage1_model(
     stage1_config: Stage1Config,        # Stage1 configuration
 )-> nn.Module:
@@ -1160,6 +1237,26 @@ def build_Stage1_model(
         hook=hook,
         mp_generator=mp_generator,
         config=stage1_config
+    )
+
+    return model
+
+def build_Stage2_model(
+    stage2_config: Stage2Config,        # Stage2 configuration
+    backbone_weights_path: str,  # Aligned backbone weights path
+    dataset_mps_path: str       # Morphological Prototype path
+)-> nn.Module:
+    backbone = vgg16(pretrained=False).features
+    backbone.load_state_dict(torch.load(backbone_weights_path))
+    # backbone = vgg16(pretrained=True).features
+
+    # load morphological prototypes
+    dataset_mps = torch.load(dataset_mps_path)  # Dict[int, Tensor]
+
+    model = Stage2(
+        backbone=backbone,
+        dataset_mps=dataset_mps,
+        config=stage2_config
     )
 
     return model
