@@ -17,7 +17,8 @@ from torchvision.ops.boxes import generalized_box_iou
 import torch.nn.functional as F
 from torchvision.models.detection.roi_heads import RoIHeads
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, TwoMLPHead
-
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from torchvision.ops import MultiScaleRoIAlign
 
 @dataclass
 class Stage1Config:
@@ -44,6 +45,7 @@ class Stage1Config:
 
 @dataclass
 class Stage2Config:
+    device: torch.device  # device
     img_size: Tuple[int, int]  # input image size
     num_classes: int  # number of classes
     in_c : int  # high-level feature maps channels
@@ -62,6 +64,8 @@ class Stage2Config:
     rpn_nms_thresh: float  # RPN NMS threshold
     # for CCAM
     ccam_threshold : float # CCAM threshold
+    # for proto loss
+    proto_loss_tau: float  # temperature tau for proto loss
     # for HungarianMatcher
     cost_class: float  # classification cost weight
     cost_bbox: float  # bbox L1 cost weight
@@ -84,11 +88,11 @@ class Stage2Config:
     det_nms_thresh: float   # detection NMS threshold
     detections_per_img: int # number of detections per image
     # for RoI Align
-    roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
+    roi_out_size_h2wb: Tuple[int]  # output size for high feature maps to weak box features
     spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
-    roi_out_size_wb2p: Tuple[int, int]  # output size for weak box features to proposal box features
+    roi_out_size_wb2p: Tuple[int]  # output size for weak box features to proposal box features
     spatial_scale_wb2p: float  # spatial scale
-    roi_out_size_h2p: Tuple[int, int]  # output size for high feature maps to proposal box features
+    roi_out_size_h2p: Tuple[int]  # output size for high feature maps to proposal box features
     spatial_scale_h2p: float    # spatial scale for high feature maps to proposal box features
     sampling_ratio: int = 2  # sampling ratio
     aligned: bool = True    # aligned flag
@@ -232,7 +236,7 @@ class Stage2(nn.Module):
         super(Stage2, self).__init__()
 
         self.encoder = backbone
-        if self.config.freeze_backbone:     # freeze backbone weights
+        if config.freeze_backbone:     # freeze backbone weights
             for param in self.encoder.parameters():
                 param.requires_grad = False
         self.config = config
@@ -253,17 +257,22 @@ class Stage2(nn.Module):
             aligned=self.config.aligned,
         )
         # (train and inference) RoI Align for high-level feature maps to proposal box feature maps
-        self.roi_align_h2p = RoIAlign(
+        # self.roi_align_h2p = RoIAlign(
+        #     output_size=self.config.roi_out_size_h2p,
+        #     spatial_scale=self.config.spatial_scale_h2p,
+        #     sampling_ratio=self.config.sampling_ratio,
+        #     aligned=self.config.aligned,
+        # )
+        self.roi_align_h2p = MultiScaleRoIAlign(
+            featmap_names=["0"],
             output_size=self.config.roi_out_size_h2p,
-            spatial_scale=self.config.spatial_scale_h2p,
             sampling_ratio=self.config.sampling_ratio,
-            aligned=self.config.aligned,
         )
 
         # RPN
         anchor_generator = AnchorGenerator(
-            sizes=self.config.rpn_anchor_sizes,
-            aspect_ratios=self.config.rpn_anchor_aspect_ratios
+            sizes=(self.config.rpn_anchor_sizes,),
+            aspect_ratios=(self.config.rpn_anchor_aspect_ratios,)
         )
         rpn_head = RPNHead(in_channels=self.config.in_c, num_anchors=anchor_generator.num_anchors_per_location()[0])
         self.rpn = RegionProposalNetwork(
@@ -363,6 +372,39 @@ class Stage2(nn.Module):
         dense_proposals_list, _ = self.rpn(img_list, features)
 
         return dense_proposals_list
+
+    def _get_proto_loss(
+        self,
+        dense_proposal_embeddings: torch.Tensor,  # Normalized, [N_D, D]
+        prototypes_embeddings: torch.Tensor,  # Normalized, [C, D]
+        best_cls: torch.Tensor,   # [N_D] long, 0~C-1
+        keep_mask: torch.Tensor,  # [N_D] bool
+        tau: float,
+        eps: float = 1e-8,
+    ):
+        """
+        仅对 keep_mask == True 的“可靠 proposals”计算。
+        :return:
+        """
+        device = dense_proposal_embeddings.device
+        if dense_proposal_embeddings.numel() == 0:
+            return torch.tensor(0.0, device=device)
+
+        if keep_mask is None or keep_mask.numel() == 0 or (keep_mask.sum() == 0):
+            # 没有可靠 proposal，则不施加该约束（避免噪声）
+            return torch.tensor(0.0, device=device)
+
+        z = dense_proposal_embeddings[keep_mask]  # [N_keep, D]
+        y = best_cls[keep_mask].long()  # [N_keep]
+        p = prototypes_embeddings  # [C, D]
+
+        # logits: [N_keep, C]
+        logits = (z @ p.t()) / max(tau, eps)
+
+        # InfoNCE with single positive == CE over prototype logits
+        loss = F.cross_entropy(logits, y)
+
+        return loss
 
     def _get_multi_bboxes(
         self,
@@ -694,6 +736,7 @@ class Stage2(nn.Module):
         for item in pseudo_by_img:
             boxes = item["boxes"]
             scores = item["scores"]
+            labels = item["labels"]
 
             if boxes.numel() == 0:
                 refined.append(item)
@@ -707,19 +750,38 @@ class Stage2(nn.Module):
 
             # nms
             keep = nms(boxes, scores, iou_thr)
-            refined.append({"boxes": boxes[keep], "scores": scores[keep]})
+            refined.append({"boxes": boxes[keep], "scores": scores[keep], "labels": labels[keep]})
         return refined
+
+    def _evaluate_pseudo_labels(self,
+        pseudo_labels: List[Dict[str, torch.Tensor]],  # pseudo labels
+        gt_targets: List[Dict[str, torch.Tensor]]  # ground-truth targets for evaluate pseudo labels
+    )-> float:
+        """
+        Evaluate pseudo labels using ground-truth targets.
+        """
+        # Copy from torchvision references
+        map_metric = MeanAveragePrecision(
+            iou_type="bbox",
+            iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50:0.05:0.95
+            max_detection_thresholds=[1, 10, 100],
+        ).to(self.config.device)
+
+        map_metric.update(pseudo_labels, gt_targets)
+        result = map_metric.compute()
+
+        return float(result["map"])
 
     def _forward_train(
         self,
         imgs: torch.Tensor,  # input images, [B, C, H, W]
         wboxes: torch.Tensor,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        wb_labels: torch.Tensor  # class label for weak boxes, [R, num_classes]
-    )-> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor], List[Dict[str, torch.Tensor]], List[Dict[str, torch.Tensor]]]:
+        wb_labels: torch.Tensor,  # class label for weak boxes, [R, num_classes]
+        gt_targets: List[Dict[str, torch.Tensor]] = None  # ground-truth targets for evaluate pseudo labels
+    )-> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor], float, List[Dict[str, torch.Tensor]]]:
         """
         :return:
-        - dense_proposal_embeddings: torch.Tensor, L2 normalized, [N_D = num_dense, D]
-        - prototypes_embeddings: torch.Tensor, L2 normalized, [num_classes, D]
+        - loss_proto: torch.Tensor, Prototype loss
         - loss_ccam: torch.Tensor, CCAM loss
         - match_losses_dict: Dict[str, torch.Tensor], One-to-One Match losses
                             {
@@ -738,12 +800,7 @@ class Stage2(nn.Module):
                                 "loss_classifier": loss_classifier,
                                 "loss_box_reg": loss_box_reg
                             }
-        - pseudo_labels: List[Dict[str, torch.Tensor]], length B, each element:
-                            {
-                                "boxes": Tensor [Nb, 4] in image coords (xyxy),
-                                "scores": Tensor [Nb],
-                                "labels": Tensor [Nb] in [1..C] (0 reserved for background)
-                            }
+        - pseudo_labels_mAP: float, mAP of pseudo labels
         - detections: List[Dict[str, torch.Tensor]], length B, each element:
                             {
                                 "boxes": Tensor [Nd, 4] in image coords (xyxy),
@@ -762,13 +819,22 @@ class Stage2(nn.Module):
         # get dense proposals
         dense_proposals_list = self._get_dense_proposals(wb_feature_maps, wboxes)  # List[Tensor], len=R, each Tensor is [num_proposals, 4]
         wbox_batch_idx = wboxes[:, 0].to(device=wb_feature_maps.device)  # [R]
+        wbox_cls_ids = wb_labels.argmax(dim=1).to(device=wb_feature_maps.device)  # [R], 0~C-1
         dense_proposal_boxes_list = []
+        dense_proposal_labels_list = []
         for i, props_xyxy in enumerate(dense_proposals_list):
-            # props_xyxy: [num_proposals, 4]
+            # props_xyxy: [num_proposals_i, 4]
+            num_pi = props_xyxy.shape[0]
+
             bi = wbox_batch_idx[i].expand(props_xyxy.shape[0], 1).to(dtype=props_xyxy.dtype)  # [num_proposals, 1]
             props_5 = torch.cat([bi, props_xyxy], dim=1)  # [num_proposals, 5]
             dense_proposal_boxes_list.append(props_5)
+
+            li = wbox_cls_ids[i].expand(num_pi)  # [num_pi]
+            dense_proposal_labels_list.append(li)
+
         dense_proposal_boxes = torch.cat(dense_proposal_boxes_list, dim=0)  # [N_D = num_proposals, 5]
+        dense_proposal_labels = torch.cat(dense_proposal_labels_list, dim=0).long()  # [N_D], 0~C-1
 
         # get proposal features
         dense_proposal_features = self.roi_align_wb2p(wb_feature_maps, dense_proposals_list)    # [N_D = total_num_proposals, C_h, H_p, W_p]
@@ -802,17 +868,18 @@ class Stage2(nn.Module):
         sims_all = torch.matmul(dense_proposal_embeddings, prototypes_embeddings.t())  # [N_D, num_classes]
 
         # get sparse proposals
-        N_D = sims_all.shape[0]  # number of dense proposals
-        # For each dense proposal i, pick ONE best class (by similarity)
-        best_cls = torch.argmax(sims_all, dim=1)  # [N_D], each in [0, C-1]
-        best_sim = sims_all[torch.arange(N_D, device=sims_all.device), best_cls]  # [N_D]
-        # Keep it only if the best class passes its threshold
-        best_thr = thresholds[best_cls]  # [N_D]
-        keep_mask = best_sim > best_thr
+        # N_D, C = sims_all.shape  # [N_D, C]
+        labels = dense_proposal_labels.long()  # [N_D], 0~C-1  (each proposal belongs to its wbox class)
+        sim_for_label = sims_all.gather(1, labels.view(-1, 1)).squeeze(1)  # [N_D]
+        thr_for_label = thresholds[labels]  # [N_D]
+        # keep only if its class-specific similarity passes its class threshold
+        keep_mask = sim_for_label > thr_for_label  # [N_D] bool
         keep_indices = torch.where(keep_mask)[0]  # [N_keep]
+        best_cls = labels
+        best_sim = sim_for_label
         sparse_proposals: List[Dict] = []
         for i in keep_indices:
-            c = int(best_cls[i].item())
+            c = int(labels[i].item())
             sparse_proposals.append({
                 "sp_idx": len(sparse_proposals),  # global index for background padding
                 "box": dense_proposal_boxes[i],  # [5], (batch_idx, x1, y1, x2, y2)
@@ -824,6 +891,16 @@ class Stage2(nn.Module):
                 "sim": best_sim[i].detach(),
                 "dense_idx": int(i.item()),
             })
+
+        # get proto loss
+        tau = self.config.proto_loss_tau
+        loss_proto = self._get_proto_loss(
+            dense_proposal_embeddings=dense_proposal_embeddings,
+            prototypes_embeddings=prototypes_embeddings,
+            best_cls=best_cls,
+            keep_mask=keep_mask,
+            tau=tau
+        )
 
         # -----Branch 2: get seed proposals-----
         # get CCAM and loss_ccam
@@ -963,11 +1040,13 @@ class Stage2(nn.Module):
         detections, det_losses_dict = self.roi_heads(
             features={"0": high_feature_maps},
             proposals=proposals,
-            image_sizes=image_sizes,
+            image_shapes=image_sizes,
             targets=det_targets,
         )
 
-        return dense_proposal_embeddings, prototypes_embeddings, loss_ccam, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels, detections
+        pseudo_labels_mAP = self._evaluate_pseudo_labels(pseudo_labels, gt_targets)
+
+        return loss_ccam, loss_proto, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections
 
     def _forward_inference(
         self,
@@ -1004,7 +1083,7 @@ class Stage2(nn.Module):
         detections, _ = self.roi_heads(
             features={"0": high_feature_maps},
             proposals=proposals,
-            image_sizes=image_sizes,
+            image_shapes=image_sizes,
             targets=None,
         )
 
@@ -1015,10 +1094,11 @@ class Stage2(nn.Module):
         mode: str,  # "train" or "inference"
         imgs: torch.Tensor,  # input images, [B, C, H, W]
         wboxes: torch.Tensor = None,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        wb_labels : torch.Tensor = None     # class label for weak boxes, [R, num_classes]
+        wb_labels : torch.Tensor = None,     # class label for weak boxes, [R, num_classes]
+        gt_targets : List[Dict[str, torch.Tensor]] = None   # ground-truth targets for evaluate pseudo labels
     ):
         if mode == "train":
-            return self._forward_train(imgs, wboxes, wb_labels)
+            return self._forward_train(imgs, wboxes, wb_labels, gt_targets)
         elif mode == "inference":
             return self._forward_inference(imgs)
 

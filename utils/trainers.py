@@ -7,6 +7,8 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from utils import Logger, get_img_contrast_loss, SupConLossConfig, LossContrastMode, supervised_contrastive_loss, get_patch_loss
 from tqdm.auto import tqdm
 from torchmetrics import MetricCollection, Precision, Recall, F1Score, AUROC, Accuracy, AveragePrecision
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
 
 @dataclass
 class Stage1TrainerConfig:
@@ -41,6 +43,11 @@ class Stage2TrainerConfig:
     checkpoints_save_path: str
     model_save_path: str
     logger: Logger
+    w_ccam_loss: float  # weight for ccam loss
+    w_rpn_loss: float   # weight for rpn loss
+    w_proto_loss: float  # weight for prototype loss
+    w_match_loss: float     # weight for matching loss
+    w_det_loss: float       # weight for detection loss
     continue_train: bool = False
     checkpoint_path: str = None
 
@@ -394,6 +401,67 @@ class Stage2Trainer:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
             print("Learning rate scheduler state loaded successfully.")
 
+    def _build_gt_targets(self, targets: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
+        """
+        :return: GT targets[i] = {"boxes": [Mi,4], "labels": [Mi]}
+        """
+        out = []
+        for t in targets:
+            if ("gt_boxes" in t) and ("gt_labels" in t):
+                boxes = t["gt_boxes"]
+                labels = t["gt_labels"]
+            else:
+                boxes = t["boxes"]
+                labels = t["labels"]
+
+            out.append({
+                "boxes": boxes.float(),
+                "labels": labels.long(),
+            })
+        return out
+
+    def _get_mAP_metric(
+        self,
+        mode : str, # 'train' or 'eval'
+    )-> float:
+        """
+        :return: mAP@[0.5:0.95]
+        """
+        self.model.eval()
+
+        if mode == "train":
+            loader = self.train_loader
+        elif mode == "val":
+            loader = self.val_loader
+
+        map_metric = MeanAveragePrecision(
+            iou_type="bbox",
+            iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50:0.05:0.95
+            max_detection_thresholds=[1, 10, 100],
+        ).to(self.config.device)
+
+        num_iters = len(loader)
+        pbar = tqdm(
+            enumerate(loader, start=1),
+            total=num_iters,
+            desc=f"Computing {mode} mAP@[0.5:0.95]",
+            leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
+            dynamic_ncols=True,  # 自适应终端宽度
+        )
+
+        with torch.no_grad():
+            for iter, (images, target) in pbar:
+                images = [img.to(self.config.device) for img in images]
+                targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
+
+                X = torch.stack(images, dim=0)
+                detections = self.model("inference", X)
+                map_metric.update(detections, targets)
+
+        metric = map_metric.compute()
+
+        return float(metric["map"])
+
     def _train_one_epoch(self, epoch) -> None:
         num_iters = len(self.train_loader)
         pbar = tqdm(
@@ -423,91 +491,125 @@ class Stage2Trainer:
         epoch_det_cls_loss = 0.0
         epoch_det_reg_loss = 0.0
 
+        epoch_pseudo_labels_mAP = 0.0
+
         for iter, (images, target) in pbar:
             images = [img.to(self.config.device) for img in images]
+            gt_targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
             targets = [{k: v.to(self.config.device) for k, v in t.items()} for t in target]
 
             wboxes = _build_wboxes(targets).to(self.config.device)
             wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
             X = torch.stack(images, dim=0)
-            dense_proposal_embeddings, prototypes_embeddings, loss_ccam, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels, detections = self.model("train", X, wboxes, wb_one_hot_labels)
+            loss_ccam, loss_proto, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections = self.model("train", X, wboxes, wb_one_hot_labels, gt_targets)
 
+            loss_match = match_losses_dict["loss_match"]
+            loss_match_cls = match_losses_dict["loss_match_cls"]
+            loss_match_l1 = match_losses_dict["loss_match_l1"]
+            loss_match_giou = match_losses_dict["loss_match_giou"]
 
+            loss_rpn_obj = rpn_losses_dict["loss_objectness"]
+            loss_rpn_reg = rpn_losses_dict["loss_rpn_box_reg"]
+            loss_rpn = loss_rpn_obj + loss_rpn_reg
 
+            loss_det_cls = det_losses_dict["loss_classifier"]
+            loss_det_reg = det_losses_dict["loss_box_reg"]
+            loss_det = loss_det_cls + loss_det_reg
 
-        #     self._update_dataset_mps_ema(prototypes)
-        #
-        #     loss_img = get_img_contrast_loss(low_latent_features, img_multi_hot_labels)
-        #     loss_wbb = supervised_contrastive_loss(high_aug_embedding_features, wb_one_hot_labels, self.supcon_loss_config)
-        #     loss_MFHA = self.w_img_loss * loss_img + self.w_wbb_loss * loss_wbb
-        #     loss_patch_cls = get_patch_loss(patch_logits, wb_one_hot_labels)
-        #     supcon_loss_config = self.supcon_loss_config
-        #     supcon_loss_config.contrast_mode = LossContrastMode.ONE_VIEW
-        #     loss_patch_supcon = supervised_contrastive_loss(contrast_patch_features, wb_one_hot_labels, supcon_loss_config)
-        #     loss_patch = loss_patch_cls + loss_patch_supcon
-        #     loss = loss_MFHA + self.w_cam_loss * loss_cam + self.w_patch_loss * loss_patch
-        #
-        #     self.optimizer.zero_grad()
-        #     loss.backward()
-        #
-        #     self.optimizer.step()
-        #
-        #     epoch_total_loss += loss.item()
-        #     epoch_img_loss += loss_img.item()
-        #     epoch_wbb_loss += loss_wbb.item()
-        #     epoch_MFHA_loss += loss_MFHA.item()
-        #     epoch_cam_loss += loss_cam.item()
-        #     epoch_patch_loss += loss_patch.item()
-        #     epoch_patch_cls_loss += loss_patch_cls.item()
-        #     epoch_patch_supcon_loss += loss_patch_supcon.item()
-        #
-        #     pbar.set_postfix({
-        #         "Iter Loss: Total": f"{loss.item():.4f} ",
-        #         "MFHA": f"{loss_MFHA.item():.4f} ",
-        #         "CAM": f"{loss_cam.item():.4f} ",
-        #         "Patch": f"{loss_patch.item():.4f} ",
-        #         "patch_cls" : f"{loss_patch_cls.item():.4f} ",
-        #         "patch_supcon" : f"{loss_patch_supcon.item():.4f} ",
-        #         "img": f"{loss_img.item():.4f} ",
-        #         "wbb": f"{loss_wbb.item():.4f} ",
-        #         "lr": f"{self.optimizer.param_groups[0]['lr']}",
-        #     })
-        #
-        # self.lr_scheduler.step()
-        #
-        # num_iters = len(self.train_loader)
-        # average_total_loss = epoch_total_loss / num_iters
-        # average_img_loss = epoch_img_loss / num_iters
-        # average_wbb_loss = epoch_wbb_loss / num_iters
-        # average_MFHA_loss = epoch_MFHA_loss / num_iters
-        # average_cam_loss = epoch_cam_loss / num_iters
-        # average_patch_loss = epoch_patch_loss / num_iters
-        # average_patch_cls_loss = epoch_patch_cls_loss / num_iters
-        # average_patch_supcon_loss = epoch_patch_supcon_loss / num_iters
-        #
-        # self.logger.add_info(
-        #     f"Epoch [{epoch}/{self.config.epochs}]"
-        #     f"Total Loss: {average_total_loss:.4f}, "
-        #     f"Image Contrast Loss: {average_img_loss:.4f}, "
-        #     f"Weak Box Contrast Loss: {average_wbb_loss:.4f}, "
-        #     f"MFHA Loss: {average_MFHA_loss:.4f}, "
-        #     f"CAM Loss: {average_cam_loss:.4f}\n"
-        #     f"Patch Loss: {average_patch_loss:.4f} "
-        #     f"Patch CLS Loss : {average_patch_cls_loss:.4f} "
-        #     f"Patch SupCon Loss : {average_patch_supcon_loss:.4f} \n"
-        # )
-        # metrics = {
-        #     'Epoch': epoch,
-        #     'Total Loss': average_total_loss,
-        #     'Image Contrast Loss': average_img_loss,
-        #     'Weak Box Contrast Loss': average_wbb_loss,
-        #     'MFHA Loss': average_MFHA_loss,
-        #     'CAM Loss': average_cam_loss,
-        #     'Patch Loss': average_patch_loss,
-        #     'Patch CLS Loss': average_patch_cls_loss,
-        #     'Patch SupCon Loss': average_patch_supcon_loss,
-        # }
-        # self.logger.add_metrics(metrics)
+            loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto + self.config.w_match_loss * loss_match + self.config.w_det_loss * loss_det
+
+            self.optimizer.zero_grad()
+            loss.backward()
+
+            self.optimizer.step()
+
+            epoch_total_loss += loss.item()
+            epoch_ccam_loss += loss_ccam.item()
+            epoch_rpn_loss += loss_rpn.item()
+            epoch_rpn_obj_loss += loss_rpn_obj.item()
+            epoch_rpn_reg_loss += loss_rpn_reg.item()
+            epoch_proto_loss += loss_proto.item()
+            epoch_match_loss += loss_match.item()
+            epoch_match_cls_loss += loss_match_cls.item()
+            epoch_match_l1_loss += loss_match_l1.item()
+            epoch_match_giou_loss += loss_match_giou.item()
+            epoch_det_loss += loss_det.item()
+            epoch_det_cls_loss += loss_det_cls.item()
+            epoch_det_reg_loss += loss_det_reg.item()
+
+            epoch_pseudo_labels_mAP += pseudo_labels_mAP
+
+            pbar.set_postfix({
+                "Iter Loss: Total": f"{loss.item():.4f} ",
+                "CCAM": f"{loss_ccam.item():.4f} ",
+                "RPN": f"{loss_rpn.item():.4f} ",
+                "Proto": f"{loss_proto.item():.4f} ",
+                "Match": f"{loss_match.item():.4f} ",
+                "Det": f"{loss_det.item():.4f} ",
+                "p_mAP": f"{pseudo_labels_mAP:.4f} ",
+                "lr": f"{self.optimizer.param_groups[0]['lr']}",
+            })
+
+        self.lr_scheduler.step()
+
+        num_iters = len(self.train_loader)
+        average_total_loss = epoch_total_loss / num_iters
+        average_ccam_loss = epoch_ccam_loss / num_iters
+        average_rpn_loss = epoch_rpn_loss / num_iters
+        average_rpn_obj_loss = epoch_rpn_obj_loss / num_iters
+        average_rpn_reg_loss = epoch_rpn_reg_loss / num_iters
+        average_proto_loss = epoch_proto_loss / num_iters
+        average_match_loss = epoch_match_loss / num_iters
+        average_match_cls_loss = epoch_match_cls_loss / num_iters
+        average_match_l1_loss = epoch_match_l1_loss / num_iters
+        average_match_giou_loss = epoch_match_giou_loss / num_iters
+        average_det_loss = epoch_det_loss / num_iters
+        average_det_cls_loss = epoch_det_cls_loss / num_iters
+        average_det_reg_loss = epoch_det_reg_loss / num_iters
+
+        average_pseudo_labels_mAP = epoch_pseudo_labels_mAP / num_iters
+
+        # get mAP@[0.5:0.95] metric
+        train_mAP = self._get_mAP_metric(mode="train")
+        val_mAP = self._get_mAP_metric(mode="val")
+
+        self.config.logger.add_info(
+            f"Epoch [{epoch}/{self.config.epochs}]"
+            f"Total Loss: {average_total_loss:.4f}, "
+            f"CCAM Loss: {average_ccam_loss:.4f}, "
+            f"RPN Loss: {average_rpn_loss:.4f}, "
+            f"Proto Loss: {average_proto_loss:.4f}, "
+            f"Match Loss: {average_match_loss:.4f}, "
+            f"Det Loss: {average_det_loss:.4f}\n"
+            f"RPN Obj Loss: {average_rpn_obj_loss:.4f}, "
+            f"RPN Reg Loss: {average_rpn_reg_loss:.4f}, "
+            f"Match CLS Loss: {average_match_cls_loss:.4f}, "
+            f"Match L1 Loss: {average_match_l1_loss:.4f}, "
+            f"Match GIoU Loss: {average_match_giou_loss:.4f}, "
+            f"Det CLS Loss: {average_det_cls_loss:.4f}, "
+            f"Det Reg Loss: {average_det_reg_loss:.4f} \n"
+            f"Train mAP@[0.5:0.95]: {train_mAP:.4f}, Val mAP@[0.5:0.95]: {val_mAP:.4f}, Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
+        )
+        metrics = {
+            'Epoch': epoch,
+            'Total Loss': average_total_loss,
+            'CCAM Loss': average_ccam_loss,
+            'RPN Loss': average_rpn_loss,
+            'RPN Obj Loss': average_rpn_obj_loss,
+            'RPN Reg Loss': average_rpn_reg_loss,
+            'Proto Loss': average_proto_loss,
+            'Match Loss': average_match_loss,
+            'Match CLS Loss': average_match_cls_loss,
+            'Match L1 Loss': average_match_l1_loss,
+            'Match GIoU Loss': average_match_giou_loss,
+            'Det Loss': average_det_loss,
+            'Det CLS Loss': average_det_cls_loss,
+            'Det Reg Loss': average_det_reg_loss,
+            'Train mAP@[0.5:0.95]': train_mAP,
+            'Val mAP@[0.5:0.95]': val_mAP,
+            'Pseudo Labels mAP@[0.5:0.95]': average_pseudo_labels_mAP,
+        }
+        self.config.logger.add_metrics(metrics)
 
     def train(self)-> None:
         for epoch in range(self.start_epoch, self.config.epochs + 1):
@@ -520,6 +622,24 @@ class Stage2Trainer:
         model_save_path = self.config.model_save_path
         self._save_model(model_save_path=model_save_path)
 
+    def _save_checkpoint(self, current_epoch : int, checkpoints_save_path : str):
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "epoch": current_epoch,
+            "log_path": self.log_path,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+        }
+
+        file_path = f"{checkpoints_save_path}/checkpoint_{current_epoch}.pth"
+        torch.save(checkpoint, file_path)
+        print(f"Checkpoint saved to {file_path}")
+
+    def _save_model(self, model_save_path : str, model_name : str = 'MP_RCNN'):
+        model_state_dict = self.model.encoder.state_dict()
+        model_file_path = f"{model_save_path}/{model_name}.pth"
+        torch.save(model_state_dict, model_file_path)
+        print(f"Model parameters saved to {model_file_path}")
 
 
 class LinearProbTrainer:
@@ -728,6 +848,21 @@ def build_stage1_trainer(
         train_loader=train_loader,
         config=trainer_config,
         supcon_loss_config=supcon_loss_config,
+    )
+
+    return trainer
+
+def build_stage2_trainer(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    trainer_config: Stage2TrainerConfig,
+)-> Stage2Trainer:
+    trainer = Stage2Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=trainer_config,
     )
 
     return trainer

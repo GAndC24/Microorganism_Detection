@@ -29,7 +29,8 @@ class UrinarySedimentDataset(Dataset):
         self.split = split
         self.transforms = transforms
 
-        self.ann_dir = os.path.join(self.root, "Annotations")  # xml annotation folder
+        self.ann_wb_dir = os.path.join(self.root, "Annotations_wb")  # wb xml annotation folder
+        self.ann_gt_dir = os.path.join(self.root, "Annotations_gt")  # gt xml annotation folder
         self.img_dir = os.path.join(self.root, "JPEGImages")  # jpg images folder
         self.set_dir = os.path.join(self.root, "ImageSets", "Main")  # dataset split folder
 
@@ -47,26 +48,37 @@ class UrinarySedimentDataset(Dataset):
         image_id = self.img_ids[idx]
 
         img_path = os.path.join(self.img_dir, f"{image_id}.jpg")
-        xml_path = os.path.join(self.ann_dir, f"{image_id}.xml")
+        wb_xml_path = os.path.join(self.ann_wb_dir, f"{image_id}.xml")
+        gt_xml_path = os.path.join(self.ann_gt_dir, f"{image_id}.xml")
 
         if not os.path.isfile(img_path):
             raise FileNotFoundError(f"Image not found: {img_path}")
-        if not os.path.isfile(xml_path):
-            raise FileNotFoundError(f"Annotation not found: {xml_path}")
+        if not os.path.isfile(wb_xml_path):
+            raise FileNotFoundError(f"Annotation not found: {wb_xml_path}")
+        if not os.path.isfile(gt_xml_path):
+            raise FileNotFoundError(f"Annotation not found: {gt_xml_path}")
 
         image_pil = Image.open(img_path).convert("RGB")
         W, H = image_pil.size  # PIL: (W, H)
 
-        image_info, wbs = parse_voc_xml(xml_path, class_map_encoding)
+        image_info, wbs = parse_voc_xml(wb_xml_path, class_map_encoding)
+        _, gts = parse_voc_xml(gt_xml_path, class_map_encoding)
 
         boxes : List[Box] = []
         labels : List[int] = []
+        gt_boxes : List[Box] = []
+        gt_labels : List[int] = []
         for wb in wbs:
             boxes.append(wb['box'])
             labels.append(wb['class_id'])
+        for gt in gts:
+            gt_boxes.append(gt['box'])
+            gt_labels.append(gt['class_id'])
 
         boxes_tensor = torch.tensor(boxes, dtype=torch.float32)  # [N,4]
         labels_tensor = torch.tensor(labels, dtype=torch.int64)  # [N]
+        gt_boxes_tensor = torch.tensor(gt_boxes, dtype=torch.float32)   # [N,4]
+        gt_labels_tensor = torch.tensor(gt_labels, dtype=torch.int64)   # [N]
 
         image = tv_tensors.Image(image_pil)
         boxes_tv = tv_tensors.BoundingBoxes(
@@ -74,9 +86,16 @@ class UrinarySedimentDataset(Dataset):
             format="XYXY",
             canvas_size=(H, W)
         )
+        gt_boxes_tv = tv_tensors.BoundingBoxes(
+            gt_boxes_tensor,
+            format="XYXY",
+            canvas_size=(H, W)
+        )
         target: Dict[str, Any] = {
             "boxes": boxes_tv,
             "labels": labels_tensor,
+            "gt_boxes": gt_boxes_tv,
+            "gt_labels": gt_labels_tensor,
             "image_id": torch.tensor([idx], dtype=torch.int64),
         }
 
@@ -98,7 +117,7 @@ class LinearProbDataset(Dataset):
         self.split = split
         self.transforms = transforms
 
-        self.ann_dir = os.path.join(self.root, "Annotations")  # xml annotation folder
+        self.ann_dir = os.path.join(self.root, "Annotations_wb")  # xml annotation folder
         self.img_dir = os.path.join(self.root, "JPEGImages")  # jpg images folder
         self.set_dir = os.path.join(self.root, "ImageSets", "Main")  # dataset split folder
 

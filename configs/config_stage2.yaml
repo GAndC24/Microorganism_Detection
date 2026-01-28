@@ -4,10 +4,11 @@ runtime:
 
 data:
   data_root: "./data/processed/Urinary Sediment Dataset"
-  batch_size: 32    # (32, 64)
+  batch_size: 16    # (32, 64)
 
 stage2_model_config:
-  img_size: 800  # (600, 800)
+  img_size: 600  # (600, 800)
+  num_classes: 7
   in_c: 512
   freeze_backbone: False
   hidden_dim: 512   # (256, 512, 768, 1024)
@@ -20,7 +21,8 @@ stage2_model_config:
   rpn_pre_nms_top_n: 4000, 2000  # train: [2000, 6000], test: [1000, 3000]
   rpn_post_nms_top_n: 2000, 1000 # train: [2000, 4000], test: [1000, 2000]
   rpn_nms_thresh: 0.8  # [0.7, 0.9]
-  ccam_threshold:
+  ccam_threshold: 0.2
+  proto_loss_tau: 0.1   # [0.05, 0.2]
   cost_class: 2.0
   cost_bbox: 5.0
   cost_giou: 2.0
@@ -40,8 +42,9 @@ stage2_model_config:
   detections_per_img: 100
   roi_out_size_h2wb: 21   # [21, 24]
   roi_out_size_wb2p: 7
-  spatial_scale_wb2p: 1.0
   roi_out_size_h2p: 7
+  backbone_weights_path: "./results/model_weights/Vgg16_backbone_260125.pth"
+  dataset_mps_path: "./dataset_morphological_prototypes/dataset_MPs_260125.pth"
 
 stage2_trainer_config:
   epochs: 50
@@ -49,6 +52,11 @@ stage2_trainer_config:
   warm_up_lr_factor: 0.01    # min_lr = warm_up_lr_factor * lr
   warmup_epochs: 5    # 1/10 epochs
   weight_decay: 0.05    # [0.05, 0.1]
+  w_ccam_loss: 1.0
+  w_rpn_loss: 0.5
+  w_proto_loss: 1.0
+  w_match_loss: 0.3
+  w_det_loss: 1.0
   checkpoints_save_path: "./checkpoints/stage2/"
   model_save_path: "./results/model_weights/"
   continue_train: False
