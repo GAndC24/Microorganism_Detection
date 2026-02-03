@@ -1,9 +1,12 @@
 # Morphological Prototype R-CNN
+import os.path
+
 import torch
 import torch.nn as nn
 from typing import Tuple, List, Dict, Any, Union
 from dataclasses import dataclass
-from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, CCAMGenerator, HungarianMatcher
+# from utils import random_masking, add_gaussian_noise, MorphologicalPrototypeGenerator, FeatureHook, build_vgg16_backbone_with_hook, vgg_layer_out_c_maps, CCAMGenerator, HungarianMatcher, visualize_hungarian_matches
+from utils import *
 from torchvision.ops import RoIAlign
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead, RegionProposalNetwork
 from torchvision.models import vgg16
@@ -96,6 +99,19 @@ class Stage2Config:
     spatial_scale_h2p: float    # spatial scale for high feature maps to proposal box features
     sampling_ratio: int = 2  # sampling ratio
     aligned: bool = True    # aligned flag
+
+@dataclass
+class Stage2CCAMConfig:
+    device: torch.device  # device
+    freeze_backbone: bool  # freeze backbone weights
+    in_c: int  # input channels
+    # for CCAM
+    ccam_threshold: float  # CCAM threshold
+    # for RoI Align
+    roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
+    spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
+    sampling_ratio: int = 2  # sampling ratio
+    aligned: bool = True  # aligned flag
 
 @dataclass
 class LinearProbConfig:
@@ -416,13 +432,21 @@ class Stage2(nn.Module):
         Copy from : https://github.com/MingXiangL/SPE
         :return: estimated bounding box: len(contours), each is [x1, y1, x2, y2]
         """
+        # with open("debug_data.txt", "a", encoding="utf-8") as f:
+        #     f.write(f"CCAM: (shape: {cam.shape})\n")
+        #     for line in cam:
+        #         f.write(" ".join([f"{val:.4f}" for val in line.flatten().tolist()]) + "\n")
+        # cam = 1 - cam
         cam = (cam * 255.).astype(np.uint8)
         map_thr = cam_thr * np.max(cam)
+
 
         _, thr_gray_heatmap = cv2.threshold(cam,
                                             int(map_thr), 255,
                                             cv2.THRESH_TOZERO)
         # thr_gray_heatmap = (thr_gray_heatmap*255.).astype(np.uint8)
+        # for debug visualization
+        # cv2.imwrite("debug_thr_gray_heatmap_1.png", thr_gray_heatmap)
 
         contours, _ = cv2.findContours(thr_gray_heatmap,
                                        cv2.RETR_TREE,
@@ -763,7 +787,7 @@ class Stage2(nn.Module):
         # Copy from torchvision references
         map_metric = MeanAveragePrecision(
             iou_type="bbox",
-            iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50:0.05:0.95
+            iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50 : 0.05 : 0.95
             max_detection_thresholds=[1, 10, 100],
         ).to(self.config.device)
 
@@ -891,6 +915,19 @@ class Stage2(nn.Module):
                 "sim": best_sim[i].detach(),
                 "dense_idx": int(i.item()),
             })
+        with open("debug_data.txt", "w", encoding="utf-8") as f:
+            f.write("Thresholds for each class:\n")
+            for t in thresholds:
+                f.write(f"{t.item()} ")
+            f.write("\n")
+            f.write(f"Similarity Matrix(shape: {sims_all.shape}):\n")
+            for sims in sims_all:
+                f.write(f"{sims}\n")
+            f.write(f"Sparse proposals(number:{len(sparse_proposals)}):\n")
+            for p in sparse_proposals:
+                for k, v in p.items():
+                    f.write(f"{k}: {v} \n")
+
 
         # get proto loss
         tau = self.config.proto_loss_tau
@@ -903,6 +940,7 @@ class Stage2(nn.Module):
         )
 
         # -----Branch 2: get seed proposals-----
+
         # get CCAM and loss_ccam
         ccam, loss_ccam = self.ccam_generator(wb_feature_maps)      # [R, 1, H_wb, W_wb]
 
@@ -911,6 +949,25 @@ class Stage2(nn.Module):
         R, _, _, _ = ccam.shape
         for i in range(R):
             ccam_i = ccam[i].detach().cpu().numpy().transpose(1, 2, 0)      # [h, w, 1]
+
+            # for debug: Visualize CCAM
+            # imgs: torch.Tensor [B,C,H,W] (一般是RGB归一化)
+            b = int(wboxes[i, 0].item())
+            x1, y1, x2, y2 = wboxes[i, 1:5].detach().cpu().numpy().tolist()
+            img_chw = imgs[b].detach().cpu().numpy()
+            img_chw = denorm_imagenet(img_chw)  # -> [0,1]
+            img_np = np.transpose(img_chw, (1, 2, 0))  # HWC
+            img_u8 = (img_np * 255).astype(np.uint8)
+            img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+            overlay = overlay_ccam_on_image(
+                img_bgr=img_bgr,
+                ccam_hw1=ccam_i,  # (Hc,Wc,1)
+                wbox_xyxy=(x1, y1, x2, y2),
+                alpha=0.45,
+                normalize_ccam=True
+            )
+            cv2.imwrite(f"./results/visualizations/ccam/debug_ccam_overlay_b{b}_r{i}.png", overlay)
+
             local_boxes_list = self._get_multi_bboxes(ccam_i, self.config.ccam_threshold)
             # 过滤“无 contours”的默认返回框
             if len(local_boxes_list) == 1 and local_boxes_list[0] == [0, 0, 1, 1]:
@@ -933,12 +990,26 @@ class Stage2(nn.Module):
                     "box" : global_boxes_wbatch[j],  # Tensor [5], (batch_idx, x1, y1, x2, y2)
                     "class_id" : class_id,
                 })
+        with open("debug_data.txt", "a", encoding="utf-8") as f:
+            f.write(f"Seed proposals(number:{len(seed_proposals)}):\n")
+            for p in seed_proposals:
+                for k, v in p.items():
+                    f.write(f"{k}: {v} \n")
 
         # ----- one-to-one match-----
         matched_pairs, unmatched_sparse = self._match_sparse_seed_with_hungarian(
             sparse_proposals=sparse_proposals,
             seed_proposals=seed_proposals,
             num_classes=self.config.num_classes,
+        )
+        # debug : visualize matched pairs
+        visualize_hungarian_matches(
+            imgs=imgs,
+            sparse_proposals=sparse_proposals,
+            seed_proposals=seed_proposals,
+            matched_pairs=matched_pairs,
+            wboxes=wboxes,
+            gt_targets=gt_targets,
         )
 
         # split matched pairs
@@ -975,6 +1046,12 @@ class Stage2(nn.Module):
         )
 
         # -----build pseudo labels-----
+        # pseudo_labels : List[Dict[str, torch.Tensor]], list length B, each element:
+        #               {
+        #                   "boxes": [Nb,4] xyxy in image coords,
+        #                   "scores": [Nb],
+        #                   "labels": [Nb]  (1..C, 0 reserved for background)
+        #               }
         pseudo_labels = self._build_rpn_pseudo_labels_from_matched_sparse(
             matched_sparse_boxes=matched_sparse_boxes,
             matched_sparse_scores=matched_sparse_scores,
@@ -1036,7 +1113,12 @@ class Stage2(nn.Module):
             }
             for b in range(batch_size)
         ]
-        # detections : List[Dict], len=B, each Dict has {"boxes" : [N_boxes, 4], "labels" : [N_boxes](1...C), "scores" : [N_boxes], softmax confidence}
+        # detections : List[Dict[str, torch.Tensor]], len=B, each Dict has
+        #              {
+        #                   "boxes" : [N_boxes, 4],
+        #                   "labels" : [N_boxes](1...C), 0 reserved for background
+        #                   "scores" : [N_boxes], softmax confidence
+        #              }
         detections, det_losses_dict = self.roi_heads(
             features={"0": high_feature_maps},
             proposals=proposals,
@@ -1101,6 +1183,468 @@ class Stage2(nn.Module):
             return self._forward_train(imgs, wboxes, wb_labels, gt_targets)
         elif mode == "inference":
             return self._forward_inference(imgs)
+
+# CCAM verification
+class Stage2_ccam(nn.Module):
+    def __init__(
+        self,
+        config : Stage2CCAMConfig,       # Stage2 CCAM configuration
+        backbone : nn.Module,  # Default VGG-16 with aligned weights
+    )-> None:
+        super(Stage2_ccam, self).__init__()
+
+        self.encoder = backbone
+        if config.freeze_backbone:     # freeze backbone weights
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+        self.config = config
+
+        # (train)RoI Align for high-level feature maps to weak box feature maps
+        self.roi_align_h2wb = RoIAlign(
+            output_size=self.config.roi_out_size_h2wb,
+            spatial_scale=self.config.spatial_scale_h2wb,
+            sampling_ratio=self.config.sampling_ratio,
+            aligned=self.config.aligned,
+        )
+
+        # CCAM Generator
+        self.ccam_generator = CCAMGenerator(in_c=self.config.in_c)
+
+    def _get_multi_bboxes(
+        self,
+        cam : np.ndarray,     # [h, w, 1]
+        cam_thr : float = 0.2,        # threshold, [0, 1]
+        area_ratio : float =0.5,
+        do_aug: bool = True,
+        delta_aug : float = 0.10,  # jitter strength, e.g. 0.05~0.15
+        num_aug: int = 4,  # how many jittered boxes per base box
+        min_box_size: int = 2  # avoid degenerate tiny boxes
+    )-> List[List[int]]:
+        """
+        Copy from : https://github.com/MingXiangL/SPE
+        :return: estimated bounding box: len(contours), each is [x1, y1, x2, y2]
+        """
+        # with open("debug_data.txt", "a", encoding="utf-8") as f:
+        #     f.write(f"CCAM: (shape: {cam.shape})\n")
+        #     for line in cam:
+        #         f.write(" ".join([f"{val:.4f}" for val in line.flatten().tolist()]) + "\n")
+        assert cam.ndim == 3 and cam.shape[2] == 1, f"Expect [H,W,1], got {cam.shape}"
+        Hc, Wc, _ = cam.shape
+
+        # ---- (1) thresholding + find contours ----
+        cam_u8 = (cam * 255.).astype(np.uint8)
+        map_thr = cam_thr * float(np.max(cam_u8))
+
+        _, thr_gray_heatmap = cv2.threshold(
+            cam_u8, int(map_thr), 255, cv2.THRESH_TOZERO
+        )
+
+        contours, _ = cv2.findContours(
+            thr_gray_heatmap, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if len(contours) != 0:
+            estimated_bbox: List[List[int]] = []
+            areas = list(map(cv2.contourArea, contours))
+            area_idx = sorted(range(len(areas)), key=areas.__getitem__, reverse=True)
+
+            for idx in area_idx:
+                if areas[idx] >= areas[area_idx[0]] * area_ratio:
+                    c = contours[idx]
+                    x, y, w, h = cv2.boundingRect(c)
+                    x1, y1, x2, y2 = x, y, x + w, y + h
+
+                    # clamp + sanitize
+                    x1 = max(0, min(x1, Wc - 1))
+                    y1 = max(0, min(y1, Hc - 1))
+                    x2 = max(0, min(x2, Wc - 1))
+                    y2 = max(0, min(y2, Hc - 1))
+                    if x2 < x1: x1, x2 = x2, x1
+                    if y2 < y1: y1, y2 = y2, y1
+
+                    # filter too small
+                    if (x2 - x1) >= min_box_size and (y2 - y1) >= min_box_size:
+                        estimated_bbox.append([x1, y1, x2, y2])
+        else:
+            estimated_bbox = [[0, 0, 1, 1]]
+
+        # ---- (2) Seed Proposal Augmentation (box jittering in CCAM coords) ----
+        # REF_11 idea: for each seed box, generate multiple jittered boxes in its neighborhood.
+        if (not do_aug) or (len(estimated_bbox) == 0):
+            return estimated_bbox
+
+        # if it's the default dummy box, do not augment
+        if len(estimated_bbox) == 1 and estimated_bbox[0] == [0, 0, 1, 1]:
+            return estimated_bbox
+
+        aug_boxes: List[List[int]] = []
+        # deterministic randomness if you want reproducibility:
+        # rng = np.random.RandomState(0)
+        rng = np.random
+
+        for (x1, y1, x2, y2) in estimated_bbox:
+            w = max(float(x2 - x1), 1.0)
+            h = max(float(y2 - y1), 1.0)
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+
+            for _ in range(int(num_aug)):
+                # eps ~ U(-delta_aug, +delta_aug)
+                ex = float(rng.uniform(-delta_aug, delta_aug))
+                ey = float(rng.uniform(-delta_aug, delta_aug))
+                ew = float(rng.uniform(-delta_aug, delta_aug))
+                eh = float(rng.uniform(-delta_aug, delta_aug))
+
+                # jitter in neighborhood (relative)
+                cx2 = cx * (1.0 + ex)
+                cy2 = cy * (1.0 + ey)
+                w2 = w * (1.0 + ew)
+                h2 = h * (1.0 + eh)
+
+                # keep positive size
+                w2 = max(w2, float(min_box_size))
+                h2 = max(h2, float(min_box_size))
+
+                nx1 = cx2 - 0.5 * w2
+                ny1 = cy2 - 0.5 * h2
+                nx2 = cx2 + 0.5 * w2
+                ny2 = cy2 + 0.5 * h2
+
+                # clamp to CCAM bounds
+                nx1 = max(0.0, min(nx1, Wc - 1.0))
+                ny1 = max(0.0, min(ny1, Hc - 1.0))
+                nx2 = max(0.0, min(nx2, Wc - 1.0))
+                ny2 = max(0.0, min(ny2, Hc - 1.0))
+
+                # sanitize ordering
+                if nx2 < nx1: nx1, nx2 = nx2, nx1
+                if ny2 < ny1: ny1, ny2 = ny2, ny1
+
+                # filter too small after clamp
+                if (nx2 - nx1) < min_box_size or (ny2 - ny1) < min_box_size:
+                    continue
+
+                aug_boxes.append([int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))])
+
+        # Optional: remove duplicates (common after rounding)
+        if len(aug_boxes) > 0:
+            uniq = []
+            seen = set()
+            for b in aug_boxes:
+                t = tuple(b)
+                if t not in seen:
+                    seen.add(t)
+                    uniq.append(b)
+            aug_boxes = uniq
+
+        return estimated_bbox + aug_boxes
+
+    def _map_boxes_roi_to_image_xyxy(
+        self,
+        boxes_local: Union[List[List[float]], torch.Tensor],    # list of [lx1, ly1, lx2, ly2] in ccam pixel coords, or Tensor [N, 4]
+        wbox: torch.Tensor,     # Tensor [5] = [batch_idx, x1, y1, x2, y2] in image coords
+        cam_hw: Tuple[int, int],    # (Hc, Wc) spatial size of ccam
+        img_hw: Tuple[int, int],    # (Himg, Wimg) spatial size of original image
+    ) -> torch.Tensor:
+        """
+        Map boxes from ROI-local coordinate system (ccam space) to image coordinate system.
+        :returns: boxes_global: Tensor [N, 4] in image coords (xyxy), float32
+        """
+        device = wbox.device
+        dtype = torch.float32
+
+        if isinstance(boxes_local, list):
+            if len(boxes_local) == 0:
+                return torch.zeros((0, 4), device=device, dtype=dtype)
+            boxes_local = torch.tensor(boxes_local, device=device, dtype=dtype)
+        else:
+            boxes_local = boxes_local.to(device=device, dtype=dtype)
+
+        # Unpack
+        _, x1, y1, x2, y2 = wbox.to(dtype=dtype)
+        Hc, Wc = cam_hw
+        Himg, Wimg = img_hw
+
+        # Avoid division by zero
+        Wc = max(int(Wc), 1)
+        Hc = max(int(Hc), 1)
+
+        roi_w = (x2 - x1).clamp(min=1e-6)
+        roi_h = (y2 - y1).clamp(min=1e-6)
+
+        # Scale from cam pixels to image pixels within ROI
+        sx = roi_w / float(Wc)
+        sy = roi_h / float(Hc)
+
+        # Map
+        gx1 = x1 + boxes_local[:, 0] * sx
+        gy1 = y1 + boxes_local[:, 1] * sy
+        gx2 = x1 + boxes_local[:, 2] * sx
+        gy2 = y1 + boxes_local[:, 3] * sy
+
+        boxes_global = torch.stack([gx1, gy1, gx2, gy2], dim=-1)
+
+        # Clamp to image bounds
+        boxes_global[:, 0].clamp_(0, Wimg - 1)
+        boxes_global[:, 2].clamp_(0, Wimg - 1)
+        boxes_global[:, 1].clamp_(0, Himg - 1)
+        boxes_global[:, 3].clamp_(0, Himg - 1)
+
+        # Ensure x1<=x2, y1<=y2 (robustness)
+        x_min = torch.min(boxes_global[:, 0], boxes_global[:, 2])
+        x_max = torch.max(boxes_global[:, 0], boxes_global[:, 2])
+        y_min = torch.min(boxes_global[:, 1], boxes_global[:, 3])
+        y_max = torch.max(boxes_global[:, 1], boxes_global[:, 3])
+        boxes_global = torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+
+        return boxes_global
+
+    def _ccam_box_score(
+            self,
+            ccam_hw1: np.ndarray,  # (Hc, Wc, 1) float in [0,1] (or any float)
+            box_xyxy: List[int],  # [x1, y1, x2, y2] in CCAM coords
+            mode: str = "topk_mean",  # "max" | "mean" | "topk_mean"
+            topk_ratio: float = 0.1,  # top 10% pixels
+            topk_min: int = 20,  # at least 20 pixels
+    ) -> float:
+        """
+        Compute a confidence score for a seed box based on CCAM activation inside the box.
+        Return a python float (recommended in [0,1] if ccam is normalized).
+        """
+        assert ccam_hw1.ndim == 3 and ccam_hw1.shape[2] == 1, f"Expect (H,W,1), got {ccam_hw1.shape}"
+
+        Hc, Wc, _ = ccam_hw1.shape
+        x1, y1, x2, y2 = [int(v) for v in box_xyxy]
+
+        # clamp to valid range
+        x1 = max(0, min(x1, Wc - 1))
+        y1 = max(0, min(y1, Hc - 1))
+        x2 = max(0, min(x2, Wc - 1))
+        y2 = max(0, min(y2, Hc - 1))
+
+        # ensure x2>=x1, y2>=y1
+        if x2 < x1: x1, x2 = x2, x1
+        if y2 < y1: y1, y2 = y2, y1
+
+        # slicing: use inclusive->exclusive
+        patch = ccam_hw1[y1:y2 + 1, x1:x2 + 1, 0]  # (h, w)
+        if patch.size == 0:
+            return 0.0
+
+        v = patch.reshape(-1).astype(np.float32)
+
+        if mode == "max":
+            score = float(v.max())
+        elif mode == "mean":
+            score = float(v.mean())
+        elif mode == "topk_mean":
+            k = int(max(topk_min, round(topk_ratio * v.size)))
+            k = min(k, v.size)
+            # top-k mean
+            # np.partition is O(n)
+            topk = np.partition(v, -k)[-k:]
+            score = float(topk.mean())
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        # optional: clamp to [0,1] if your CCAM is normalized
+        if np.isfinite(score):
+            score = max(0.0, min(1.0, score))
+        else:
+            score = 0.0
+        return score
+
+    def _get_mAP(self,
+        seed_proposals: List[Dict[str, torch.Tensor]],  # seed proposals
+        gt_targets: List[Dict[str, torch.Tensor]]  # ground-truth targets for evaluate pseudo labels
+    )-> float:
+        """
+        Evaluate pseudo labels using ground-truth targets.
+        """
+        # Copy from torchvision references
+        map_metric = MeanAveragePrecision(
+            iou_type="bbox",
+            iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50 : 0.05 : 0.95
+            max_detection_thresholds=[1, 10, 100],
+        ).to(self.config.device)
+
+        map_metric.update(seed_proposals, gt_targets)
+        result = map_metric.compute()
+
+        return float(result["map"])
+
+    def forward(
+        self,
+        imgs: torch.Tensor,  # input images, [B, C, H, W]
+        wboxes: torch.Tensor = None,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+        wb_labels: torch.Tensor = None,  # class label for weak boxes, [R, num_classes]
+        gt_targets: List[Dict[str, torch.Tensor]] = None,  # ground-truth targets for evaluate pseudo labels
+        vis_dir : str = None,        # visualization directory
+        should_invert : bool = True     # whether to invert CCAM
+    )-> Tuple[torch.Tensor, float]:
+        """
+        :return:
+        - loss_ccam: CCAM loss
+        - seed_mAP: mAP of seed boxes
+        """
+        # -----get high-level feature maps-----
+        self.encoder[-1] = nn.Identity()
+        high_feature_maps = self.encoder(imgs)  # [B, C_h, H_h, W_h]
+
+        # -----get weak box feature maps-----
+        wb_feature_maps = self.roi_align_h2wb(high_feature_maps, wboxes)  # [R, C_h, H_wb, W_wb]
+
+        # get CCAM and loss_ccam
+        ccam, loss_ccam = self.ccam_generator(wb_feature_maps)  # [R, 1, H_wb, W_wb]
+        if should_invert:
+            ccam = 1 - ccam
+
+        # get seed proposals from CCAM
+        seed_proposals: List[Dict] = []
+        R, _, _, _ = ccam.shape
+        for i in range(R):
+            ccam_i = ccam[i].detach().cpu().numpy().transpose(1, 2, 0)  # [h, w, 1]
+
+            local_boxes_list = self._get_multi_bboxes(ccam_i, self.config.ccam_threshold)
+            # 过滤“无 contours”的默认返回框
+            if len(local_boxes_list) == 1 and local_boxes_list[0] == [0, 0, 1, 1]:
+                continue
+            # map local boxes to image boxes
+            wbox_i = wboxes[i]  # [5]
+            Himg, Wimg = imgs.shape[2], imgs.shape[3]
+            global_boxes_xyxy = self._map_boxes_roi_to_image_xyxy(
+                boxes_local=local_boxes_list,
+                wbox=wbox_i,
+                cam_hw=(ccam_i.shape[0], ccam_i.shape[1]),
+                img_hw=(Himg, Wimg)
+            )  # Tensor [N, 4]
+            batch_idx = wbox_i[0].to(global_boxes_xyxy).view(1, 1).repeat(global_boxes_xyxy.size(0), 1)
+            global_boxes_wbatch = torch.cat([batch_idx, global_boxes_xyxy], dim=1)  # [N, 5]
+
+            # class_id = wb_labels[i].argmax().item()
+            # for j in range(global_boxes_wbatch.size(0)):
+            #     seed_proposals.append({
+            #         "box": global_boxes_wbatch[j],  # Tensor [5], (batch_idx, x1, y1, x2, y2)
+            #         "class_id": class_id,   # [0, C-1]
+            #     })
+
+            class_id = wb_labels[i].argmax().item()
+            # local_boxes_list: CCAM coords boxes (same order as mapping)
+            # global_boxes_wbatch: mapped image coords boxes with batch idx
+            for j in range(global_boxes_wbatch.size(0)):
+                local_box = local_boxes_list[j]  # [x1,y1,x2,y2] in CCAM coords
+
+                # score from CCAM activation inside local box
+                score = self._ccam_box_score(
+                    ccam_hw1=ccam_i,  # (Hc,Wc,1)
+                    box_xyxy=local_box,
+                    mode="topk_mean",  # or "max"
+                    topk_ratio=0.1,
+                    topk_min=20,
+                )
+
+                seed_proposals.append({
+                    "box": global_boxes_wbatch[j],  # Tensor [5] (batch_idx,x1,y1,x2,y2)
+                    "class_id": class_id,
+                    "score": float(score),  # python float
+                })
+
+        # for debug: Visualize CCAM and decide whether to invert
+        # imgs: torch.Tensor [B,C,H,W] (一般是RGB归一化)
+        R, _, _, _ = ccam.shape
+        for i in range(R):
+            ccam_i = ccam[i].detach().cpu().numpy().transpose(1, 2, 0)  # [h, w, 1]
+
+            b = int(wboxes[i, 0].item())
+            x1, y1, x2, y2 = wboxes[i, 1:5].detach().cpu().numpy().tolist()
+            img_chw = imgs[b].detach().cpu().numpy()
+            img_chw = denorm_imagenet(img_chw)  # -> [0,1]
+            img_np = np.transpose(img_chw, (1, 2, 0))  # HWC
+            img_u8 = (img_np * 255).astype(np.uint8)
+            img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+
+            gt_boxes_b = None
+            gt_labels_b = None
+            if gt_targets is not None:
+                gt_boxes_b = gt_targets[b]["boxes"]  # Tensor [Ng,4]
+                gt_labels_b = gt_targets[b].get("labels")
+
+            seed_boxes_b = [
+                p for p in seed_proposals
+                if int(p["box"][0].item()) == b
+            ]
+
+            vis_img = overlay_ccam_on_image(
+                img_bgr=img_bgr,
+                ccam_hw1=ccam_i,
+                wbox_xyxy=(x1, y1, x2, y2),
+                alpha=0.45,
+                gt_boxes=gt_boxes_b,
+                gt_labels=gt_labels_b,
+                seed_boxes=seed_boxes_b,
+                draw_wbox=True,
+            )
+            ccam_vis_path = os.path.join(vis_dir, f"debug_ccam_overlay_b{b}_r{i}.png")
+            cv2.imwrite(ccam_vis_path, vis_img)
+
+
+        B = imgs.shape[0]
+        # build seed boxes for mAP evaluation
+        seed_boxes_by_img: List[Dict[str, torch.Tensor]] = []
+        # for b in range(B):
+        #     boxes_list = []
+        #     labels_list = []
+        #     for p in seed_proposals:
+        #         box = p["box"]
+        #         batch_idx = int(box[0].item())
+        #         if batch_idx == b:
+        #             boxes_list.append(box[1:5].unsqueeze(0))
+        #             labels_list.append(p["class_id"])
+        #
+        #     if len(boxes_list) > 0:
+        #         boxes_tensor = torch.cat(boxes_list, dim=0)
+        #         labels_tensor = torch.tensor(labels_list, device=boxes_tensor.device, dtype=torch.long)
+        #     else:
+        #         boxes_tensor = torch.zeros((0, 4), device=imgs.device, dtype=torch.float32)
+        #         labels_tensor = torch.zeros((0,), device=imgs.device, dtype=torch.long)
+        #
+        #     seed_boxes_by_img.append({
+        #         "boxes": boxes_tensor,    # [N_boxes, 4]
+        #         "labels": labels_tensor,  # [N_boxes] in [0..C-1]
+        #     })
+        for b in range(B):
+            boxes_list = []
+            labels_list = []
+            scores_list = []
+
+            for p in seed_proposals:
+                box = p["box"]
+                batch_idx = int(box[0].item())
+                if batch_idx == b:
+                    boxes_list.append(box[1:5].unsqueeze(0))
+                    labels_list.append(p["class_id"])
+                    scores_list.append(float(p.get("score", 1.0)))  # fallback
+
+            if len(boxes_list) > 0:
+                boxes_tensor = torch.cat(boxes_list, dim=0)
+                labels_tensor = torch.tensor(labels_list, device=boxes_tensor.device, dtype=torch.long)
+                scores_tensor = torch.tensor(scores_list, device=boxes_tensor.device, dtype=torch.float32)
+            else:
+                boxes_tensor = torch.zeros((0, 4), device=imgs.device, dtype=torch.float32)
+                labels_tensor = torch.zeros((0,), device=imgs.device, dtype=torch.long)
+                scores_tensor = torch.zeros((0,), device=imgs.device, dtype=torch.float32)
+
+            seed_boxes_by_img.append({
+                "boxes": boxes_tensor,  # [N,4]
+                "labels": labels_tensor,  # [N]
+                "scores": scores_tensor,  # [N]
+            })
+
+        seed_mAP = self._get_mAP(seed_boxes_by_img, gt_targets)
+
+        return loss_ccam, seed_mAP
+
+
 
 # For backbone verification
 class LinearProb(nn.Module):
@@ -1337,6 +1881,21 @@ def build_Stage2_model(
         backbone=backbone,
         dataset_mps=dataset_mps,
         config=stage2_config
+    )
+
+    return model
+
+def build_Stage2CCAM_model(
+    stage2CCAM_config : Stage2CCAMConfig,
+    backbone_weights_path: str,  # Aligned backbone weights path
+)-> nn.Module:
+    backbone = vgg16(pretrained=False).features
+    backbone.load_state_dict(torch.load(backbone_weights_path))
+    # backbone = vgg16(pretrained=True).features
+
+    model = Stage2_ccam(
+        backbone=backbone,
+        config=stage2CCAM_config
     )
 
     return model

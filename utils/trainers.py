@@ -1,3 +1,4 @@
+import os.path
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import torch
@@ -48,6 +49,21 @@ class Stage2TrainerConfig:
     w_proto_loss: float  # weight for prototype loss
     w_match_loss: float     # weight for matching loss
     w_det_loss: float       # weight for detection loss
+    continue_train: bool = False
+    checkpoint_path: str = None
+
+@dataclass
+class Stage2CCAMTrainerConfig:
+    num_classes: int  # number of classes
+    device: torch.device  # "cpu" or "cuda"
+    epochs: int
+    lr: float  # base lr
+    warm_up_lr_factor: float  # min_lr = warm_up_lr_factor * lr
+    warmup_epochs: int
+    weight_decay: float
+    checkpoints_save_path: str
+    model_save_path: str
+    logger: Logger
     continue_train: bool = False
     checkpoint_path: str = None
 
@@ -641,6 +657,173 @@ class Stage2Trainer:
         torch.save(model_state_dict, model_file_path)
         print(f"Model parameters saved to {model_file_path}")
 
+class Stage2CCAMTrainer:
+    def __init__(
+        self,
+        model: nn.Module,
+        train_loader: DataLoader,
+        config: Stage2CCAMTrainerConfig,
+    )-> None:
+        self.model = model
+        self.train_loader = train_loader
+        self.config = config
+
+        self.model.to(self.config.device)
+
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay
+        )
+
+        self.lr_scheduler = SequentialLR(
+            self.optimizer,
+            schedulers=[
+                # Linear warm‑up
+                LinearLR(self.optimizer, start_factor=self.config.warm_up_lr_factor, end_factor=1.0),
+                # cosine decay
+                CosineAnnealingLR(self.optimizer, T_max=self.config.epochs - self.config.warmup_epochs,
+                                  eta_min=self.config.lr * self.config.warm_up_lr_factor)
+            ],
+            milestones=[self.config.warmup_epochs]
+        )
+
+        self.start_epoch = 1
+
+        self.log_path = self.config.logger.get_log_dir()
+
+        if self.config.continue_train:
+            # 加载检查点
+            checkpoint = torch.load(self.config.checkpoint_path)
+
+            # 加载模型参数
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            print("Model loaded successfully.")
+
+            # 设置当前训练轮数
+            self.start_epoch = checkpoint['epoch'] + 1
+
+            # 加载优化器状态
+            optimizer_state_dict = checkpoint['optimizer_state_dict']
+            self.optimizer.load_state_dict(optimizer_state_dict)
+            print("Optimizer state loaded successfully.")
+
+            # 加载学习率调度器状态
+            lr_scheduler_state_dict = checkpoint['lr_scheduler_state_dict']
+            self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
+            print("Learning rate scheduler state loaded successfully.")
+
+    def _build_gt_targets(self, targets: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
+        """
+        :return: GT targets[i] = {"boxes": [Mi,4], "labels": [Mi]}
+        """
+        out = []
+        for t in targets:
+            if ("gt_boxes" in t) and ("gt_labels" in t):
+                boxes = t["gt_boxes"]
+                labels = t["gt_labels"]
+            else:
+                boxes = t["boxes"]
+                labels = t["labels"]
+
+            out.append({
+                "boxes": boxes.float(),
+                "labels": labels.long(),
+            })
+        return out
+
+    def _train_one_epoch(self, epoch) -> None:
+        vis_dir_root = "./results/visualizations/ccam/"
+
+        num_iters = len(self.train_loader)
+        pbar = tqdm(
+            enumerate(self.train_loader, start=1),
+            total=num_iters,
+            desc=f"Epoch {epoch}/{self.config.epochs}",
+            leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
+            dynamic_ncols=True,  # 自适应终端宽度
+        )
+
+        epoch_total_loss = 0.0
+        epoch_seed_mAP = 0.0
+
+        for iter, (images, target) in pbar:
+            vis_dir = os.path.join(vis_dir_root, f"epoch_{epoch}", f"batch_{iter}")
+            os.makedirs(vis_dir, exist_ok=True)
+
+            images = [img.to(self.config.device) for img in images]
+            gt_targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
+            targets = [{k: v.to(self.config.device) for k, v in t.items()} for t in target]
+
+            wboxes = _build_wboxes(targets).to(self.config.device)
+            wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
+            X = torch.stack(images, dim=0)
+            loss_ccam, seed_mAP = self.model(X, wboxes, wb_one_hot_labels, gt_targets, vis_dir)
+
+            loss = loss_ccam
+
+            self.optimizer.zero_grad()
+            loss.backward()
+
+            self.optimizer.step()
+
+            epoch_total_loss += loss.item()
+
+            epoch_seed_mAP += seed_mAP
+
+            pbar.set_postfix({
+                "Iter Loss: Total": f"{loss.item():.4f} ",
+                "seed_mAP": f"{seed_mAP:.4f} ",
+                "lr": f"{self.optimizer.param_groups[0]['lr']}",
+            })
+
+        self.lr_scheduler.step()
+
+        num_iters = len(self.train_loader)
+        average_total_loss = epoch_total_loss / num_iters
+        average_seed_mAP = epoch_seed_mAP / num_iters
+
+        self.config.logger.add_info(
+            f"Epoch [{epoch}/{self.config.epochs}]"
+            f"Total Loss: {average_total_loss:.4f}, "
+            f"Train seed mAP@[0.5:0.95]: {average_seed_mAP:.4f}\n"
+        )
+        metrics = {
+            'Epoch': epoch,
+            'Total Loss': average_total_loss,
+            'Train seed mAP@[0.5:0.95]': average_seed_mAP,
+        }
+        self.config.logger.add_metrics(metrics)
+
+    def train(self)-> None:
+        for epoch in range(self.start_epoch, self.config.epochs + 1):
+            self.model.train()
+            self._train_one_epoch(epoch)
+            checkpoints_save_path = self.config.checkpoints_save_path
+            self._save_checkpoint(current_epoch=epoch, checkpoints_save_path=checkpoints_save_path)
+
+        self.config.logger.end_train()
+        model_save_path = self.config.model_save_path
+        self._save_model(model_save_path=model_save_path)
+
+    def _save_checkpoint(self, current_epoch : int, checkpoints_save_path : str):
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "epoch": current_epoch,
+            "log_path": self.log_path,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+        }
+
+        file_path = f"{checkpoints_save_path}/checkpoint_{current_epoch}.pth"
+        torch.save(checkpoint, file_path)
+        print(f"Checkpoint saved to {file_path}")
+
+    def _save_model(self, model_save_path : str, model_name : str = 'Stage2_CCAM'):
+        model_state_dict = self.model.encoder.state_dict()
+        model_file_path = f"{model_save_path}/{model_name}.pth"
+        torch.save(model_state_dict, model_file_path)
+        print(f"Model parameters saved to {model_file_path}")
 
 class LinearProbTrainer:
     def __init__(
@@ -862,6 +1045,19 @@ def build_stage2_trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
+        config=trainer_config,
+    )
+
+    return trainer
+
+def build_stage2_ccam_trainer(
+    model: nn.Module,
+    train_loader: DataLoader,
+    trainer_config: Stage2CCAMTrainerConfig,
+)-> Stage2CCAMTrainer:
+    trainer = Stage2CCAMTrainer(
+        model=model,
+        train_loader=train_loader,
         config=trainer_config,
     )
 

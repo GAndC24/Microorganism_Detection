@@ -497,6 +497,9 @@ class HungarianMatcher(nn.Module):
         # Final cost matrix
         C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         C = C.view(bs, num_queries, -1).cpu()
+        with open("./debug_data.txt", "a", encoding="utf-8") as f:
+            f.write(f"Cost matrix shape: {C.shape}\n")
+            f.write(f"Cost matrix max value: {C.max()}\n")
 
         sizes = [len(v["boxes"]) for v in targets]
         indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]

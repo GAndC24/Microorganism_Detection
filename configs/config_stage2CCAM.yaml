@@ -1,0 +1,27 @@
+runtime:
+  seed: 42
+  device: cuda  # 'cuda' or 'cpu'
+
+data:
+  data_root: "./data/processed/Urinary Sediment Dataset"
+  batch_size: 16    # (32, 64)
+  img_size: 600
+
+stage2_ccam_model_config:
+  freeze_backbone: False
+  in_c: 512
+  ccam_threshold: 0.9
+  roi_out_size_h2wb: 21   # [21, 24]
+  backbone_weights_path: "./results/model_weights/Vgg16_backbone_260125.pth"
+
+stage2_ccam_trainer_config:
+  num_classes: 7
+  epochs: 100
+  lr: 0.001
+  warm_up_lr_factor: 0.01    # min_lr = warm_up_lr_factor * lr
+  warmup_epochs: 5    # 1/10 epochs
+  weight_decay: 0.05    # [0.05, 0.1]
+  checkpoints_save_path: "./checkpoints/stage2_ccam/"
+  model_save_path: "./results/model_weights/"
+  continue_train: False
+  checkpoint_path: ""  # ./checkpoints/stage2_ccam/checkpoint_{epoch}.pth

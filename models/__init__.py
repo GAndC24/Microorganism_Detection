@@ -1,1 +1,1 @@
-from .MP_RCNN import Stage1Config, build_Stage1_model, LinearProbConfig, build_LinearProb_model, PrototypeCheckerConfig, build_PrototypeChecker_model, Stage2Config, build_Stage2_model
+from .MP_RCNN import Stage1Config, build_Stage1_model, LinearProbConfig, build_LinearProb_model, PrototypeCheckerConfig, build_PrototypeChecker_model, Stage2Config, build_Stage2_model, build_Stage2CCAM_model, Stage2CCAMConfig

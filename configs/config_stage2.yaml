@@ -59,7 +59,7 @@ stage2_trainer_config:
   w_det_loss: 1.0
   checkpoints_save_path: "./checkpoints/stage2/"
   model_save_path: "./results/model_weights/"
-  continue_train: False
-  checkpoint_path: ""  # ./checkpoints/stage2/checkpoint_{epoch}.pth
+  continue_train: True
+  checkpoint_path: "./checkpoints/stage2/checkpoint_19.pth"  # ./checkpoints/stage2/checkpoint_{epoch}.pth
 
 
