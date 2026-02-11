@@ -53,21 +53,6 @@ class Stage2TrainerConfig:
     checkpoint_path: str = None
 
 @dataclass
-class Stage2CCAMTrainerConfig:
-    num_classes: int  # number of classes
-    device: torch.device  # "cpu" or "cuda"
-    epochs: int
-    lr: float  # base lr
-    warm_up_lr_factor: float  # min_lr = warm_up_lr_factor * lr
-    warmup_epochs: int
-    weight_decay: float
-    checkpoints_save_path: str
-    model_save_path: str
-    logger: Logger
-    continue_train: bool = False
-    checkpoint_path: str = None
-
-@dataclass
 class LinearProbTrainerConfig:
     num_classes: int  # number of classes
     device: torch.device  # "cpu" or "cuda"
@@ -392,6 +377,8 @@ class Stage2Trainer:
             milestones=[self.config.warmup_epochs]
         )
 
+        self.bg_prototype : Dict[int, torch.Tensor] = {}
+
         self.start_epoch = 1
 
         self.log_path = self.config.logger.get_log_dir()
@@ -468,17 +455,53 @@ class Stage2Trainer:
         with torch.no_grad():
             for iter, (images, target) in pbar:
                 images = [img.to(self.config.device) for img in images]
-                targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
+                gt_targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
 
                 X = torch.stack(images, dim=0)
                 detections = self.model("inference", X)
-                map_metric.update(detections, targets)
+
+                preds = []
+                for p in detections:
+                    # copy tensors (avoid in-place side effects)
+                    boxes = p["boxes"].detach()
+                    scores = p["scores"].detach()
+                    labels = p["labels"].detach()
+
+                    # drop background (labels <= 0)
+                    keep = labels > 0
+                    boxes = boxes[keep]
+                    scores = scores[keep]
+                    labels = labels[keep]
+
+                    preds.append({
+                        "boxes": boxes,
+                        "scores": scores,
+                        "labels": labels,
+                    })
+
+                targets = []
+                for t in gt_targets:
+                    boxes = t["boxes"].detach()
+                    labels = t["labels"].detach()
+
+                    labels = labels + 1  # shift to [1..C]
+
+                    targets.append({
+                        "boxes": boxes,
+                        "labels": labels,
+                    })
+
+                map_metric.update(preds, targets)
 
         metric = map_metric.compute()
 
         return float(metric["map"])
 
     def _train_one_epoch(self, epoch) -> None:
+        vis_root = os.path.join(self.log_path, "visualizations")
+        vis_dir = os.path.join(vis_root, f"epoch_{epoch}")
+        os.makedirs(vis_dir, exist_ok=True)
+
         num_iters = len(self.train_loader)
         pbar = tqdm(
             enumerate(self.train_loader, start=1),
@@ -498,14 +521,14 @@ class Stage2Trainer:
 
         epoch_proto_loss = 0.0
 
-        epoch_match_loss = 0.0
-        epoch_match_cls_loss = 0.0
-        epoch_match_l1_loss = 0.0
-        epoch_match_giou_loss = 0.0
+        # epoch_match_loss = 0.0
+        # epoch_match_cls_loss = 0.0
+        # epoch_match_l1_loss = 0.0
+        # epoch_match_giou_loss = 0.0
 
-        epoch_det_loss = 0.0
-        epoch_det_cls_loss = 0.0
-        epoch_det_reg_loss = 0.0
+        # epoch_det_loss = 0.0
+        # epoch_det_cls_loss = 0.0
+        # epoch_det_reg_loss = 0.0
 
         epoch_pseudo_labels_mAP = 0.0
 
@@ -517,22 +540,35 @@ class Stage2Trainer:
             wboxes = _build_wboxes(targets).to(self.config.device)
             wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
             X = torch.stack(images, dim=0)
-            loss_ccam, loss_proto, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections = self.model("train", X, wboxes, wb_one_hot_labels, gt_targets)
+            # loss_ccam, loss_proto, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections = self.model(
+            #     "train", X, wboxes, wb_one_hot_labels, gt_targets, vis_dir, epoch, iter
+            # )
+            # loss_ccam, loss_proto, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections = self.model(
+            #     "train", X, wboxes, wb_one_hot_labels, gt_targets, vis_dir, epoch, iter
+            # )
+            # loss_ccam, loss_proto, rpn_losses_dict, pseudo_labels_mAP = self.model(
+            #     "train", X, wboxes, wb_one_hot_labels, gt_targets, vis_dir, epoch, iter
+            # )
+            loss_ccam, loss_proto, rpn_losses_dict, pseudo_labels_mAP = self.model(
+                "train", X, wboxes, wb_one_hot_labels, self.bg_prototype, gt_targets, vis_dir, epoch, iter
+            )
 
-            loss_match = match_losses_dict["loss_match"]
-            loss_match_cls = match_losses_dict["loss_match_cls"]
-            loss_match_l1 = match_losses_dict["loss_match_l1"]
-            loss_match_giou = match_losses_dict["loss_match_giou"]
+            # loss_match = match_losses_dict["loss_match"]
+            # loss_match_cls = match_losses_dict["loss_match_cls"]
+            # loss_match_l1 = match_losses_dict["loss_match_l1"]
+            # loss_match_giou = match_losses_dict["loss_match_giou"]
 
             loss_rpn_obj = rpn_losses_dict["loss_objectness"]
             loss_rpn_reg = rpn_losses_dict["loss_rpn_box_reg"]
             loss_rpn = loss_rpn_obj + loss_rpn_reg
 
-            loss_det_cls = det_losses_dict["loss_classifier"]
-            loss_det_reg = det_losses_dict["loss_box_reg"]
-            loss_det = loss_det_cls + loss_det_reg
+            # loss_det_cls = det_losses_dict["loss_classifier"]
+            # loss_det_reg = det_losses_dict["loss_box_reg"]
+            # loss_det = loss_det_cls + loss_det_reg
 
-            loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto + self.config.w_match_loss * loss_match + self.config.w_det_loss * loss_det
+            # loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto + self.config.w_match_loss * loss_match + self.config.w_det_loss * loss_det
+            # loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto + self.config.w_det_loss * loss_det
+            loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -545,13 +581,13 @@ class Stage2Trainer:
             epoch_rpn_obj_loss += loss_rpn_obj.item()
             epoch_rpn_reg_loss += loss_rpn_reg.item()
             epoch_proto_loss += loss_proto.item()
-            epoch_match_loss += loss_match.item()
-            epoch_match_cls_loss += loss_match_cls.item()
-            epoch_match_l1_loss += loss_match_l1.item()
-            epoch_match_giou_loss += loss_match_giou.item()
-            epoch_det_loss += loss_det.item()
-            epoch_det_cls_loss += loss_det_cls.item()
-            epoch_det_reg_loss += loss_det_reg.item()
+            # epoch_match_loss += loss_match.item()
+            # epoch_match_cls_loss += loss_match_cls.item()
+            # epoch_match_l1_loss += loss_match_l1.item()
+            # epoch_match_giou_loss += loss_match_giou.item()
+            # epoch_det_loss += loss_det.item()
+            # epoch_det_cls_loss += loss_det_cls.item()
+            # epoch_det_reg_loss += loss_det_reg.item()
 
             epoch_pseudo_labels_mAP += pseudo_labels_mAP
 
@@ -560,8 +596,8 @@ class Stage2Trainer:
                 "CCAM": f"{loss_ccam.item():.4f} ",
                 "RPN": f"{loss_rpn.item():.4f} ",
                 "Proto": f"{loss_proto.item():.4f} ",
-                "Match": f"{loss_match.item():.4f} ",
-                "Det": f"{loss_det.item():.4f} ",
+                # "Match": f"{loss_match.item():.4f} ",
+                # "Det": f"{loss_det.item():.4f} ",
                 "p_mAP": f"{pseudo_labels_mAP:.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
             })
@@ -575,19 +611,19 @@ class Stage2Trainer:
         average_rpn_obj_loss = epoch_rpn_obj_loss / num_iters
         average_rpn_reg_loss = epoch_rpn_reg_loss / num_iters
         average_proto_loss = epoch_proto_loss / num_iters
-        average_match_loss = epoch_match_loss / num_iters
-        average_match_cls_loss = epoch_match_cls_loss / num_iters
-        average_match_l1_loss = epoch_match_l1_loss / num_iters
-        average_match_giou_loss = epoch_match_giou_loss / num_iters
-        average_det_loss = epoch_det_loss / num_iters
-        average_det_cls_loss = epoch_det_cls_loss / num_iters
-        average_det_reg_loss = epoch_det_reg_loss / num_iters
+        # average_match_loss = epoch_match_loss / num_iters
+        # average_match_cls_loss = epoch_match_cls_loss / num_iters
+        # average_match_l1_loss = epoch_match_l1_loss / num_iters
+        # average_match_giou_loss = epoch_match_giou_loss / num_iters
+        # average_det_loss = epoch_det_loss / num_iters
+        # average_det_cls_loss = epoch_det_cls_loss / num_iters
+        # average_det_reg_loss = epoch_det_reg_loss / num_iters
 
         average_pseudo_labels_mAP = epoch_pseudo_labels_mAP / num_iters
 
-        # get mAP@[0.5:0.95] metric
-        train_mAP = self._get_mAP_metric(mode="train")
-        val_mAP = self._get_mAP_metric(mode="val")
+        # # get mAP@[0.5:0.95] metric
+        # train_mAP = self._get_mAP_metric(mode="train")
+        # val_mAP = self._get_mAP_metric(mode="val")
 
         self.config.logger.add_info(
             f"Epoch [{epoch}/{self.config.epochs}]"
@@ -595,16 +631,17 @@ class Stage2Trainer:
             f"CCAM Loss: {average_ccam_loss:.4f}, "
             f"RPN Loss: {average_rpn_loss:.4f}, "
             f"Proto Loss: {average_proto_loss:.4f}, "
-            f"Match Loss: {average_match_loss:.4f}, "
-            f"Det Loss: {average_det_loss:.4f}\n"
+            # f"Match Loss: {average_match_loss:.4f}, "
+            # f"Det Loss: {average_det_loss:.4f}\n"
             f"RPN Obj Loss: {average_rpn_obj_loss:.4f}, "
             f"RPN Reg Loss: {average_rpn_reg_loss:.4f}, "
-            f"Match CLS Loss: {average_match_cls_loss:.4f}, "
-            f"Match L1 Loss: {average_match_l1_loss:.4f}, "
-            f"Match GIoU Loss: {average_match_giou_loss:.4f}, "
-            f"Det CLS Loss: {average_det_cls_loss:.4f}, "
-            f"Det Reg Loss: {average_det_reg_loss:.4f} \n"
-            f"Train mAP@[0.5:0.95]: {train_mAP:.4f}, Val mAP@[0.5:0.95]: {val_mAP:.4f}, Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
+            # f"Match CLS Loss: {average_match_cls_loss:.4f}, "
+            # f"Match L1 Loss: {average_match_l1_loss:.4f}, "
+            # f"Match GIoU Loss: {average_match_giou_loss:.4f}, "
+            # f"Det CLS Loss: {average_det_cls_loss:.4f}, "
+            # f"Det Reg Loss: {average_det_reg_loss:.4f} \n"
+            # f"Train mAP@[0.5:0.95]: {train_mAP:.4f}, Val mAP@[0.5:0.95]: {val_mAP:.4f}, Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
+            f"Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
         )
         metrics = {
             'Epoch': epoch,
@@ -614,15 +651,15 @@ class Stage2Trainer:
             'RPN Obj Loss': average_rpn_obj_loss,
             'RPN Reg Loss': average_rpn_reg_loss,
             'Proto Loss': average_proto_loss,
-            'Match Loss': average_match_loss,
-            'Match CLS Loss': average_match_cls_loss,
-            'Match L1 Loss': average_match_l1_loss,
-            'Match GIoU Loss': average_match_giou_loss,
-            'Det Loss': average_det_loss,
-            'Det CLS Loss': average_det_cls_loss,
-            'Det Reg Loss': average_det_reg_loss,
-            'Train mAP@[0.5:0.95]': train_mAP,
-            'Val mAP@[0.5:0.95]': val_mAP,
+            # 'Match Loss': average_match_loss,
+            # 'Match CLS Loss': average_match_cls_loss,
+            # 'Match L1 Loss': average_match_l1_loss,
+            # 'Match GIoU Loss': average_match_giou_loss,
+            # 'Det Loss': average_det_loss,
+            # 'Det CLS Loss': average_det_cls_loss,
+            # 'Det Reg Loss': average_det_reg_loss,
+            # 'Train mAP@[0.5:0.95]': train_mAP,
+            # 'Val mAP@[0.5:0.95]': val_mAP,
             'Pseudo Labels mAP@[0.5:0.95]': average_pseudo_labels_mAP,
         }
         self.config.logger.add_metrics(metrics)
@@ -652,174 +689,6 @@ class Stage2Trainer:
         print(f"Checkpoint saved to {file_path}")
 
     def _save_model(self, model_save_path : str, model_name : str = 'MP_RCNN'):
-        model_state_dict = self.model.encoder.state_dict()
-        model_file_path = f"{model_save_path}/{model_name}.pth"
-        torch.save(model_state_dict, model_file_path)
-        print(f"Model parameters saved to {model_file_path}")
-
-class Stage2CCAMTrainer:
-    def __init__(
-        self,
-        model: nn.Module,
-        train_loader: DataLoader,
-        config: Stage2CCAMTrainerConfig,
-    )-> None:
-        self.model = model
-        self.train_loader = train_loader
-        self.config = config
-
-        self.model.to(self.config.device)
-
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=config.lr,
-            weight_decay=config.weight_decay
-        )
-
-        self.lr_scheduler = SequentialLR(
-            self.optimizer,
-            schedulers=[
-                # Linear warm‑up
-                LinearLR(self.optimizer, start_factor=self.config.warm_up_lr_factor, end_factor=1.0),
-                # cosine decay
-                CosineAnnealingLR(self.optimizer, T_max=self.config.epochs - self.config.warmup_epochs,
-                                  eta_min=self.config.lr * self.config.warm_up_lr_factor)
-            ],
-            milestones=[self.config.warmup_epochs]
-        )
-
-        self.start_epoch = 1
-
-        self.log_path = self.config.logger.get_log_dir()
-
-        if self.config.continue_train:
-            # 加载检查点
-            checkpoint = torch.load(self.config.checkpoint_path)
-
-            # 加载模型参数
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-            print("Model loaded successfully.")
-
-            # 设置当前训练轮数
-            self.start_epoch = checkpoint['epoch'] + 1
-
-            # 加载优化器状态
-            optimizer_state_dict = checkpoint['optimizer_state_dict']
-            self.optimizer.load_state_dict(optimizer_state_dict)
-            print("Optimizer state loaded successfully.")
-
-            # 加载学习率调度器状态
-            lr_scheduler_state_dict = checkpoint['lr_scheduler_state_dict']
-            self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
-            print("Learning rate scheduler state loaded successfully.")
-
-    def _build_gt_targets(self, targets: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
-        """
-        :return: GT targets[i] = {"boxes": [Mi,4], "labels": [Mi]}
-        """
-        out = []
-        for t in targets:
-            if ("gt_boxes" in t) and ("gt_labels" in t):
-                boxes = t["gt_boxes"]
-                labels = t["gt_labels"]
-            else:
-                boxes = t["boxes"]
-                labels = t["labels"]
-
-            out.append({
-                "boxes": boxes.float(),
-                "labels": labels.long(),
-            })
-        return out
-
-    def _train_one_epoch(self, epoch) -> None:
-        vis_dir_root = "./results/visualizations/ccam/"
-
-        num_iters = len(self.train_loader)
-        pbar = tqdm(
-            enumerate(self.train_loader, start=1),
-            total=num_iters,
-            desc=f"Epoch {epoch}/{self.config.epochs}",
-            leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
-            dynamic_ncols=True,  # 自适应终端宽度
-        )
-
-        epoch_total_loss = 0.0
-        epoch_seed_mAP = 0.0
-
-        for iter, (images, target) in pbar:
-            vis_dir = os.path.join(vis_dir_root, f"epoch_{epoch}", f"batch_{iter}")
-            os.makedirs(vis_dir, exist_ok=True)
-
-            images = [img.to(self.config.device) for img in images]
-            gt_targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
-            targets = [{k: v.to(self.config.device) for k, v in t.items()} for t in target]
-
-            wboxes = _build_wboxes(targets).to(self.config.device)
-            wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
-            X = torch.stack(images, dim=0)
-            loss_ccam, seed_mAP = self.model(X, wboxes, wb_one_hot_labels, gt_targets, vis_dir)
-
-            loss = loss_ccam
-
-            self.optimizer.zero_grad()
-            loss.backward()
-
-            self.optimizer.step()
-
-            epoch_total_loss += loss.item()
-
-            epoch_seed_mAP += seed_mAP
-
-            pbar.set_postfix({
-                "Iter Loss: Total": f"{loss.item():.4f} ",
-                "seed_mAP": f"{seed_mAP:.4f} ",
-                "lr": f"{self.optimizer.param_groups[0]['lr']}",
-            })
-
-        self.lr_scheduler.step()
-
-        num_iters = len(self.train_loader)
-        average_total_loss = epoch_total_loss / num_iters
-        average_seed_mAP = epoch_seed_mAP / num_iters
-
-        self.config.logger.add_info(
-            f"Epoch [{epoch}/{self.config.epochs}]"
-            f"Total Loss: {average_total_loss:.4f}, "
-            f"Train seed mAP@[0.5:0.95]: {average_seed_mAP:.4f}\n"
-        )
-        metrics = {
-            'Epoch': epoch,
-            'Total Loss': average_total_loss,
-            'Train seed mAP@[0.5:0.95]': average_seed_mAP,
-        }
-        self.config.logger.add_metrics(metrics)
-
-    def train(self)-> None:
-        for epoch in range(self.start_epoch, self.config.epochs + 1):
-            self.model.train()
-            self._train_one_epoch(epoch)
-            checkpoints_save_path = self.config.checkpoints_save_path
-            self._save_checkpoint(current_epoch=epoch, checkpoints_save_path=checkpoints_save_path)
-
-        self.config.logger.end_train()
-        model_save_path = self.config.model_save_path
-        self._save_model(model_save_path=model_save_path)
-
-    def _save_checkpoint(self, current_epoch : int, checkpoints_save_path : str):
-        checkpoint = {
-            "model_state_dict": self.model.state_dict(),
-            "epoch": current_epoch,
-            "log_path": self.log_path,
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
-        }
-
-        file_path = f"{checkpoints_save_path}/checkpoint_{current_epoch}.pth"
-        torch.save(checkpoint, file_path)
-        print(f"Checkpoint saved to {file_path}")
-
-    def _save_model(self, model_save_path : str, model_name : str = 'Stage2_CCAM'):
         model_state_dict = self.model.encoder.state_dict()
         model_file_path = f"{model_save_path}/{model_name}.pth"
         torch.save(model_state_dict, model_file_path)
@@ -1045,19 +914,6 @@ def build_stage2_trainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        config=trainer_config,
-    )
-
-    return trainer
-
-def build_stage2_ccam_trainer(
-    model: nn.Module,
-    train_loader: DataLoader,
-    trainer_config: Stage2CCAMTrainerConfig,
-)-> Stage2CCAMTrainer:
-    trainer = Stage2CCAMTrainer(
-        model=model,
-        train_loader=train_loader,
         config=trainer_config,
     )
 

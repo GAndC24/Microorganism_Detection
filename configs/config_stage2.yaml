@@ -7,12 +7,15 @@ data:
   batch_size: 16    # (32, 64)
 
 stage2_model_config:
-  img_size: 600  # (600, 800)
+  img_size: 384  # (600, 800)
   num_classes: 7
   in_c: 512
   freeze_backbone: False
+  keep_iou_thr: 0.1   # [0.1, 0.5]
+  # for projection head
   hidden_dim: 512   # (256, 512, 768, 1024)
   embed_dim: 512
+  # for RPN
   rpn_anchor_sizes : 32, 40, 64, 120, 208   # statistics-based sizes
   rpn_anchor_aspect_ratios: 0.89, 1.0, 1.15   # statistics-based ratios
   rpn_fg_iou_thresh: 0.6  # [0.5, 0.7]
@@ -21,18 +24,24 @@ stage2_model_config:
   rpn_pre_nms_top_n: 4000, 2000  # train: [2000, 6000], test: [1000, 3000]
   rpn_post_nms_top_n: 2000, 1000 # train: [2000, 4000], test: [1000, 2000]
   rpn_nms_thresh: 0.8  # [0.7, 0.9]
+  # for CCAM
   ccam_threshold: 0.2
+  # for proto loss
   proto_loss_tau: 0.1   # [0.05, 0.2]
+  # for HungarianMatcher
   cost_class: 2.0
   cost_bbox: 5.0
   cost_giou: 2.0
+  # for Pseudo Labels
   rpn_pseudo_nms_thr: 0.7  # [0.6, 0.8]
   rpn_pseudo_topk: 200  # [100, 300]
+  # for Match Loss
   match_focal_alpha: 0.25
   match_focal_gamma: 2.0
   lambda_match_cls: 2.0
   lambda_match_l1: 2.0
   lambda_match_giou: 2.0
+  # for RoI Head
   det_fg_iou_thresh: 0.5  # [0.3, 0.5]
   det_bg_iou_thresh: 0.1  # [0.0, 0.2]
   det_batch_size_per_image: 128  # [128, 256]
@@ -40,9 +49,11 @@ stage2_model_config:
   det_score_thresh: 0.0   # for training = 0.0, for inference = [0.3, 0.5]
   det_nms_thresh: 0.5
   detections_per_img: 100
+  # for RoI Align
   roi_out_size_h2wb: 21   # [21, 24]
-  roi_out_size_wb2p: 7
+#  roi_out_size_wb2p: 7
   roi_out_size_h2p: 7
+  # load paths
   backbone_weights_path: "./results/model_weights/Vgg16_backbone_260125.pth"
   dataset_mps_path: "./dataset_morphological_prototypes/dataset_MPs_260125.pth"
 
@@ -59,7 +70,7 @@ stage2_trainer_config:
   w_det_loss: 1.0
   checkpoints_save_path: "./checkpoints/stage2/"
   model_save_path: "./results/model_weights/"
-  continue_train: True
-  checkpoint_path: "./checkpoints/stage2/checkpoint_19.pth"  # ./checkpoints/stage2/checkpoint_{epoch}.pth
+  continue_train: False
+  checkpoint_path: ""  # ./checkpoints/stage2/checkpoint_{epoch}.pth
 
 

@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
 from datasets import UrinarySedimentDataset, detection_collate_fn
 from models import Stage2Config, build_Stage2_model
-from utils import Stage2TrainerConfig, build_stage2_trainer, vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps, Logger
+from utils import Stage2TrainerConfig, build_stage2_trainer,  vgg_layer_out_size_ratio_maps, Logger
 
 def _load_yaml(config_path : str)-> Dict[str, Any]:
     config_path = Path(config_path)
@@ -153,6 +153,7 @@ def main()-> None:
     num_classes = stage2_model_config["num_classes"]
     in_c = stage2_model_config["in_c"]
     freeze_backbone = bool(stage2_model_config["freeze_backbone"])
+    keep_iou_thr = stage2_model_config["keep_iou_thr"]
     hidden_dim = stage2_model_config["hidden_dim"]
     embed_dim = stage2_model_config["embed_dim"]
     rpn_anchor_sizes = tuple(_parse_to_list_of_int(stage2_model_config["rpn_anchor_sizes"]))
@@ -192,8 +193,8 @@ def main()-> None:
     detections_per_img = stage2_model_config["detections_per_img"]
     roi_out_size_h2wb = stage2_model_config["roi_out_size_h2wb"]
     roi_out_size_h2wb = (roi_out_size_h2wb, roi_out_size_h2wb)
-    roi_out_size_wb2p = stage2_model_config["roi_out_size_wb2p"]
-    roi_out_size_wb2p = (roi_out_size_wb2p, roi_out_size_wb2p)
+    # roi_out_size_wb2p = stage2_model_config["roi_out_size_wb2p"]
+    # roi_out_size_wb2p = (roi_out_size_wb2p, roi_out_size_wb2p)
     roi_out_size_h2p = stage2_model_config["roi_out_size_h2p"]
     roi_out_size_h2p = (roi_out_size_h2p, roi_out_size_h2p)
     backbone_weights_path = stage2_model_config["backbone_weights_path"]
@@ -204,6 +205,7 @@ def main()-> None:
         f"  Num Classes: {num_classes}\n"
         f"  Input Channels: {in_c}\n"
         f"  Freeze Backbone: {freeze_backbone}\n"
+        f"  Keep IOU Thresh: {keep_iou_thr}\n"
         f"  Hidden Dimension: {hidden_dim}\n"
         f"  Embedding Dimension: {embed_dim}\n"
         f"  RPN Anchor Sizes: {rpn_anchor_sizes}\n"
@@ -234,7 +236,7 @@ def main()-> None:
         f"  Det NMS Thresh: {det_nms_thresh}\n"
         f"  Detections Per Image: {detections_per_img}\n"
         f"  ROI Out Size H2WB: {roi_out_size_h2wb}\n"
-        f"  ROI Out Size WB2P: {roi_out_size_wb2p}\n"
+        # f"  ROI Out Size WB2P: {roi_out_size_wb2p}\n"
         f"  ROI Out Size H2P: {roi_out_size_h2p}\n"
         f"  Backbone Weights Path: {backbone_weights_path}\n"
         f"  Dataset MPs Path: {dataset_mps_path}\n"
@@ -298,13 +300,14 @@ def main()-> None:
 
     # Initialize Model
     spatial_scale_h2wb = spatial_scale_h2p = vgg_layer_out_size_ratio_maps[29]
-    spatial_scale_wb2p = 1.0
+    # spatial_scale_wb2p = 1.0
     stage2_config = Stage2Config(
         device=device,
         img_size=img_size,
         num_classes=num_classes,
         in_c=in_c,
         freeze_backbone=freeze_backbone,
+        keep_iou_thr=keep_iou_thr,
         hidden_dim=hidden_dim,
         embed_dim=embed_dim,
         rpn_anchor_sizes=rpn_anchor_sizes,
@@ -336,8 +339,8 @@ def main()-> None:
         detections_per_img=detections_per_img,
         roi_out_size_h2wb=roi_out_size_h2wb,
         spatial_scale_h2wb = spatial_scale_h2wb,
-        roi_out_size_wb2p=roi_out_size_wb2p,
-        spatial_scale_wb2p=spatial_scale_wb2p,
+        # roi_out_size_wb2p=roi_out_size_wb2p,
+        # spatial_scale_wb2p=spatial_scale_wb2p,
         roi_out_size_h2p=roi_out_size_h2p,
         spatial_scale_h2p=spatial_scale_h2p
     )

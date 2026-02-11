@@ -6,9 +6,10 @@ GitHub repository: https://github.com/SCoulY/MuSCLe
 import torch
 from enum import Enum
 from dataclasses import dataclass
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 import torch.nn.functional as F
 import torch.nn as nn
+from torchvision.ops.boxes import generalized_box_iou
 
 # -----Image Contrastive Loss-----
 def get_img_contrast_loss(emb : torch.Tensor, label : torch.Tensor, tau : float = 0.1, eps : float = 1e-6)->torch.Tensor:
@@ -453,3 +454,183 @@ class SimMaxLoss(nn.Module):
             return torch.sum(loss)
         else:
             return loss
+
+# ----- Proto Loss -----
+def get_proto_loss(
+    proposal_embeddings: torch.Tensor,  # Normalized, [N_D, D]
+    prototypes_embeddings: torch.Tensor,  # Normalized, [C, D]
+    labels: torch.Tensor,   # [N_D] long, 0~C-1
+    keep_mask: torch.Tensor,  # [N_D] bool
+    tau: float,
+    eps: float = 1e-8,
+)-> torch.Tensor:
+    """
+    仅对 keep_mask == True 的“可靠 proposals”计算。
+    :return: loss_proto
+    """
+    device = proposal_embeddings.device
+    if proposal_embeddings.numel() == 0:
+        return torch.tensor(0.0, device=device)
+
+    if keep_mask is None or keep_mask.numel() == 0 or (keep_mask.sum() == 0):
+        # 没有可靠 proposal，则不施加该约束（避免噪声）
+        return torch.tensor(0.0, device=device)
+
+    z = proposal_embeddings[keep_mask]  # [N_keep, D]
+    y = labels[keep_mask].long()  # [N_keep]
+    p = prototypes_embeddings  # [C, D]
+
+    # logits: [N_keep, C]
+    logits = (z @ p.t()) / max(tau, eps)
+
+    # InfoNCE with single positive == CE over prototype logits
+    loss = F.cross_entropy(logits, y)
+
+    return loss
+
+# ----- Match Loss -----
+def _softmax_focal_loss(
+    logits: torch.Tensor,  # [N, C+1]
+    targets: torch.Tensor,  # [N] in [0..C] (C=background)
+    alpha: float = 0.25,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    log_probs = torch.log_softmax(logits, dim=-1)  # [N, C+1]
+    probs = torch.softmax(logits, dim=-1)  # [N, C+1]
+
+    idx = torch.arange(logits.size(0), device=logits.device)
+    pt = probs[idx, targets]  # [N]
+    logpt = log_probs[idx, targets]  # [N]
+
+    loss = - (alpha * (1.0 - pt).pow(gamma) * logpt)  # [N]
+    return loss.mean()
+
+def compute_match_loss(
+    matched_pairs: List[Tuple[Dict, Dict]],   # (det_dict, aug_seed_dict)
+    unmatched_dets: List[Dict],               # det_dict list, treated as background
+    imgs: torch.Tensor,                       # [B,C,H,W]
+    num_classes: int,
+    match_focal_alpha: float,
+    match_focal_gamma: float,
+    lambda_match_cls: float,
+    lambda_match_l1: float,
+    lambda_match_giou: float,
+    other_class_logit: float = -20.0,
+    bg_logit: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    """
+    Match loss for one-to-one matching between:
+      - detections (pred): det_dict from _match_with_hungarian
+      - aug seeds (tgt): aug_seed_dict
+
+    det_dict format:
+      {
+        "sp_idx": int,
+        "box": Tensor[5] (batch_idx,x1,y1,x2,y2),
+        "class_id": int in [0..C-1],
+        "score": Tensor scalar,
+        "logit": Tensor scalar (logit(score) proxy)
+      }
+
+    aug_seed_dict format:
+      {
+        "box": Tensor[5],
+        "class_id": int in [0..C-1],
+        "score": float or Tensor (optional),
+        "logit": Tensor scalar (optional)
+      }
+    """
+    device = imgs.device
+    C = num_classes
+    bg_id = C  # background index in [0..C]
+
+    # --------------------------
+    # (0) collect all detections participating in match loss
+    #     matched dets are positives (target = seed class)
+    #     unmatched dets are negatives (target = background)
+    # --------------------------
+    det_all: List[Dict] = [p[0] for p in matched_pairs] + list(unmatched_dets)
+    N = len(det_all)
+    if N == 0:
+        z = torch.tensor(0.0, device=device)
+        return {"loss_match": z, "loss_match_cls": z, "loss_match_l1": z, "loss_match_giou": z}
+
+    # --------------------------
+    # (1) classification loss (Softmax focal over C+1 classes)
+    # --------------------------
+    # targets: matched -> seed class, unmatched -> background
+    cls_targets = torch.full((N,), bg_id, device=device, dtype=torch.long)
+    for k, (det, seed) in enumerate(matched_pairs):
+        cls_targets[k] = int(seed["class_id"])  # [0..C-1]
+
+    # build logits: [N, C+1]
+    # - all foreground channels default other_class_logit
+    # - put det["logit"] at its predicted class channel
+    # - background channel = bg_logit
+    cls_logits = torch.full((N, C + 1), other_class_logit, device=device, dtype=torch.float32)
+    cls_logits[:, bg_id] = float(bg_logit)
+
+    for i, det in enumerate(det_all):
+        pred_c = int(det["class_id"])
+        lg = det.get("logit", None)
+        if lg is None:
+            # if logit missing, derive from score
+            s = det.get("score", 1.0)
+            if not torch.is_tensor(s):
+                s = torch.tensor(float(s), device=device, dtype=torch.float32)
+            else:
+                s = s.to(device=device, dtype=torch.float32)
+            lg = torch.log(s.clamp(1e-6, 1 - 1e-6))
+        else:
+            if torch.is_tensor(lg):
+                lg = lg.to(device=device, dtype=torch.float32)
+            else:
+                lg = torch.tensor(float(lg), device=device, dtype=torch.float32)
+
+        if 0 <= pred_c < C:
+            cls_logits[i, pred_c] = lg
+
+    loss_cls = _softmax_focal_loss(
+        logits=cls_logits,
+        targets=cls_targets,
+        alpha=match_focal_alpha,
+        gamma=match_focal_gamma,
+    )
+
+    # --------------------------
+    # (2) regression loss (only for matched pairs)
+    # --------------------------
+    K = len(matched_pairs)
+    if K == 0:
+        loss_l1 = torch.tensor(0.0, device=device)
+        loss_giou = torch.tensor(0.0, device=device)
+    else:
+        det_boxes5 = torch.stack([p[0]["box"] for p in matched_pairs], dim=0).to(device=device)
+        seed_boxes5 = torch.stack([p[1]["box"] for p in matched_pairs], dim=0).to(device=device)
+
+        det_xyxy = det_boxes5[:, 1:5].float()
+        seed_xyxy = seed_boxes5[:, 1:5].float()
+
+        H, W = imgs.shape[-2], imgs.shape[-1]
+        scale = torch.tensor([W, H, W, H], device=device, dtype=torch.float32).unsqueeze(0)
+
+        loss_l1 = F.l1_loss(det_xyxy / scale, seed_xyxy / scale, reduction="none").sum(dim=1).mean()
+
+        giou = generalized_box_iou(det_xyxy, seed_xyxy)  # [K,K]
+        loss_giou = (1.0 - giou.diag()).mean()
+
+    # --------------------------
+    # (3) weighted sum
+    # --------------------------
+    lam_cls = lambda_match_cls
+    lam_l1 = lambda_match_l1
+    lam_giou = lambda_match_giou
+
+    loss_match = lam_cls * loss_cls + lam_l1 * loss_l1 + lam_giou * loss_giou
+
+    return {
+        "loss_match": loss_match,
+        "loss_match_cls": loss_cls,
+        "loss_match_l1": loss_l1,
+        "loss_match_giou": loss_giou,
+    }
