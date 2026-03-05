@@ -5,13 +5,22 @@ runtime:
 data:
   data_root: "./data/processed/Urinary Sediment Dataset"
   batch_size: 16    # (32, 64)
+  img_size: 640  # (600, 800)
+  num_classes: 7
 
 stage2_model_config:
-  img_size: 384  # (600, 800)
-  num_classes: 7
   in_c: 512
   freeze_backbone: False
-  keep_iou_thr: 0.1   # [0.1, 0.5]
+  # for compute constrain loss
+  w_proto_loss: 3.0  #  [1.0, 3.0]
+  w_pull_loss: 1.0 # [0.3, 1.5]
+  w_push_loss: 0.05 # [0.01, 0.3]
+  # for compute foreground scores
+  w_prototype_sim: 1.5  # [1.0, 2.0]
+  w_ccam_score: 0.6  # [0.2, 0.8]
+  w_obj_score: 0.3  # [0.1, 0.6]
+  # for select sparse proposal
+  keep_iou_thr: 0.5   # [0.1, 0.5]
   # for projection head
   hidden_dim: 512   # (256, 512, 768, 1024)
   embed_dim: 512
@@ -22,36 +31,33 @@ stage2_model_config:
   rpn_bg_iou_thresh: 0.3  # [0.2, 0.3]
   rpn_batch_size_per_image: 256  # [128, 256]
   rpn_pre_nms_top_n: 4000, 2000  # train: [2000, 6000], test: [1000, 3000]
-  rpn_post_nms_top_n: 2000, 1000 # train: [2000, 4000], test: [1000, 2000]
+  rpn_post_nms_top_n: 3000, 1000 # train: [2000, 4000], test: [1000, 2000]
   rpn_nms_thresh: 0.8  # [0.7, 0.9]
   # for CCAM
-  ccam_threshold: 0.2
-  # for proto loss
-  proto_loss_tau: 0.1   # [0.05, 0.2]
-  # for HungarianMatcher
-  cost_class: 2.0
-  cost_bbox: 5.0
-  cost_giou: 2.0
+  ccam_threshold: 0.5
+#  # for HungarianMatcher
+#  cost_class: 2.0
+#  cost_bbox: 5.0
+#  cost_giou: 2.0
   # for Pseudo Labels
   rpn_pseudo_nms_thr: 0.7  # [0.6, 0.8]
   rpn_pseudo_topk: 200  # [100, 300]
-  # for Match Loss
-  match_focal_alpha: 0.25
-  match_focal_gamma: 2.0
-  lambda_match_cls: 2.0
-  lambda_match_l1: 2.0
-  lambda_match_giou: 2.0
-  # for RoI Head
-  det_fg_iou_thresh: 0.5  # [0.3, 0.5]
-  det_bg_iou_thresh: 0.1  # [0.0, 0.2]
-  det_batch_size_per_image: 128  # [128, 256]
-  det_positive_fraction: 0.25
-  det_score_thresh: 0.0   # for training = 0.0, for inference = [0.3, 0.5]
-  det_nms_thresh: 0.5
-  detections_per_img: 100
+#  # for Match Loss
+#  match_focal_alpha: 0.25
+#  match_focal_gamma: 2.0
+#  lambda_match_cls: 2.0
+#  lambda_match_l1: 2.0
+#  lambda_match_giou: 2.0
+#  # for RoI Head
+#  det_fg_iou_thresh: 0.5  # [0.3, 0.5]
+#  det_bg_iou_thresh: 0.1  # [0.0, 0.2]
+#  det_batch_size_per_image: 128  # [128, 256]
+#  det_positive_fraction: 0.25
+#  det_score_thresh: 0.0   # for training = 0.0, for inference = [0.3, 0.5]
+#  det_nms_thresh: 0.5
+#  detections_per_img: 100
   # for RoI Align
   roi_out_size_h2wb: 21   # [21, 24]
-#  roi_out_size_wb2p: 7
   roi_out_size_h2p: 7
   # load paths
   backbone_weights_path: "./results/model_weights/Vgg16_backbone_260125.pth"
@@ -64,13 +70,14 @@ stage2_trainer_config:
   warmup_epochs: 5    # 1/10 epochs
   weight_decay: 0.05    # [0.05, 0.1]
   w_ccam_loss: 1.0
-  w_rpn_loss: 0.5
-  w_proto_loss: 1.0
-  w_match_loss: 0.3
-  w_det_loss: 1.0
+  w_constrain_loss: 1.0
+  w_rpn_loss: 1.0
+  w_obj_loss: 1.2
+#  w_match_loss: 0.3
+  ema_alpha: 0.99   # [0.9, 0.99]
   checkpoints_save_path: "./checkpoints/stage2/"
   model_save_path: "./results/model_weights/"
-  continue_train: False
-  checkpoint_path: ""  # ./checkpoints/stage2/checkpoint_{epoch}.pth
+  continue_train: True
+  checkpoint_path: "./checkpoints/stage2/checkpoint_49.pth"  # ./checkpoints/stage2/checkpoint_{epoch}.pth
 
 

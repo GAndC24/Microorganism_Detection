@@ -455,38 +455,98 @@ class SimMaxLoss(nn.Module):
         else:
             return loss
 
-# ----- Proto Loss -----
-def get_proto_loss(
-    proposal_embeddings: torch.Tensor,  # Normalized, [N_D, D]
-    prototypes_embeddings: torch.Tensor,  # Normalized, [C, D]
-    labels: torch.Tensor,   # [N_D] long, 0~C-1
-    keep_mask: torch.Tensor,  # [N_D] bool
-    tau: float,
-    eps: float = 1e-8,
+# ----- Object Loss -----
+def get_object_loss(
+    proposal_obj_logits : torch.Tensor,  # [N_s = total_num_sparse_proposals, C = num_classes]
+    bg_proposal_obj_logits : torch.Tensor,  # [N_b = total_num_bg_proposals, C = num_classes]
+    proposal_labels : torch.Tensor,  # [N_s], dtype long, range [1, C]
+    fg_scores : torch.Tensor, # [N_s] float, range [0, 1]
 )-> torch.Tensor:
     """
-    仅对 keep_mask == True 的“可靠 proposals”计算。
-    :return: loss_proto
+    compute object loss
+    :return:
+    loss_obj
+    """
+    Ns = proposal_obj_logits.shape[0]
+    Nb = bg_proposal_obj_logits.shape[0]
+    total = Ns + Nb
+
+    # compute loss_sparse
+    ce_per = F.cross_entropy(proposal_obj_logits, proposal_labels, reduction='none')  # [N_s]
+    denom = fg_scores.sum().clamp_min(1e-12)
+    loss_sparse = (fg_scores * ce_per).sum() / denom
+
+    # compute loss_bg
+    bg_labels = torch.zeros(Nb, dtype=torch.long, device=bg_proposal_obj_logits.device)  # background class index = 0
+    loss_bg = F.cross_entropy(bg_proposal_obj_logits, bg_labels)
+
+    # compute loss_obj
+    loss_obj = (Ns * loss_sparse + Nb * loss_bg) / total
+
+    return loss_obj
+
+# ----- Constrain Loss -----
+def get_constrain_loss(
+    proposal_embeddings: torch.Tensor,  # Normalized, [N = total_num_sparse_proposals, D = embed_dim]
+    prototypes_embeddings: torch.Tensor,  # Normalized, [C = num_classes, D]
+    bg_prototype_embedding : torch.Tensor,  # Normalized, [D]
+    labels : torch.Tensor, # [N], dtype long, range [1, C]
+    fg_scores : torch.Tensor, # [N] float, range [0, 1]
+    w_proto_loss : float,
+    w_pull_loss : float,
+    w_push_loss : float,
+    tau : float = 0.07,
+    push_margin : float  = 0.1,
+    push_tau : float = 0.2
+)-> Dict[str, torch.Tensor]:
+    """
+    compute constrain loss
+    :return:
+    constrain_loss_dict = {
+        "loss_constrain" : total_loss,
+        "loss_proto" : loss_proto,
+        "loss_pull" : loss_pull,
+        "loss_push" : loss_push,
+    }
     """
     device = proposal_embeddings.device
-    if proposal_embeddings.numel() == 0:
-        return torch.tensor(0.0, device=device)
-
-    if keep_mask is None or keep_mask.numel() == 0 or (keep_mask.sum() == 0):
-        # 没有可靠 proposal，则不施加该约束（避免噪声）
-        return torch.tensor(0.0, device=device)
-
-    z = proposal_embeddings[keep_mask]  # [N_keep, D]
-    y = labels[keep_mask].long()  # [N_keep]
+    N = proposal_embeddings.shape[0]
+    C = prototypes_embeddings.shape[0]
+    z = proposal_embeddings  # [N, D]
     p = prototypes_embeddings  # [C, D]
+    bg_p = bg_prototype_embedding.view(1, -1)  # [1, D]
+    labels = (labels - 1).clamp(min=0, max=C - 1)    # shift to range [0, C - 1], shape [N]
+    a = fg_scores  # [N]
 
-    # logits: [N_keep, C]
-    logits = (z @ p.t()) / max(tau, eps)
+    # compute loss_proto
+    logits_fg = (z @ p.t()) / tau  # [N, C]
+    log_prob_fg = F.log_softmax(logits_fg, dim=1)  # [N, C]
+    log_p_true = log_prob_fg.gather(1, labels.view(-1, 1)).squeeze(1)  # [N]
+    loss_proto = -(a * log_p_true).mean()
 
-    # InfoNCE with single positive == CE over prototype logits
-    loss = F.cross_entropy(logits, y)
+    # compute loss_pull
+    logits_bg = (z @ bg_p.t()).squeeze(1) / tau  # [N]
+    logits_all = torch.cat([logits_bg.view(-1, 1), logits_fg], dim=1)  # [N, 1+C]
+    log_prob_all = F.log_softmax(logits_all, dim=1)  # [N, 1+C]
+    log_p_bg = log_prob_all[:, 0]  # [N]
+    loss_pull = -((1.0 - a) * log_p_bg).mean()
 
-    return loss
+    # compute loss_push
+    # exp_arg = torch.clamp(logits_bg, max=50.0)
+    # loss_push = (a * torch.exp(exp_arg)).mean()
+    # softplus version
+    s_bg = (z @ bg_p.t()).squeeze(1)  # [N]
+    loss_push = (a * F.softplus((s_bg - push_margin) / push_tau)).mean()
+
+    # total
+    total_loss = (w_proto_loss * loss_proto) + (w_pull_loss * loss_pull) + (w_push_loss * loss_push)
+
+    return {
+        "loss_constrain": total_loss,
+        "loss_proto": loss_proto,
+        "loss_pull": loss_pull,
+        "loss_push": loss_push,
+    }
 
 # ----- Match Loss -----
 def _softmax_focal_loss(

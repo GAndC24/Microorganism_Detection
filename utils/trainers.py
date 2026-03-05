@@ -44,11 +44,12 @@ class Stage2TrainerConfig:
     checkpoints_save_path: str
     model_save_path: str
     logger: Logger
-    w_ccam_loss: float  # weight for ccam loss
-    w_rpn_loss: float   # weight for rpn loss
-    w_proto_loss: float  # weight for prototype loss
-    w_match_loss: float     # weight for matching loss
-    w_det_loss: float       # weight for detection loss
+    w_ccam_loss: float  # weight for loss_ccam
+    w_constrain_loss: float  # weight for loss_constrain
+    w_rpn_loss: float   # weight for loss_rpn
+    w_obj_loss: float   # weight for loss_obj
+    # w_match_loss: float     # weight for matching loss
+    ema_alpha: float  # EMA alpha for background prototype update
     continue_train: bool = False
     checkpoint_path: str = None
 
@@ -377,7 +378,7 @@ class Stage2Trainer:
             milestones=[self.config.warmup_epochs]
         )
 
-        self.bg_prototype : Dict[int, torch.Tensor] = {}
+        self.bg_prototype : Dict[str, torch.Tensor] = {}
 
         self.start_epoch = 1
 
@@ -497,6 +498,24 @@ class Stage2Trainer:
 
         return float(metric["map"])
 
+    @torch.no_grad()
+    def _update_bg_prototype_ema(
+        self,
+        batch_bg_prototype : torch.Tensor  # batch background prototype, shape [D]
+    )-> None:
+        """
+        Update background prototype using Exponential Moving Average (EMA).
+        :return:
+        """
+
+        k = 'bg'
+        m = self.config.ema_alpha
+        if k not in self.bg_prototype:       # first time initialization
+            self.bg_prototype[k] = batch_bg_prototype
+        else:
+            self.bg_prototype[k] = m * batch_bg_prototype + (1.0 - m) * self.bg_prototype[k]
+
+
     def _train_one_epoch(self, epoch) -> None:
         vis_root = os.path.join(self.log_path, "visualizations")
         vis_dir = os.path.join(vis_root, f"epoch_{epoch}")
@@ -511,24 +530,22 @@ class Stage2Trainer:
             dynamic_ncols=True,  # 自适应终端宽度
         )
 
-        epoch_total_loss = 0.0
-
-        epoch_ccam_loss = 0.0
-
-        epoch_rpn_loss = 0.0
-        epoch_rpn_obj_loss = 0.0
-        epoch_rpn_reg_loss = 0.0
-
-        epoch_proto_loss = 0.0
-
-        # epoch_match_loss = 0.0
-        # epoch_match_cls_loss = 0.0
-        # epoch_match_l1_loss = 0.0
-        # epoch_match_giou_loss = 0.0
-
-        # epoch_det_loss = 0.0
-        # epoch_det_cls_loss = 0.0
-        # epoch_det_reg_loss = 0.0
+        epoch_losses : Dict[str, float] = {
+            "total_loss" : 0.0,
+            "ccam_loss" : 0.0,
+            "constrain_loss" : 0.0,
+            "proto_loss" : 0.0,
+            "pull_loss" : 0.0,
+            "push_loss" : 0.0,
+            "obj_loss" : 0.0,
+            "rpn_loss" : 0.0,
+            "rpn_obj_loss" : 0.0,
+            "rpn_reg_loss" : 0.0,
+            # "match_loss" : 0.0,
+            # "match_cls_loss" : 0.0,
+            # "match_l1_loss" : 0.0,
+            # "match_giou_loss" : 0.0,
+        }
 
         epoch_pseudo_labels_mAP = 0.0
 
@@ -540,126 +557,126 @@ class Stage2Trainer:
             wboxes = _build_wboxes(targets).to(self.config.device)
             wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
             X = torch.stack(images, dim=0)
-            # loss_ccam, loss_proto, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections = self.model(
-            #     "train", X, wboxes, wb_one_hot_labels, gt_targets, vis_dir, epoch, iter
-            # )
-            # loss_ccam, loss_proto, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections = self.model(
-            #     "train", X, wboxes, wb_one_hot_labels, gt_targets, vis_dir, epoch, iter
-            # )
-            # loss_ccam, loss_proto, rpn_losses_dict, pseudo_labels_mAP = self.model(
-            #     "train", X, wboxes, wb_one_hot_labels, gt_targets, vis_dir, epoch, iter
-            # )
-            loss_ccam, loss_proto, rpn_losses_dict, pseudo_labels_mAP = self.model(
-                "train", X, wboxes, wb_one_hot_labels, self.bg_prototype, gt_targets, vis_dir, epoch, iter
+            out = self.model(
+                imgs=X,
+                wboxes=wboxes,
+                wb_labels=wb_one_hot_labels,
+                bg_prototype=self.bg_prototype,
+                gt_targets=gt_targets,
+                vis_dir=vis_dir,
+                epoch=epoch,
+                it=iter
             )
+
+            self._update_bg_prototype_ema(out["batch_bg_prototype"])
+
+            loss_ccam = out["loss_ccam"]
+
+            constrain_losses_dict = out["constrain_losses_dict"]
+            loss_constrain = constrain_losses_dict["loss_constrain"]
+            loss_proto = constrain_losses_dict["loss_proto"]
+            loss_pull = constrain_losses_dict["loss_pull"]
+            loss_push = constrain_losses_dict["loss_push"]
+
+            loss_obj = out["loss_obj"]
+
+            rpn_losses_dict = out["rpn_losses_dict"]
+            loss_rpn_obj = rpn_losses_dict["loss_objectness"]
+            loss_rpn_reg = rpn_losses_dict["loss_rpn_box_reg"]
+            loss_rpn = loss_rpn_obj + loss_rpn_reg
 
             # loss_match = match_losses_dict["loss_match"]
             # loss_match_cls = match_losses_dict["loss_match_cls"]
             # loss_match_l1 = match_losses_dict["loss_match_l1"]
             # loss_match_giou = match_losses_dict["loss_match_giou"]
 
-            loss_rpn_obj = rpn_losses_dict["loss_objectness"]
-            loss_rpn_reg = rpn_losses_dict["loss_rpn_box_reg"]
-            loss_rpn = loss_rpn_obj + loss_rpn_reg
-
-            # loss_det_cls = det_losses_dict["loss_classifier"]
-            # loss_det_reg = det_losses_dict["loss_box_reg"]
-            # loss_det = loss_det_cls + loss_det_reg
-
-            # loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto + self.config.w_match_loss * loss_match + self.config.w_det_loss * loss_det
-            # loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto + self.config.w_det_loss * loss_det
-            loss = self.config.w_ccam_loss * loss_ccam + self.config.w_rpn_loss * loss_rpn + self.config.w_proto_loss * loss_proto
+            loss = self.config.w_ccam_loss * loss_ccam + self.config.w_constrain_loss * loss_constrain + self.config.w_obj_loss * loss_obj + self.config.w_rpn_loss * loss_rpn
 
             self.optimizer.zero_grad()
             loss.backward()
 
             self.optimizer.step()
 
-            epoch_total_loss += loss.item()
-            epoch_ccam_loss += loss_ccam.item()
-            epoch_rpn_loss += loss_rpn.item()
-            epoch_rpn_obj_loss += loss_rpn_obj.item()
-            epoch_rpn_reg_loss += loss_rpn_reg.item()
-            epoch_proto_loss += loss_proto.item()
-            # epoch_match_loss += loss_match.item()
-            # epoch_match_cls_loss += loss_match_cls.item()
-            # epoch_match_l1_loss += loss_match_l1.item()
-            # epoch_match_giou_loss += loss_match_giou.item()
-            # epoch_det_loss += loss_det.item()
-            # epoch_det_cls_loss += loss_det_cls.item()
-            # epoch_det_reg_loss += loss_det_reg.item()
+            epoch_losses["total_loss"] += loss.item()
+            epoch_losses["ccam_loss"] += loss_ccam.item()
+            epoch_losses["constrain_loss"] += loss_constrain.item()
+            epoch_losses["obj_loss"] += loss_obj.item()
+            epoch_losses["proto_loss"] += loss_proto.item()
+            epoch_losses["pull_loss"] += loss_pull.item()
+            epoch_losses["push_loss"] += loss_push.item()
+            epoch_losses["rpn_loss"] += loss_rpn.item()
+            epoch_losses["rpn_obj_loss"] += loss_rpn_obj.item()
+            epoch_losses["rpn_reg_loss"] += loss_rpn_reg.item()
+            # epoch_losses["match_loss"] += loss_match.item()
 
+            pseudo_labels_mAP = out["pseudo_labels_mAP"]
             epoch_pseudo_labels_mAP += pseudo_labels_mAP
 
             pbar.set_postfix({
                 "Iter Loss: Total": f"{loss.item():.4f} ",
                 "CCAM": f"{loss_ccam.item():.4f} ",
                 "RPN": f"{loss_rpn.item():.4f} ",
-                "Proto": f"{loss_proto.item():.4f} ",
+                "Constrain": f"{loss_constrain.item():.4f} ",
+                "Obj" : f"{loss_obj.item():.4f} ",
                 # "Match": f"{loss_match.item():.4f} ",
-                # "Det": f"{loss_det.item():.4f} ",
-                "p_mAP": f"{pseudo_labels_mAP:.4f} ",
+                "p_mAP": f"{pseudo_labels_mAP} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
             })
 
         self.lr_scheduler.step()
 
         num_iters = len(self.train_loader)
-        average_total_loss = epoch_total_loss / num_iters
-        average_ccam_loss = epoch_ccam_loss / num_iters
-        average_rpn_loss = epoch_rpn_loss / num_iters
-        average_rpn_obj_loss = epoch_rpn_obj_loss / num_iters
-        average_rpn_reg_loss = epoch_rpn_reg_loss / num_iters
-        average_proto_loss = epoch_proto_loss / num_iters
+        average_total_loss = epoch_losses["total_loss"] / num_iters
+        average_ccam_loss = epoch_losses["ccam_loss"] / num_iters
+        average_constrain_loss = epoch_losses["constrain_loss"] / num_iters
+        average_proto_loss = epoch_losses["proto_loss"] / num_iters
+        average_pull_loss = epoch_losses["pull_loss"] / num_iters
+        average_push_loss = epoch_losses["push_loss"] / num_iters
+        average_obj_loss = epoch_losses["obj_loss"] / num_iters
+        average_rpn_loss = epoch_losses["rpn_loss"] / num_iters
+        average_rpn_obj_loss = epoch_losses["rpn_obj_loss"] / num_iters
+        average_rpn_reg_loss = epoch_losses["rpn_reg_loss"] / num_iters
         # average_match_loss = epoch_match_loss / num_iters
         # average_match_cls_loss = epoch_match_cls_loss / num_iters
         # average_match_l1_loss = epoch_match_l1_loss / num_iters
         # average_match_giou_loss = epoch_match_giou_loss / num_iters
-        # average_det_loss = epoch_det_loss / num_iters
-        # average_det_cls_loss = epoch_det_cls_loss / num_iters
-        # average_det_reg_loss = epoch_det_reg_loss / num_iters
 
         average_pseudo_labels_mAP = epoch_pseudo_labels_mAP / num_iters
-
-        # # get mAP@[0.5:0.95] metric
-        # train_mAP = self._get_mAP_metric(mode="train")
-        # val_mAP = self._get_mAP_metric(mode="val")
 
         self.config.logger.add_info(
             f"Epoch [{epoch}/{self.config.epochs}]"
             f"Total Loss: {average_total_loss:.4f}, "
             f"CCAM Loss: {average_ccam_loss:.4f}, "
-            f"RPN Loss: {average_rpn_loss:.4f}, "
+            f"Constrain Loss: {average_constrain_loss:.4f}, "
+            f"Obj Loss: {average_obj_loss:.4f}, "
+            f"RPN Loss: {average_rpn_loss:.4f},\n"
+            # f"Match Loss: {average_match_loss:.4f},\n"
             f"Proto Loss: {average_proto_loss:.4f}, "
-            # f"Match Loss: {average_match_loss:.4f}, "
-            # f"Det Loss: {average_det_loss:.4f}\n"
+            f"Pull Loss: {average_pull_loss:.4f}, "
+            f"Push Loss: {average_push_loss:.4f}, "
             f"RPN Obj Loss: {average_rpn_obj_loss:.4f}, "
-            f"RPN Reg Loss: {average_rpn_reg_loss:.4f}, "
+            f"RPN Reg Loss: {average_rpn_reg_loss:.4f},\n"
             # f"Match CLS Loss: {average_match_cls_loss:.4f}, "
             # f"Match L1 Loss: {average_match_l1_loss:.4f}, "
-            # f"Match GIoU Loss: {average_match_giou_loss:.4f}, "
-            # f"Det CLS Loss: {average_det_cls_loss:.4f}, "
-            # f"Det Reg Loss: {average_det_reg_loss:.4f} \n"
-            # f"Train mAP@[0.5:0.95]: {train_mAP:.4f}, Val mAP@[0.5:0.95]: {val_mAP:.4f}, Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
+            # f"Match GIoU Loss: {average_match_giou_loss:.4f}\n"
             f"Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
         )
         metrics = {
             'Epoch': epoch,
             'Total Loss': average_total_loss,
             'CCAM Loss': average_ccam_loss,
+            'Constrain Loss': average_constrain_loss,
+            'Proto Loss' : average_proto_loss,
+            'Pull Loss' : average_pull_loss,
+            'Push Loss' : average_push_loss,
+            'Obj Loss': average_obj_loss,
             'RPN Loss': average_rpn_loss,
             'RPN Obj Loss': average_rpn_obj_loss,
             'RPN Reg Loss': average_rpn_reg_loss,
-            'Proto Loss': average_proto_loss,
             # 'Match Loss': average_match_loss,
             # 'Match CLS Loss': average_match_cls_loss,
             # 'Match L1 Loss': average_match_l1_loss,
             # 'Match GIoU Loss': average_match_giou_loss,
-            # 'Det Loss': average_det_loss,
-            # 'Det CLS Loss': average_det_cls_loss,
-            # 'Det Reg Loss': average_det_reg_loss,
-            # 'Train mAP@[0.5:0.95]': train_mAP,
-            # 'Val mAP@[0.5:0.95]': val_mAP,
             'Pseudo Labels mAP@[0.5:0.95]': average_pseudo_labels_mAP,
         }
         self.config.logger.add_metrics(metrics)

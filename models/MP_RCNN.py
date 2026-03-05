@@ -1,6 +1,5 @@
 # Morphological Prototype R-CNN
 import os.path
-
 import torch
 import torch.nn as nn
 from typing import Tuple, List, Dict, Any, Union, Optional, Literal
@@ -54,6 +53,15 @@ class Stage2Config:
     num_classes: int  # number of classes
     in_c : int  # high-level feature maps channels
     freeze_backbone: bool  # freeze backbone weights
+    # for compute constrain loss
+    w_proto_loss : float  # weight for loss_proto
+    w_pull_loss : float # weight for loss_pull
+    w_push_loss : float # weight for loss_push
+    # for compute foreground scores
+    w_prototype_sim : float  # weight for prototype similarity
+    w_ccam_score : float  # weight for CCAM score
+    w_obj_score : float  # weight for object score
+    # for select sparse proposal
     keep_iou_thr: float  # keep IoU threshold
     # for projection head
     hidden_dim: int     # MLP hidden dimension
@@ -69,29 +77,27 @@ class Stage2Config:
     rpn_nms_thresh: float  # RPN NMS threshold
     # for CCAM
     ccam_threshold : float # CCAM threshold
-    # for proto loss
-    proto_loss_tau: float  # temperature tau for proto loss
-    # for HungarianMatcher
-    cost_class: float  # classification cost weight
-    cost_bbox: float  # bbox L1 cost weight
-    cost_giou: float  # bbox GIoU cost weight
+    # # for HungarianMatcher
+    # cost_class: float  # classification cost weight
+    # cost_bbox: float  # bbox L1 cost weight
+    # cost_giou: float  # bbox GIoU cost weight
     # for Pseudo Labels
     rpn_pseudo_nms_thr : float  # NMS threshold for pseudo labels
     rpn_pseudo_topk : int  # top-k proposals for pseudo labels
-    # for Match Loss
-    match_focal_alpha : float   # focal loss alpha
-    match_focal_gamma : float   # focal loss gamma
-    lambda_match_cls: float     # weight for match classification loss
-    lambda_match_l1: float    # weight for match L1 loss
-    lambda_match_giou: float    # weight for match giou loss
-    # for RoI Head
-    det_fg_iou_thresh: float  # foreground IoU threshold
-    det_bg_iou_thresh: float  # background IoU threshold
-    det_batch_size_per_image: int  # detection batch size per image
-    det_positive_fraction: float  # detection positive fraction
-    det_score_thresh: float  # detection score threshold
-    det_nms_thresh: float   # detection NMS threshold
-    detections_per_img: int # number of detections per image
+    # # for Match Loss
+    # match_focal_alpha : float   # focal loss alpha
+    # match_focal_gamma : float   # focal loss gamma
+    # lambda_match_cls: float     # weight for match classification loss
+    # lambda_match_l1: float    # weight for match L1 loss
+    # lambda_match_giou: float    # weight for match giou loss
+    # # for RoI Head
+    # det_fg_iou_thresh: float  # foreground IoU threshold
+    # det_bg_iou_thresh: float  # background IoU threshold
+    # det_batch_size_per_image: int  # detection batch size per image
+    # det_positive_fraction: float  # detection positive fraction
+    # det_score_thresh: float  # detection score threshold
+    # det_nms_thresh: float   # detection NMS threshold
+    # detections_per_img: int # number of detections per image
     # for RoI Align
     roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
     spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
@@ -101,19 +107,6 @@ class Stage2Config:
     spatial_scale_h2p: float    # spatial scale for high feature maps to proposal box features
     sampling_ratio: int = 2  # sampling ratio
     aligned: bool = True    # aligned flag
-
-@dataclass
-class Stage2CCAMConfig:
-    device: torch.device  # device
-    freeze_backbone: bool  # freeze backbone weights
-    in_c: int  # input channels
-    # for CCAM
-    ccam_threshold: float  # CCAM threshold
-    # for RoI Align
-    roi_out_size_h2wb: Tuple[int, int]  # output size for high feature maps to weak box features
-    spatial_scale_h2wb: float  # spatial scale for high feature maps to weak box features
-    sampling_ratio: int = 2  # sampling ratio
-    aligned: bool = True  # aligned flag
 
 @dataclass
 class LinearProbConfig:
@@ -260,21 +253,14 @@ class Stage2(nn.Module):
         self.config = config
         self.dataset_mps = dataset_mps
 
-        # (train)RoI Align for high-level feature maps to weak box feature maps
+        # RoI Align for high-level feature maps to weak box feature maps
         self.roi_align_h2wb = RoIAlign(
             output_size=self.config.roi_out_size_h2wb,
             spatial_scale=self.config.spatial_scale_h2wb,
             sampling_ratio=self.config.sampling_ratio,
             aligned=self.config.aligned,
         )
-        # # (train)RoI Align for weak box feature maps to proposal box feature maps
-        # self.roi_align_wb2p = RoIAlign(
-        #     output_size=self.config.roi_out_size_wb2p,
-        #     spatial_scale=self.config.spatial_scale_wb2p,
-        #     sampling_ratio=self.config.sampling_ratio,
-        #     aligned=self.config.aligned,
-        # )
-        # (train and inference) RoI Align for high-level feature maps to proposal box feature maps
+        # RoI Align for high-level feature maps to proposal box feature maps
         self.roi_align_h2p = MultiScaleRoIAlign(
             featmap_names=["0"],
             output_size=self.config.roi_out_size_h2p,
@@ -309,7 +295,7 @@ class Stage2(nn.Module):
             nn.ReLU(),
             nn.Linear(config.hidden_dim, config.embed_dim),
             nn.ReLU(),
-            nn.BatchNorm1d(config.embed_dim)
+            # nn.BatchNorm1d(config.embed_dim)
         )
 
         # Object Classifier
@@ -318,42 +304,42 @@ class Stage2(nn.Module):
         # CCAM Generator
         self.ccam_generator = CCAMGenerator(in_c=self.config.in_c)
 
-        # One-to-One Matcher
-        self.matcher = HungarianMatcher(
-            cost_class=self.config.cost_class,
-            cost_bbox=self.config.cost_bbox,
-            cost_giou=self.config.cost_giou
-        )
+        # # One-to-One Matcher
+        # self.matcher = HungarianMatcher(
+        #     cost_class=self.config.cost_class,
+        #     cost_bbox=self.config.cost_bbox,
+        #     cost_giou=self.config.cost_giou
+        # )
 
-        # Box Head
-        resolution = self.config.roi_out_size_h2p[0]
-        box_head = TwoMLPHead(
-            in_channels=self.config.in_c * resolution * resolution,
-            representation_size=self.config.hidden_dim,
-        )
-
-        # Box Predictor（cls + reg）
-        box_predictor = FastRCNNPredictor(
-            in_channels=self.config.hidden_dim,
-            num_classes=self.config.num_classes + 1,  # include background
-        )
-
-        # RoI Heads (roi align + box head + box predictor)
-        self.roi_heads = RoIHeads(
-            box_roi_pool=self.roi_align_h2p,
-            box_head=box_head,
-            box_predictor=box_predictor,
-
-            fg_iou_thresh=self.config.det_fg_iou_thresh,
-            bg_iou_thresh=self.config.det_bg_iou_thresh,
-            batch_size_per_image=self.config.det_batch_size_per_image,
-            positive_fraction=self.config.det_positive_fraction,
-
-            bbox_reg_weights=None,
-            score_thresh=self.config.det_score_thresh,
-            nms_thresh=self.config.det_nms_thresh,
-            detections_per_img=self.config.detections_per_img,
-        )
+        # # Box Head
+        # resolution = self.config.roi_out_size_h2p[0]
+        # box_head = TwoMLPHead(
+        #     in_channels=self.config.in_c * resolution * resolution,
+        #     representation_size=self.config.hidden_dim,
+        # )
+        #
+        # # Box Predictor（cls + reg）
+        # box_predictor = FastRCNNPredictor(
+        #     in_channels=self.config.hidden_dim,
+        #     num_classes=self.config.num_classes + 1,  # include background
+        # )
+        #
+        # # RoI Heads (roi align + box head + box predictor)
+        # self.roi_heads = RoIHeads(
+        #     box_roi_pool=self.roi_align_h2p,
+        #     box_head=box_head,
+        #     box_predictor=box_predictor,
+        #
+        #     fg_iou_thresh=self.config.det_fg_iou_thresh,
+        #     bg_iou_thresh=self.config.det_bg_iou_thresh,
+        #     batch_size_per_image=self.config.det_batch_size_per_image,
+        #     positive_fraction=self.config.det_positive_fraction,
+        #
+        #     bbox_reg_weights=None,
+        #     score_thresh=self.config.det_score_thresh,
+        #     nms_thresh=self.config.det_nms_thresh,
+        #     detections_per_img=self.config.detections_per_img,
+        # )
 
     @torch.no_grad()
     def _get_dense_proposals(
@@ -373,223 +359,223 @@ class Stage2(nn.Module):
 
         return dense_proposals_list
 
-    @torch.no_grad()
-    def _get_multi_bboxes(
-        self,
-        box_xyxy: torch.Tensor,  # [4] or [N,4], image coords (xyxy)
-        img_hw: Tuple[int, int],  # (Himg, Wimg)
-        do_aug: bool = True,
-        delta_aug: float = 0.10,  # [0.05, 0.15]
-        num_aug: int = 4,  # generate how many jitter boxes per base box
-        min_box_size: int = 2,  # avoid degenerate tiny boxes
-        keep_at_least_one: bool = True,  # NEW: never return empty if input non-empty
-    ) -> torch.Tensor:
-        """
-        Seed Proposal Augmentation (box jittering) with fallback:
-          - If a box is smaller than min_box_size in width/height, expand it to min_box_size
-            around its center (then clamp to image bounds).
-          - Optionally guarantee at least one output box (keep_at_least_one=True).
-
-        Return:
-          out_boxes: Tensor [M, 4] in image coords (xyxy), float32
-                    M is roughly N*(1+num_aug), after duplicate removal.
-        """
-        device = box_xyxy.device
-        dtype = torch.float32
-        Himg, Wimg = int(img_hw[0]), int(img_hw[1])
-
-        if box_xyxy is None or box_xyxy.numel() == 0:
-            return torch.zeros((0, 4), device=device, dtype=dtype)
-
-        # ---- make [N,4] float boxes
-        if box_xyxy.dim() == 1:
-            boxes = box_xyxy.view(1, 4).to(device=device, dtype=dtype)
-        else:
-            boxes = box_xyxy.to(device=device, dtype=dtype)
-
-        # ---- sanitize ordering (x1<=x2, y1<=y2)
-        x1 = torch.min(boxes[:, 0], boxes[:, 2])
-        y1 = torch.min(boxes[:, 1], boxes[:, 3])
-        x2 = torch.max(boxes[:, 0], boxes[:, 2])
-        y2 = torch.max(boxes[:, 1], boxes[:, 3])
-        boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-
-        # ---- clamp to image bounds (float)
-        # use [0, W-1]/[0, H-1] to match your original convention
-        boxes[:, 0] = boxes[:, 0].clamp(0, Wimg - 1)
-        boxes[:, 2] = boxes[:, 2].clamp(0, Wimg - 1)
-        boxes[:, 1] = boxes[:, 1].clamp(0, Himg - 1)
-        boxes[:, 3] = boxes[:, 3].clamp(0, Himg - 1)
-
-        # ---- drop NaN/Inf boxes early (robustness)
-        finite = torch.isfinite(boxes).all(dim=1)
-        boxes = boxes[finite]
-        if boxes.numel() == 0:
-            return torch.zeros((0, 4), device=device, dtype=dtype)
-
-        # ---- remove truly invalid (non-positive size) boxes
-        raw_w = boxes[:, 2] - boxes[:, 0]
-        raw_h = boxes[:, 3] - boxes[:, 1]
-        pos = (raw_w > 0.0) & (raw_h > 0.0)
-        boxes = boxes[pos]
-        if boxes.numel() == 0:
-            return torch.zeros((0, 4), device=device, dtype=dtype)
-
-        # -------------------------------------------------------------------------
-        # Fallback expansion: ensure EACH original box is at least min_box_size
-        # (center-preserving), then clamp and re-sanitize.
-        # -------------------------------------------------------------------------
-        minsz = float(min_box_size)
-
-        cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
-        cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
-        w = (boxes[:, 2] - boxes[:, 0])
-        h = (boxes[:, 3] - boxes[:, 1])
-
-        w2 = torch.clamp(w, min=minsz)
-        h2 = torch.clamp(h, min=minsz)
-
-        bx1 = cx - 0.5 * w2
-        by1 = cy - 0.5 * h2
-        bx2 = cx + 0.5 * w2
-        by2 = cy + 0.5 * h2
-
-        # clamp to bounds
-        bx1 = bx1.clamp(0, Wimg - 1)
-        bx2 = bx2.clamp(0, Wimg - 1)
-        by1 = by1.clamp(0, Himg - 1)
-        by2 = by2.clamp(0, Himg - 1)
-
-        # re-sanitize after clamp
-        ax1 = torch.min(bx1, bx2)
-        ax2 = torch.max(bx1, bx2)
-        ay1 = torch.min(by1, by2)
-        ay2 = torch.max(by1, by2)
-        boxes = torch.stack([ax1, ay1, ax2, ay2], dim=-1)
-
-        # If clamping near borders caused width/height to collapse again,
-        # do a second-pass “push inside bounds” to enforce min size as much as possible.
-        # (This matters when cx is extremely close to the border.)
-        w3 = boxes[:, 2] - boxes[:, 0]
-        h3 = boxes[:, 3] - boxes[:, 1]
-
-        need_w = w3 < minsz
-        need_h = h3 < minsz
-
-        if need_w.any():
-            # try to set [x1, x2] = [cx - min/2, cx + min/2] then shift into [0, W-1]
-            cxn = (boxes[:, 0] + boxes[:, 2]) * 0.5
-            nx1 = cxn - 0.5 * minsz
-            nx2 = cxn + 0.5 * minsz
-            # shift if out of bounds
-            shift_l = (0.0 - nx1).clamp(min=0.0)
-            shift_r = (nx2 - (Wimg - 1)).clamp(min=0.0)
-            nx1 = nx1 + shift_l - shift_r
-            nx2 = nx2 + shift_l - shift_r
-            # clamp final
-            nx1 = nx1.clamp(0, Wimg - 1)
-            nx2 = nx2.clamp(0, Wimg - 1)
-            boxes[need_w, 0] = nx1[need_w]
-            boxes[need_w, 2] = nx2[need_w]
-
-        if need_h.any():
-            cyn = (boxes[:, 1] + boxes[:, 3]) * 0.5
-            ny1 = cyn - 0.5 * minsz
-            ny2 = cyn + 0.5 * minsz
-            shift_t = (0.0 - ny1).clamp(min=0.0)
-            shift_b = (ny2 - (Himg - 1)).clamp(min=0.0)
-            ny1 = ny1 + shift_t - shift_b
-            ny2 = ny2 + shift_t - shift_b
-            ny1 = ny1.clamp(0, Himg - 1)
-            ny2 = ny2.clamp(0, Himg - 1)
-            boxes[need_h, 1] = ny1[need_h]
-            boxes[need_h, 3] = ny2[need_h]
-
-        # final validity check (after fallback expansion)
-        fw = boxes[:, 2] - boxes[:, 0]
-        fh = boxes[:, 3] - boxes[:, 1]
-        valid_final = (fw > 0.0) & (fh > 0.0)
-        boxes = boxes[valid_final]
-
-        if boxes.numel() == 0:
-            # extremely rare (only possible if Himg/Wimg are tiny or coords are pathological)
-            if keep_at_least_one:
-                return torch.zeros((1, 4), device=device, dtype=dtype)
-            return torch.zeros((0, 4), device=device, dtype=dtype)
-
-        # always keep originals (after expansion)
-        out = [boxes]
-
-        if (not do_aug) or (num_aug <= 0):
-            return boxes
-
-        # ---- xyxy -> cxcywh for jitter
-        cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
-        cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
-        w = (boxes[:, 2] - boxes[:, 0]).clamp(min=minsz)
-        h = (boxes[:, 3] - boxes[:, 1]).clamp(min=minsz)
-
-        # ---- sample eps for each aug and each box
-        for _ in range(int(num_aug)):
-            eps = (2.0 * torch.rand((boxes.size(0), 4), device=device, dtype=dtype) - 1.0) * float(delta_aug)
-            epsx, epsy, epsw, epsh = eps[:, 0], eps[:, 1], eps[:, 2], eps[:, 3]
-
-            # random sign per component
-            sgn = torch.where(
-                torch.rand((boxes.size(0), 4), device=device) > 0.5,
-                torch.ones((boxes.size(0), 4), device=device, dtype=dtype),
-                -torch.ones((boxes.size(0), 4), device=device, dtype=dtype),
-            )
-            sx, sy, sw, sh = sgn[:, 0], sgn[:, 1], sgn[:, 2], sgn[:, 3]
-
-            cx2 = cx * (1.0 + sx * epsx)
-            cy2 = cy * (1.0 + sy * epsy)
-            w2 = w * (1.0 + sw * epsw)
-            h2 = h * (1.0 + sh * epsh)
-
-            # keep positive size (and at least min size)
-            w2 = torch.clamp(w2, min=minsz)
-            h2 = torch.clamp(h2, min=minsz)
-
-            nx1 = cx2 - 0.5 * w2
-            ny1 = cy2 - 0.5 * h2
-            nx2 = cx2 + 0.5 * w2
-            ny2 = cy2 + 0.5 * h2
-
-            # clamp to image bounds
-            nx1 = nx1.clamp(0, Wimg - 1)
-            nx2 = nx2.clamp(0, Wimg - 1)
-            ny1 = ny1.clamp(0, Himg - 1)
-            ny2 = ny2.clamp(0, Himg - 1)
-
-            # sanitize ordering after clamp
-            ax1 = torch.min(nx1, nx2)
-            ax2 = torch.max(nx1, nx2)
-            ay1 = torch.min(ny1, ny2)
-            ay2 = torch.max(ny1, ny2)
-
-            aug = torch.stack([ax1, ay1, ax2, ay2], dim=-1)
-
-            # filter tiny (strict) for augmented boxes
-            aw = aug[:, 2] - aug[:, 0]
-            ah = aug[:, 3] - aug[:, 1]
-            aug = aug[(aw >= minsz) & (ah >= minsz)]
-
-            if aug.numel() > 0:
-                out.append(aug)
-
-        out_boxes = torch.cat(out, dim=0)  # [M,4]
-
-        # ---- remove duplicates (quantize to ints for hashing)
-        # keep at least one if input non-empty
-        q = torch.round(out_boxes).to(torch.int64)
-        uniq = torch.unique(q, dim=0, sorted=False)
-
-        if uniq.numel() == 0 and keep_at_least_one:
-            # fallback: keep the first (expanded) original box
-            uniq = torch.round(boxes[:1]).to(torch.int64)
-
-        return uniq.to(dtype=dtype)
+    # @torch.no_grad()
+    # def _get_multi_bboxes(
+    #     self,
+    #     box_xyxy: torch.Tensor,  # [4] or [N,4], image coords (xyxy)
+    #     img_hw: Tuple[int, int],  # (Himg, Wimg)
+    #     do_aug: bool = True,
+    #     delta_aug: float = 0.10,  # [0.05, 0.15]
+    #     num_aug: int = 4,  # generate how many jitter boxes per base box
+    #     min_box_size: int = 2,  # avoid degenerate tiny boxes
+    #     keep_at_least_one: bool = True,  # NEW: never return empty if input non-empty
+    # ) -> torch.Tensor:
+    #     """
+    #     Seed Proposal Augmentation (box jittering) with fallback:
+    #       - If a box is smaller than min_box_size in width/height, expand it to min_box_size
+    #         around its center (then clamp to image bounds).
+    #       - Optionally guarantee at least one output box (keep_at_least_one=True).
+    #
+    #     Return:
+    #       out_boxes: Tensor [M, 4] in image coords (xyxy), float32
+    #                 M is roughly N*(1+num_aug), after duplicate removal.
+    #     """
+    #     device = box_xyxy.device
+    #     dtype = torch.float32
+    #     Himg, Wimg = int(img_hw[0]), int(img_hw[1])
+    #
+    #     if box_xyxy is None or box_xyxy.numel() == 0:
+    #         return torch.zeros((0, 4), device=device, dtype=dtype)
+    #
+    #     # ---- make [N,4] float boxes
+    #     if box_xyxy.dim() == 1:
+    #         boxes = box_xyxy.view(1, 4).to(device=device, dtype=dtype)
+    #     else:
+    #         boxes = box_xyxy.to(device=device, dtype=dtype)
+    #
+    #     # ---- sanitize ordering (x1<=x2, y1<=y2)
+    #     x1 = torch.min(boxes[:, 0], boxes[:, 2])
+    #     y1 = torch.min(boxes[:, 1], boxes[:, 3])
+    #     x2 = torch.max(boxes[:, 0], boxes[:, 2])
+    #     y2 = torch.max(boxes[:, 1], boxes[:, 3])
+    #     boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+    #
+    #     # ---- clamp to image bounds (float)
+    #     # use [0, W-1]/[0, H-1] to match your original convention
+    #     boxes[:, 0] = boxes[:, 0].clamp(0, Wimg - 1)
+    #     boxes[:, 2] = boxes[:, 2].clamp(0, Wimg - 1)
+    #     boxes[:, 1] = boxes[:, 1].clamp(0, Himg - 1)
+    #     boxes[:, 3] = boxes[:, 3].clamp(0, Himg - 1)
+    #
+    #     # ---- drop NaN/Inf boxes early (robustness)
+    #     finite = torch.isfinite(boxes).all(dim=1)
+    #     boxes = boxes[finite]
+    #     if boxes.numel() == 0:
+    #         return torch.zeros((0, 4), device=device, dtype=dtype)
+    #
+    #     # ---- remove truly invalid (non-positive size) boxes
+    #     raw_w = boxes[:, 2] - boxes[:, 0]
+    #     raw_h = boxes[:, 3] - boxes[:, 1]
+    #     pos = (raw_w > 0.0) & (raw_h > 0.0)
+    #     boxes = boxes[pos]
+    #     if boxes.numel() == 0:
+    #         return torch.zeros((0, 4), device=device, dtype=dtype)
+    #
+    #     # -------------------------------------------------------------------------
+    #     # Fallback expansion: ensure EACH original box is at least min_box_size
+    #     # (center-preserving), then clamp and re-sanitize.
+    #     # -------------------------------------------------------------------------
+    #     minsz = float(min_box_size)
+    #
+    #     cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
+    #     cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
+    #     w = (boxes[:, 2] - boxes[:, 0])
+    #     h = (boxes[:, 3] - boxes[:, 1])
+    #
+    #     w2 = torch.clamp(w, min=minsz)
+    #     h2 = torch.clamp(h, min=minsz)
+    #
+    #     bx1 = cx - 0.5 * w2
+    #     by1 = cy - 0.5 * h2
+    #     bx2 = cx + 0.5 * w2
+    #     by2 = cy + 0.5 * h2
+    #
+    #     # clamp to bounds
+    #     bx1 = bx1.clamp(0, Wimg - 1)
+    #     bx2 = bx2.clamp(0, Wimg - 1)
+    #     by1 = by1.clamp(0, Himg - 1)
+    #     by2 = by2.clamp(0, Himg - 1)
+    #
+    #     # re-sanitize after clamp
+    #     ax1 = torch.min(bx1, bx2)
+    #     ax2 = torch.max(bx1, bx2)
+    #     ay1 = torch.min(by1, by2)
+    #     ay2 = torch.max(by1, by2)
+    #     boxes = torch.stack([ax1, ay1, ax2, ay2], dim=-1)
+    #
+    #     # If clamping near borders caused width/height to collapse again,
+    #     # do a second-pass “push inside bounds” to enforce min size as much as possible.
+    #     # (This matters when cx is extremely close to the border.)
+    #     w3 = boxes[:, 2] - boxes[:, 0]
+    #     h3 = boxes[:, 3] - boxes[:, 1]
+    #
+    #     need_w = w3 < minsz
+    #     need_h = h3 < minsz
+    #
+    #     if need_w.any():
+    #         # try to set [x1, x2] = [cx - min/2, cx + min/2] then shift into [0, W-1]
+    #         cxn = (boxes[:, 0] + boxes[:, 2]) * 0.5
+    #         nx1 = cxn - 0.5 * minsz
+    #         nx2 = cxn + 0.5 * minsz
+    #         # shift if out of bounds
+    #         shift_l = (0.0 - nx1).clamp(min=0.0)
+    #         shift_r = (nx2 - (Wimg - 1)).clamp(min=0.0)
+    #         nx1 = nx1 + shift_l - shift_r
+    #         nx2 = nx2 + shift_l - shift_r
+    #         # clamp final
+    #         nx1 = nx1.clamp(0, Wimg - 1)
+    #         nx2 = nx2.clamp(0, Wimg - 1)
+    #         boxes[need_w, 0] = nx1[need_w]
+    #         boxes[need_w, 2] = nx2[need_w]
+    #
+    #     if need_h.any():
+    #         cyn = (boxes[:, 1] + boxes[:, 3]) * 0.5
+    #         ny1 = cyn - 0.5 * minsz
+    #         ny2 = cyn + 0.5 * minsz
+    #         shift_t = (0.0 - ny1).clamp(min=0.0)
+    #         shift_b = (ny2 - (Himg - 1)).clamp(min=0.0)
+    #         ny1 = ny1 + shift_t - shift_b
+    #         ny2 = ny2 + shift_t - shift_b
+    #         ny1 = ny1.clamp(0, Himg - 1)
+    #         ny2 = ny2.clamp(0, Himg - 1)
+    #         boxes[need_h, 1] = ny1[need_h]
+    #         boxes[need_h, 3] = ny2[need_h]
+    #
+    #     # final validity check (after fallback expansion)
+    #     fw = boxes[:, 2] - boxes[:, 0]
+    #     fh = boxes[:, 3] - boxes[:, 1]
+    #     valid_final = (fw > 0.0) & (fh > 0.0)
+    #     boxes = boxes[valid_final]
+    #
+    #     if boxes.numel() == 0:
+    #         # extremely rare (only possible if Himg/Wimg are tiny or coords are pathological)
+    #         if keep_at_least_one:
+    #             return torch.zeros((1, 4), device=device, dtype=dtype)
+    #         return torch.zeros((0, 4), device=device, dtype=dtype)
+    #
+    #     # always keep originals (after expansion)
+    #     out = [boxes]
+    #
+    #     if (not do_aug) or (num_aug <= 0):
+    #         return boxes
+    #
+    #     # ---- xyxy -> cxcywh for jitter
+    #     cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
+    #     cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
+    #     w = (boxes[:, 2] - boxes[:, 0]).clamp(min=minsz)
+    #     h = (boxes[:, 3] - boxes[:, 1]).clamp(min=minsz)
+    #
+    #     # ---- sample eps for each aug and each box
+    #     for _ in range(int(num_aug)):
+    #         eps = (2.0 * torch.rand((boxes.size(0), 4), device=device, dtype=dtype) - 1.0) * float(delta_aug)
+    #         epsx, epsy, epsw, epsh = eps[:, 0], eps[:, 1], eps[:, 2], eps[:, 3]
+    #
+    #         # random sign per component
+    #         sgn = torch.where(
+    #             torch.rand((boxes.size(0), 4), device=device) > 0.5,
+    #             torch.ones((boxes.size(0), 4), device=device, dtype=dtype),
+    #             -torch.ones((boxes.size(0), 4), device=device, dtype=dtype),
+    #         )
+    #         sx, sy, sw, sh = sgn[:, 0], sgn[:, 1], sgn[:, 2], sgn[:, 3]
+    #
+    #         cx2 = cx * (1.0 + sx * epsx)
+    #         cy2 = cy * (1.0 + sy * epsy)
+    #         w2 = w * (1.0 + sw * epsw)
+    #         h2 = h * (1.0 + sh * epsh)
+    #
+    #         # keep positive size (and at least min size)
+    #         w2 = torch.clamp(w2, min=minsz)
+    #         h2 = torch.clamp(h2, min=minsz)
+    #
+    #         nx1 = cx2 - 0.5 * w2
+    #         ny1 = cy2 - 0.5 * h2
+    #         nx2 = cx2 + 0.5 * w2
+    #         ny2 = cy2 + 0.5 * h2
+    #
+    #         # clamp to image bounds
+    #         nx1 = nx1.clamp(0, Wimg - 1)
+    #         nx2 = nx2.clamp(0, Wimg - 1)
+    #         ny1 = ny1.clamp(0, Himg - 1)
+    #         ny2 = ny2.clamp(0, Himg - 1)
+    #
+    #         # sanitize ordering after clamp
+    #         ax1 = torch.min(nx1, nx2)
+    #         ax2 = torch.max(nx1, nx2)
+    #         ay1 = torch.min(ny1, ny2)
+    #         ay2 = torch.max(ny1, ny2)
+    #
+    #         aug = torch.stack([ax1, ay1, ax2, ay2], dim=-1)
+    #
+    #         # filter tiny (strict) for augmented boxes
+    #         aw = aug[:, 2] - aug[:, 0]
+    #         ah = aug[:, 3] - aug[:, 1]
+    #         aug = aug[(aw >= minsz) & (ah >= minsz)]
+    #
+    #         if aug.numel() > 0:
+    #             out.append(aug)
+    #
+    #     out_boxes = torch.cat(out, dim=0)  # [M,4]
+    #
+    #     # ---- remove duplicates (quantize to ints for hashing)
+    #     # keep at least one if input non-empty
+    #     q = torch.round(out_boxes).to(torch.int64)
+    #     uniq = torch.unique(q, dim=0, sorted=False)
+    #
+    #     if uniq.numel() == 0 and keep_at_least_one:
+    #         # fallback: keep the first (expanded) original box
+    #         uniq = torch.round(boxes[:1]).to(torch.int64)
+    #
+    #     return uniq.to(dtype=dtype)
 
     def _map_boxes_roi_to_image_xyxy(
         self,
@@ -736,7 +722,7 @@ class Stage2(nn.Module):
         self,
         ccam_i: torch.Tensor,  # [Hc, Wc] float
         cam_boxes_xyxy: torch.Tensor,  # [N, 4] long in CCAM coords
-        top_p: float = 0.2,  # Top-p% mean, e.g., 0.2 means top 20%
+        top_p: float = 0.2,  # Top-p% mean
     )-> Tuple[torch.Tensor, torch.Tensor]:
         """
         For each box, compute:
@@ -815,6 +801,85 @@ class Stage2(nn.Module):
         w = (x2 - x1).clamp(min=1e-6)
         h = (y2 - y1).clamp(min=1e-6)
         return torch.stack([cx, cy, w, h], dim=-1)
+
+    def _compute_fg_scores(
+        self,
+        sparse_props_ccam_scores : torch.Tensor,  # [total_num_sparse_proposals], range [0, 1]
+        prototypes_embeddings : torch.Tensor,   # Normalized, shape [num_classes, D]
+        sparse_proposal_embeddings : torch.Tensor,  # Normalized, shape [total_num_sparse_proposals, D]
+        sparse_proposal_labels : torch.Tensor,  # [total_num_sparse_proposals], range [1, num_classes] (0 reserved for background)
+        sparse_proposal_boxes : torch.Tensor,  # [total_num_sparse_proposals, 5], each row = [batch_idx, x1, y1, x2, y2]
+        sparse_proposal_object_scores : torch.Tensor,  # [total_num_sparse_proposals], range [0, 1]
+        w_prototype_sim : float,
+        w_ccam_score: float,
+        w_obj_score: float,
+        tau : float = 0.07,     # [0.05, 0.15]
+    )-> torch.Tensor:
+        """
+        :return: fg_scores: [total_num_sparse_proposals], range [0,1]
+        """
+        z = sparse_proposal_embeddings
+        s_1 = sparse_props_ccam_scores
+        s_2 = sparse_proposal_object_scores
+        labels = sparse_proposal_labels
+        C = prototypes_embeddings.shape[0]
+        N = z.shape[0]
+
+        # gather class prototype for each proposal
+        # shift to [0, C-1]
+        cls_idx = (labels - 1).clamp(min=0, max=C - 1)  # [total_num_sparse_proposals], range [0, C-1]
+        proto_k = prototypes_embeddings[cls_idx]  # [total_num_sparse_proposals, D]
+
+        # compute
+        # sim_k = (z * proto_k).sum(dim=1) / tau  # [total_num_sparse_proposals]
+        sim_k = (z * proto_k).sum(dim=1)  # [total_num_sparse_proposals]
+        logits = float(w_prototype_sim) * sim_k + float(w_ccam_score) * s_1 + float(w_obj_score) * s_2  # [total_num_sparse_proposals]
+
+        # # for debug
+        # with open("debug_data.txt", "w") as f:
+        #     for i in range(logits.size(0)):
+        #         f.write(f"Proposal {i}: sim_k={sim_k[i].item()}, ccam_score={s_1[i].item()}, obj_score={s_2[i].item()}, logit={logits[i].item()}\n")
+
+        # fg_scores = torch.sigmoid(logits)  # [total_num_sparse_proposals]
+
+        # # grouped softmax by class
+        # fg_scores = torch.zeros((N,), device=self.config.device, dtype=torch.float32)
+        # valid_mask = (labels >= 1) & (labels <= C)
+        # if valid_mask.any():
+        #     # process each class separately
+        #     for c in range(1, C + 1):
+        #         mask_c = valid_mask & (labels == c)
+        #         if not mask_c.any():
+        #             continue
+        #         logits_c = logits[mask_c]  # [n_c]
+        #         # temperature-scaled softmax within the class group
+        #         logits_c = logits_c / max(float(tau), 1e-6)
+        #         logits_c = logits_c - logits_c.max()
+        #         fg_scores[mask_c] = torch.softmax(logits_c, dim=0)
+
+        # ---- 3) grouped softmax by (image, class) ----
+        fg_scores = torch.zeros((N,), device=logits.device, dtype=torch.float32)
+
+        valid_mask = (labels >= 1) & (labels <= C)
+        if not valid_mask.any():
+            return fg_scores
+
+        # group key: (batch_idx, class_label)
+        # batch_idx is sparse_proposal_boxes[:,0]
+        batch_idx = sparse_proposal_boxes[:, 0].long()  # [N]
+        group_id = batch_idx * (C + 1) + labels.long()  # [N], unique per (img, cls) since labels in [1..C]
+
+        # Iterate each group; each group does a softmax over its proposals
+        unique_gids = torch.unique(group_id[valid_mask])
+        for gid in unique_gids:
+            m = valid_mask & (group_id == gid)
+            if not m.any():
+                continue
+            l = logits[m] / tau
+            l = l - l.max()  # numerical stability
+            fg_scores[m] = torch.softmax(l, dim=0)
+
+        return fg_scores
 
     # def _build_rpn_pseudo_labels(
     #     self,
@@ -1166,138 +1231,138 @@ class Stage2(nn.Module):
 
         return out
 
-    def _match_with_hungarian(
-        self,
-        topk_detections: List[Dict[str, torch.Tensor]],
-        aug_seed_proposals: List[Dict],
-        num_classes: int,
-        other_class_logit: float = -20.0,
-    ) -> Tuple[List[Tuple[Dict, Dict]], List[Dict]]:
-        """
-        One-to-one Hungarian matching between:
-          - pred: topk_detections (RoIHeads outputs, per-image)
-          - tgt : aug_seed_proposals (list of dict with box[5], class_id)
-        :returns:
-          - matched_pairs: List[(det_dict, aug_seed_dict)]
-                - det_dict{
-                    "sp_idx": int,                 # 全 batch 唯一索引（内部 bookkeeping）
-                    "box": Tensor [5],              # (batch_idx, x1, y1, x2, y2)  image coords
-                    "class_id": int,                # 预测类别 id ∈ [0 .. C-1]
-                    "score": Tensor scalar,         # detection score ∈ (0,1)
-                    "logit": Tensor scalar,         # logit(score) or log(score)（用于 matcher cost_class）
-                }
-                - aug_seed_dict = {
-                    "box": Tensor [5],              # (batch_idx, x1, y1, x2, y2)
-                    "class_id": int,                # GT-like class id ∈ [0 .. C-1]
-                    "score": float or Tensor,
-                    "logit": Tensor scalar,
-                }
-          - unmatched_dets: List[det_dict]  (treated as background in match cls loss)
-        """
-        B = len(topk_detections)
-        if B == 0:
-            return [], []
-
-        device = topk_detections[0]["boxes"].device
-        matched_pairs: List[Tuple[Dict, Dict]] = []
-        unmatched_dets: List[Dict] = []
-
-        # Build aug seeds grouped by batch
-        aug_by_img: List[List[Dict]] = [[] for _ in range(B)]
-        for t in aug_seed_proposals:
-            b = int(t["box"][0].item())
-            if 0 <= b < B:
-                aug_by_img[b].append(t)
-
-        global_det_idx = 0  # for sp_idx-like indexing across batch (optional but consistent)
-
-        for b in range(B):
-            det_b = topk_detections[b]
-            boxes = det_b.get("boxes", None)
-            scores = det_b.get("scores", None)
-            labels = det_b.get("labels", None)
-
-            if boxes is None or scores is None or labels is None:
-                continue
-
-            if boxes.numel() == 0:
-                continue
-
-            seeds_b = aug_by_img[b]
-            if len(seeds_b) == 0:
-                # no targets -> all detections unmatched
-                for i in range(boxes.shape[0]):
-                    cls_id = int(labels[i].item()) - 1  # labels are 1..C
-                    unmatched_dets.append({
-                        "sp_idx": global_det_idx,
-                        "box": torch.cat([torch.tensor([b], device=device, dtype=boxes.dtype), boxes[i]], dim=0),  # [5]
-                        "class_id": cls_id,
-                        "score": scores[i],
-                        "logit": torch.log(scores[i].clamp(1e-6, 1 - 1e-6)),
-                    })
-                    global_det_idx += 1
-                continue
-
-            Nd = boxes.shape[0]
-
-            # ---- build det dicts (for output pairing + later losses) ----
-            det_dicts: List[Dict] = []
-            for i in range(Nd):
-                cls_id = int(labels[i].item()) - 1  # shift [1..C] -> [0..C-1]
-                s = scores[i].to(device=device, dtype=torch.float32)
-                # convert score -> logit proxy (monotonic), used only for cost_class
-                lg = torch.log(s.clamp(1e-6, 1 - 1e-6))
-
-                box5 = torch.cat([
-                    torch.tensor([b], device=device, dtype=boxes.dtype),
-                    boxes[i]
-                ], dim=0)  # [5]
-
-                det_dicts.append({
-                    "sp_idx": global_det_idx,
-                    "box": box5,  # [5]
-                    "class_id": cls_id,  # [0..C-1]
-                    "score": s,  # scalar tensor
-                    "logit": lg,  # scalar tensor
-                })
-                global_det_idx += 1
-
-            # ---- matcher inputs: pred_boxes/pred_logits ----
-            pred_boxes_xyxy = boxes.to(device=device, dtype=torch.float32)  # [Nd,4]
-            pred_boxes = self._xyxy_to_cxcywh(pred_boxes_xyxy)  # [Nd,4]
-
-            # pred_logits: [1, Nd, C] (foreground only)
-            pred_logits = torch.full((1, Nd, num_classes), other_class_logit, device=device, dtype=torch.float32)
-            for i in range(Nd):
-                cls = det_dicts[i]["class_id"]
-                pred_logits[0, i, cls] = det_dicts[i]["logit"].to(device=device, dtype=torch.float32)
-
-            outputs = {
-                "pred_logits": pred_logits,  # [1, Nd, C]
-                "pred_boxes": pred_boxes.unsqueeze(0),  # [1, Nd, 4]
-            }
-
-            # ---- targets ----
-            tgt_labels = torch.tensor([int(t["class_id"]) for t in seeds_b], device=device, dtype=torch.long)  # [Nt]
-            tgt_boxes_xyxy = torch.stack([t["box"][1:5] for t in seeds_b], dim=0).to(device=device,
-                                                                                     dtype=torch.float32)  # [Nt,4]
-            tgt_boxes = self._xyxy_to_cxcywh(tgt_boxes_xyxy)  # [Nt,4]
-            targets = [{"labels": tgt_labels, "boxes": tgt_boxes}]
-
-            # ---- hungarian ----
-            indices = self.matcher(outputs, targets)  # list length=1
-            src_idx, tgt_idx = indices[0]
-
-            matched_src = set(src_idx.tolist())
-            for si, ti in zip(src_idx.tolist(), tgt_idx.tolist()):
-                matched_pairs.append((det_dicts[si], seeds_b[ti]))
-
-            # unmatched detections (background)
-            for i in range(Nd):
-                if i not in matched_src:
-                    unmatched_dets.append(det_dicts[i])
-
-        return matched_pairs, unmatched_dets
+    # def _match_with_hungarian(
+    #     self,
+    #     topk_detections: List[Dict[str, torch.Tensor]],
+    #     aug_seed_proposals: List[Dict],
+    #     num_classes: int,
+    #     other_class_logit: float = -20.0,
+    # ) -> Tuple[List[Tuple[Dict, Dict]], List[Dict]]:
+    #     """
+    #     One-to-one Hungarian matching between:
+    #       - pred: topk_detections (RoIHeads outputs, per-image)
+    #       - tgt : aug_seed_proposals (list of dict with box[5], class_id)
+    #     :returns:
+    #       - matched_pairs: List[(det_dict, aug_seed_dict)]
+    #             - det_dict{
+    #                 "sp_idx": int,                 # 全 batch 唯一索引（内部 bookkeeping）
+    #                 "box": Tensor [5],              # (batch_idx, x1, y1, x2, y2)  image coords
+    #                 "class_id": int,                # 预测类别 id ∈ [0 .. C-1]
+    #                 "score": Tensor scalar,         # detection score ∈ (0,1)
+    #                 "logit": Tensor scalar,         # logit(score) or log(score)（用于 matcher cost_class）
+    #             }
+    #             - aug_seed_dict = {
+    #                 "box": Tensor [5],              # (batch_idx, x1, y1, x2, y2)
+    #                 "class_id": int,                # GT-like class id ∈ [0 .. C-1]
+    #                 "score": float or Tensor,
+    #                 "logit": Tensor scalar,
+    #             }
+    #       - unmatched_dets: List[det_dict]  (treated as background in match cls loss)
+    #     """
+    #     B = len(topk_detections)
+    #     if B == 0:
+    #         return [], []
+    #
+    #     device = topk_detections[0]["boxes"].device
+    #     matched_pairs: List[Tuple[Dict, Dict]] = []
+    #     unmatched_dets: List[Dict] = []
+    #
+    #     # Build aug seeds grouped by batch
+    #     aug_by_img: List[List[Dict]] = [[] for _ in range(B)]
+    #     for t in aug_seed_proposals:
+    #         b = int(t["box"][0].item())
+    #         if 0 <= b < B:
+    #             aug_by_img[b].append(t)
+    #
+    #     global_det_idx = 0  # for sp_idx-like indexing across batch (optional but consistent)
+    #
+    #     for b in range(B):
+    #         det_b = topk_detections[b]
+    #         boxes = det_b.get("boxes", None)
+    #         scores = det_b.get("scores", None)
+    #         labels = det_b.get("labels", None)
+    #
+    #         if boxes is None or scores is None or labels is None:
+    #             continue
+    #
+    #         if boxes.numel() == 0:
+    #             continue
+    #
+    #         seeds_b = aug_by_img[b]
+    #         if len(seeds_b) == 0:
+    #             # no targets -> all detections unmatched
+    #             for i in range(boxes.shape[0]):
+    #                 cls_id = int(labels[i].item()) - 1  # labels are 1..C
+    #                 unmatched_dets.append({
+    #                     "sp_idx": global_det_idx,
+    #                     "box": torch.cat([torch.tensor([b], device=device, dtype=boxes.dtype), boxes[i]], dim=0),  # [5]
+    #                     "class_id": cls_id,
+    #                     "score": scores[i],
+    #                     "logit": torch.log(scores[i].clamp(1e-6, 1 - 1e-6)),
+    #                 })
+    #                 global_det_idx += 1
+    #             continue
+    #
+    #         Nd = boxes.shape[0]
+    #
+    #         # ---- build det dicts (for output pairing + later losses) ----
+    #         det_dicts: List[Dict] = []
+    #         for i in range(Nd):
+    #             cls_id = int(labels[i].item()) - 1  # shift [1..C] -> [0..C-1]
+    #             s = scores[i].to(device=device, dtype=torch.float32)
+    #             # convert score -> logit proxy (monotonic), used only for cost_class
+    #             lg = torch.log(s.clamp(1e-6, 1 - 1e-6))
+    #
+    #             box5 = torch.cat([
+    #                 torch.tensor([b], device=device, dtype=boxes.dtype),
+    #                 boxes[i]
+    #             ], dim=0)  # [5]
+    #
+    #             det_dicts.append({
+    #                 "sp_idx": global_det_idx,
+    #                 "box": box5,  # [5]
+    #                 "class_id": cls_id,  # [0..C-1]
+    #                 "score": s,  # scalar tensor
+    #                 "logit": lg,  # scalar tensor
+    #             })
+    #             global_det_idx += 1
+    #
+    #         # ---- matcher inputs: pred_boxes/pred_logits ----
+    #         pred_boxes_xyxy = boxes.to(device=device, dtype=torch.float32)  # [Nd,4]
+    #         pred_boxes = self._xyxy_to_cxcywh(pred_boxes_xyxy)  # [Nd,4]
+    #
+    #         # pred_logits: [1, Nd, C] (foreground only)
+    #         pred_logits = torch.full((1, Nd, num_classes), other_class_logit, device=device, dtype=torch.float32)
+    #         for i in range(Nd):
+    #             cls = det_dicts[i]["class_id"]
+    #             pred_logits[0, i, cls] = det_dicts[i]["logit"].to(device=device, dtype=torch.float32)
+    #
+    #         outputs = {
+    #             "pred_logits": pred_logits,  # [1, Nd, C]
+    #             "pred_boxes": pred_boxes.unsqueeze(0),  # [1, Nd, 4]
+    #         }
+    #
+    #         # ---- targets ----
+    #         tgt_labels = torch.tensor([int(t["class_id"]) for t in seeds_b], device=device, dtype=torch.long)  # [Nt]
+    #         tgt_boxes_xyxy = torch.stack([t["box"][1:5] for t in seeds_b], dim=0).to(device=device,
+    #                                                                                  dtype=torch.float32)  # [Nt,4]
+    #         tgt_boxes = self._xyxy_to_cxcywh(tgt_boxes_xyxy)  # [Nt,4]
+    #         targets = [{"labels": tgt_labels, "boxes": tgt_boxes}]
+    #
+    #         # ---- hungarian ----
+    #         indices = self.matcher(outputs, targets)  # list length=1
+    #         src_idx, tgt_idx = indices[0]
+    #
+    #         matched_src = set(src_idx.tolist())
+    #         for si, ti in zip(src_idx.tolist(), tgt_idx.tolist()):
+    #             matched_pairs.append((det_dicts[si], seeds_b[ti]))
+    #
+    #         # unmatched detections (background)
+    #         for i in range(Nd):
+    #             if i not in matched_src:
+    #                 unmatched_dets.append(det_dicts[i])
+    #
+    #     return matched_pairs, unmatched_dets
 
     def _evaluate_pseudo_labels(self,
         pseudo_labels: List[Dict[str, torch.Tensor]],  # pseudo labels
@@ -1352,43 +1417,35 @@ class Stage2(nn.Module):
         self,
         imgs: torch.Tensor,  # input images, [B, C, H, W]
         wboxes: torch.Tensor,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        wb_labels: torch.Tensor,  # class label for weak boxes, [R, num_classes]
+        wb_labels: torch.Tensor,  # class label for weak boxes, one-hot, [R, num_classes], range [0, num_classes - 1]
         bg_prototype: Dict[str, torch.Tensor],  # background prototype
         gt_targets: List[Dict[str, torch.Tensor]] = None,  # ground-truth targets for evaluate pseudo labels
         vis_dir: str = None,  # for debug : visualization output dir
         epoch: int = 0,  # for debug : current epoch
         it: int = 0  # for debug : current iteration
-    # )-> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], float, List[Dict[str, torch.Tensor]]]:
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor], float]:
+    ) -> Dict[str, Any]:
         """
         :return:
-        - loss_proto: torch.Tensor, Prototype loss
+        out : Dict[str, Any], contains:
         - loss_ccam: torch.Tensor, CCAM loss
-        - match_losses_dict: Dict[str, torch.Tensor], One-to-One Match losses
-                            {
-                                "loss_match": loss_match,
-                                "loss_match_cls": loss_cls,
-                                "loss_match_l1": loss_l1,
-                                "loss_match_giou": loss_giou,
-                            }
+        - batch_bg_prototype: torch.Tensor, batch background prototype for EMA update, shape [D]
+        - constrain_losses_dict: Dict[str, torch.Tensor], constrain losses
+                                {
+                                    "loss_constrain" : total_loss,
+                                    "loss_proto" : loss_proto,
+                                    "loss_pull" : loss_pull,
+                                    "loss_push" : loss_push,
+                                }
+        - loss_obj: torch.Tensor, sparse proposal objectness loss
         - rpn_losses_dict: Dict[str, torch.Tensor], RPN losses
                             {
                                 "loss_objectness": loss_objectness,
                                 "loss_rpn_box_reg": loss_rpn_box_reg,
                             }
-        - det_losses_dict: Dict[str, torch.Tensor], Detection losses
-                            {
-                                "loss_classifier": loss_classifier,
-                                "loss_box_reg": loss_box_reg
-                            }
         - pseudo_labels_mAP: float, mAP of pseudo labels
-        - detections: List[Dict[str, torch.Tensor]], length B, each element:
-                            {
-                                "boxes": Tensor [Nd, 4] in image coords (xyxy),
-                                "labels": Tensor [Nd] in [1..C] (0 reserved for background),
-                                "scores": Tensor [Nd],
-                            }
         """
+        out : Dict[str, Any] = {}   # output container
+
         # -----get high-level feature maps-----
         self.encoder[-1] = nn.Identity()
         high_feature_maps = self.encoder(imgs)  # [B, C_h, H_h, W_h]
@@ -1400,72 +1457,87 @@ class Stage2(nn.Module):
         # get CCAM and loss_ccam
         ccam, loss_ccam = self.ccam_generator(wb_feature_maps)  # [R, 1, H_wb, W_wb]
 
+        out.update({
+            "loss_ccam" : loss_ccam
+        })
+
         # -----Branch 2: get augmented seed proposals-----
         # 1) get dense proposals
         img_size = (imgs.shape[-1], imgs.shape[-2])  # (H_img, W_img)
         img_size_list = [img_size for _ in range(imgs.shape[0])]
         dense_proposals_list = self._get_dense_proposals(high_feature_maps, img_size_list, imgs)  # List[Tensor], len=B, each Tensor is [num_proposals, 4]
 
-        # 2) get sparse proposals
-        # select proposals included in weak boxes
-        keep_props_list = []    # len=B, each Tensor is [num_keep_props, 4]
+        # 2) split dense proposals into sparse proposals and background proposals based on wboxes
+        B = imgs.shape[0]
+        sparse_proposals_list = []  # len=B, each Tensor is [num_props, 4]
+        sparse_proposal_labels_list = []  # len=B, each Tensor is [num_props]
+        bg_proposals_list = []  # len=B, each Tensor is [num_bg_props, 4]
 
-        B = len(dense_proposals_list)
         for b in range(B):
             # all proposals in this image
             props_xyxy = dense_proposals_list[b]    # [num_props, 4]
 
             # all weak boxes in this image
-            wbs = wboxes[wboxes[:, 0].long() == b, 1:5]  # [num_wbs, 4]
+            wb_mask = (wboxes[:, 0].long() == b)    # bool mask for wboxes in this image, shape [R]
+            wbs = wboxes[wb_mask, 1:5]  # [num_wbs, 4]
+            wbl = wb_labels[wb_mask]  # one-hot class labels for wboxes in this image, shape [num_wbs, num_classes], range [0, num_classes - 1]
+
             # completely inside wbox
             # broadcast
             p = props_xyxy[:, None, :]  # [num_props, 1, 4]
             w = wbs[None, :, :]  # [1, num_wbs, 4]
+            # inside matrix, shape [num_props, num_wbs]
             inside = (p[..., 0] >= w[..., 0]) & (p[..., 1] >= w[..., 1]) & \
-                     (p[..., 2] <= w[..., 2]) & (p[..., 3] <= w[..., 3])  # [num_props, num_wbs]
-            keep_mask = inside.any(dim=1)  # [num_props]
+                     (p[..., 2] <= w[..., 2]) & (p[..., 3] <= w[..., 3])
+            # iou matrix for proposals and wboxes, shape [num_props, num_wbs]
+            ious = box_iou(props_xyxy, wbs)
 
-            # # center inside wbox
-            # # centers: [num_props]
-            # cx = 0.5 * (props_xyxy[:, 0] + props_xyxy[:, 2])
-            # cy = 0.5 * (props_xyxy[:, 1] + props_xyxy[:, 3])
-            # # broadcast: c -> [num_props,1], w -> [1,num_wbs,4]
-            # cx_b = cx[:, None]
-            # cy_b = cy[:, None]
-            # w = wbs[None, :, :]  # [1, num_wbs, 4]
-            # center_in = (cx_b >= w[..., 0]) & (cy_b >= w[..., 1]) & \
-            #             (cx_b <= w[..., 2]) & (cy_b <= w[..., 3])  # [num_props, num_wbs]
-            # keep_mask = center_in.any(dim=1)  # [num_props]
+            # initial sparse mask: any inside
+            sparse_mask = inside.any(dim=1)  # [num_props]
 
-            # # IoU with any wbox
-            # ious = box_iou(props_xyxy, wbs)  # [num_props, num_wbs]
-            # # keep if IoU >= thr with ANY weak box
-            # keep_mask = (ious >= self.config.keep_iou_thr).any(dim=1)  # [num_props]
-
-            # keep at least one proposal
-            if not keep_mask.any():
-                ious = box_iou(props_xyxy, wbs)  # [num_props, num_wbs]
+            # no proposals completely inside any wbox, keep at least one proposal
+            if not sparse_mask.any():
                 max_iou_per_prop, _ = ious.max(dim=1)  # [num_props]
-
-                # 优先保留 IoU >= 阈值 的 proposals（如果有）
-                iou_keep = max_iou_per_prop >= float(self.config.keep_iou_thr)
+                # keep proposals whose max IoU with any wbox >= iou threshold
+                iou_keep = max_iou_per_prop >= float(self.config.keep_iou_thr)  # [num_props]
                 if iou_keep.any():
-                    keep_mask = iou_keep
-                else:
-                    # 否则只保留 IoU 最大的那个 proposal（至少 1 个）
+                    sparse_mask = iou_keep
+                else:   # no proposals whose max IoU with any wbox >= iou threshold
+                    # keep the proposal with highest IoU with any wbox
                     best_idx = torch.argmax(max_iou_per_prop)
-                    keep_mask = torch.zeros_like(max_iou_per_prop, dtype=torch.bool)
-                    keep_mask[best_idx] = True
+                    sparse_mask = torch.zeros_like(max_iou_per_prop, dtype=torch.bool)
+                    sparse_mask[best_idx] = True
 
-            keep_props_list.append(props_xyxy[keep_mask])
+            # assign class labels for sparse proposals based on wboxes
+            # if proposal inside multiple wboxes: pick max IoU among inside ones for assign label
+            big_neg = torch.finfo(ious.dtype).min   # large negative value for masking
+            # for each proposal, get the max IoU with wboxes that it is inside of; if not inside any wbox, assign big negative
+            masked_ious = torch.where(inside, ious, torch.tensor(big_neg, device=ious.device, dtype=ious.dtype))    # [num_props, num_wbs]
+            wbox_best_inside = torch.argmax(masked_ious, dim=1)  # [num_props]
+            wbox_best_iou = torch.argmax(ious, dim=1)  # [num_props]
 
-        # select top-k scoring proposals based on CCAM
-        topk_ratio = 0.5
+            # for sparse proposals: choose best_inside if truly inside; else best_iou
+            use_inside = inside.any(dim=1)
+            wbox_best = torch.where(use_inside, wbox_best_inside, wbox_best_iou)  # index of best wbox for each proposal, shape [num_props]
+
+            # assign labels for sparse proposals
+            assigned_wbl = wbl[wbox_best]   # [num_props, num_classes]
+            prop_labels_all = torch.argmax(assigned_wbl, dim=1).long()  # [num_props], range [0, num_classes - 1]
+            prop_labels_all = prop_labels_all + 1  # shift to range [1, num_classes], where 0 is reserved for background
+
+            # split sparse / bg
+            sparse_props = props_xyxy[sparse_mask]
+            sparse_labels = prop_labels_all[sparse_mask]
+            bg_props = props_xyxy[~sparse_mask]
+
+            sparse_proposals_list.append(sparse_props)
+            sparse_proposal_labels_list.append(sparse_labels)
+            bg_proposals_list.append(bg_props)
+
+
+        # 3) get CCAM foreground scores of sparse proposals
         R, _, Hc, Wc = ccam.shape
-        sparse_proposals_list = []    # len=B, each Tensor is [num_props, 4]
-        roi_labels_list = []    # len=B, each Tensor is [num_props]
-        sparse_props_per_img = [ [] for _ in range(B)]
-        sparse_props_labels_per_img = [[] for _ in range(B)]
+        sparse_props_ccam_scores_per_img = [ [] for _ in range(B)]
 
         # invert ccam
         # ccam = 1 - ccam
@@ -1473,7 +1545,7 @@ class Stage2(nn.Module):
         for i in range(R):
             b = int(wboxes[i, 0].item())        # wbox batch_idx
             wbox_xyxy = wboxes[i, 1:5]    # [4], image coords
-            props_xyxy = keep_props_list[b]    # [num_props, 4], image coords
+            props_xyxy = sparse_proposals_list[b]    # [num_props, 4], image coords
 
             ccam_boxes = self._map_boxes_image_to_roi_xyxy(
                 boxes_img_xyxy=props_xyxy,
@@ -1489,38 +1561,22 @@ class Stage2(nn.Module):
             )       # [num_props]
 
             scores = fg_scores - bg_scores  # [num_props]
+            if len(sparse_props_ccam_scores_per_img[b]) == 0:
+                sparse_props_ccam_scores_per_img[b].append(scores)
 
-            k = int(max(1, round(topk_ratio * props_xyxy.shape[0])))
-            top_indices = torch.topk(scores, k=k, largest=True).indices  # [k]
-            wbox_cls = int(torch.argmax(wb_labels[i]).item())
-            top_props = props_xyxy[top_indices]
-            sparse_props_per_img[b].append(top_props)
-            top_labels = torch.full(
-                (top_props.shape[0],),  # (k,)
-                wbox_cls,
-                device=self.config.device,
-                dtype=torch.long
-            )
-            sparse_props_labels_per_img[b].append(top_labels)
-
-
+        sparse_props_ccam_scores_list = []  # len=B, each Tensor is [num_props]
         for b in range(B):
-            sparse_proposals_list.append(
-                torch.cat(sparse_props_per_img[b], dim=0)  # [num_props,4]
+            sparse_props_ccam_scores_list.append(
+                torch.cat(sparse_props_ccam_scores_per_img[b], dim=0)
             )
-            roi_labels_list.append(
-                torch.cat(sparse_props_labels_per_img[b], dim=0)  # [Nb]
-            )
-        # with open("debug_data.txt", "w") as f:
-        #     f.write("Sparse proposals:\n")
-        #     for b in range(B):
-        #         f.write(f"Image {b}:\n")
-        #         for i in range(sparse_proposals_list[b].shape[0]):
-        #             box = sparse_proposals_list[b][i].cpu().numpy().tolist()
-        #             label = roi_labels_list[b][i].cpu().item()
-        #             f.write(f"  Box: {box}, Label: {label}\n")
 
-        # get sparse proposal features
+        sparse_props_ccam_scores = torch.cat(sparse_props_ccam_scores_list, dim=0)  # [total_num_sparse_proposals]
+        # # for debug
+        # with open("debug_data.txt", 'w') as f:
+        #     for score in sparse_props_ccam_scores.cpu().tolist():
+        #         f.write(f"{score}\n")
+
+        # get sparse proposal & background proposal features
         high_feature_maps_dict = {"0" : high_feature_maps}
         image_shapes = [(imgs.shape[-2], imgs.shape[-1]) for _ in range(B)]
         sparse_proposal_features = self.roi_align_h2p(
@@ -1528,70 +1584,161 @@ class Stage2(nn.Module):
             sparse_proposals_list,
             image_shapes
         )    # [total_num_sparse_proposals, C_h, H_p, W_p]
-
-        # roi_batch_idx = torch.cat([
-        #     torch.full((sparse_proposals_list[b].shape[0],), b, device=self.config.device, dtype=torch.long)
-        #     for b in range(B)
-        # ], dim=0)  # [total_num_sparse_proposals]
+        bg_proposal_features = self.roi_align_h2p(
+            high_feature_maps_dict,
+            bg_proposals_list,
+            image_shapes
+        )    # [total_num_bg_proposals, C_h, H_p, W_p]
 
         sparse_proposal_boxes_list = []
+        bg_proposal_boxes_list = []
         for b in range(B):
             props_xyxy = sparse_proposals_list[b]  # [num_props, 4]
+            bg_props_xyxy = bg_proposals_list[b]  # [num_bg_props, 4]
+
             batch_idx = torch.full((props_xyxy.shape[0],), b, device=self.config.device, dtype=torch.long)
+            batch_idx_bg = torch.full((bg_props_xyxy.shape[0],), b, device=self.config.device, dtype=torch.long)
+
             props_boxes = torch.cat([batch_idx.unsqueeze(1), props_xyxy], dim=1)
+            bg_props_boxes = torch.cat([batch_idx_bg.unsqueeze(1), bg_props_xyxy], dim=1)
+
             sparse_proposal_boxes_list.append(props_boxes)
+            bg_proposal_boxes_list.append(bg_props_boxes)
+
         sparse_proposal_boxes = torch.cat(sparse_proposal_boxes_list, dim=0)  # [total_num_sparse_proposals, 5], each props is [batch_idx, x1, y1, x2, y2]
+        # bg_proposal_boxes = torch.cat(bg_proposal_boxes_list, dim=0)  # [total_num_bg_proposals, 5], each props is [batch_idx, x1, y1, x2, y2]
 
-        roi_labels = torch.cat(roi_labels_list, dim=0)  # [total_num_sparse_proposals]
+        sparse_proposal_labels = torch.cat(sparse_proposal_labels_list, dim=0)  # [total_num_sparse_proposals], range [1, num_classes]
 
-        # 3) embed sparse proposal features and prototypes for contrast loss
+        # 4) embed sparse proposal features, background proposal features and prototypes
         # sparse proposal features to embeddings
         sparse_proposal_features = self.gap(sparse_proposal_features)  # [total_num_sparse_proposals, C_h, 1, 1]
         sparse_proposal_features = sparse_proposal_features.view(sparse_proposal_features.shape[0], -1)    # [total_num_sparse_proposals, C_h]
         sparse_proposal_embeddings = self.proj(sparse_proposal_features)  # [total_num_sparse_proposals, D = embed_dim]
-        # get object scores
-        sparse_proposal_object_logits = self.obj_classifier(sparse_proposal_embeddings)  # [total_num_sparse_proposals, num_classes + 1]
-        sparse_proposal_object_scores = F.softmax(sparse_proposal_object_logits, dim=1)  # [total_num_sparse_proposals, num_classes + 1]
-        # L2 norm
-        sparse_proposal_embeddings = F.normalize(sparse_proposal_embeddings, dim=1)  # [total_num_sparse_proposals, D]
+        # background proposal features to embeddings
+        bg_proposal_features = self.gap(bg_proposal_features)  # [total_num_bg_proposals, C_h, 1, 1]
+        bg_proposal_features = bg_proposal_features.view(bg_proposal_features.shape[0], -1)    # [total_num_bg_proposals, C_h]
+        bg_proposal_embeddings = self.proj(bg_proposal_features)  # [total_num_bg_proposals, D = embed_dim]
+        # build batch background prototype: LogSumExp pooling of background proposal features
+        N = bg_proposal_features.shape[0]
+        batch_bg_prototype = torch.logsumexp(bg_proposal_features, dim=0) - torch.log(torch.tensor(float(N), device=self.config.device))  # [D]
+        key = 'bg'
+        if key not in bg_prototype:  # first time initialization
+            bg_prototype[key] = batch_bg_prototype
+
+        out.update({
+            "batch_bg_prototype" : batch_bg_prototype
+        })
 
         # prototypes to embeddings
         prototypes = torch.stack([self.dataset_mps[k] for k in range(self.config.num_classes)], dim=0)  # [num_classes, D_p = C_h]
         prototypes_embeddings = self.proj(prototypes)  # [num_classes, D]
-        prototypes_embeddings = F.normalize(prototypes_embeddings, dim=1)  # [num_classes, D]
+        prototypes_embeddings_norm = F.normalize(prototypes_embeddings, dim=1)  # [num_classes, D]
+        # background prototype to embedding
+        bg_prototype_embedding = self.proj(bg_prototype['bg'].unsqueeze(0))  # [1, D]
+        bg_prototype_embedding = bg_prototype_embedding.squeeze(0)  # [D]
+        # L2 norm
+        bg_prototype_embedding_norm = F.normalize(bg_prototype_embedding, dim=0)  # [D]
 
-        # 4) Object Discovery
+        # 5) compute foreground scores for sparse proposals
+        # L2 norm
+        sparse_proposal_embeddings_norm = F.normalize(sparse_proposal_embeddings, dim=1)  # [total_num_sparse_proposals, D]
+        bg_proposal_embeddings_norm = F.normalize(bg_proposal_embeddings, dim=1)  # [total_num_bg_proposals, D]
+        # get object scores
+        sparse_proposal_object_logits = self.obj_classifier(sparse_proposal_embeddings)  # [total_num_sparse_proposals, num_classes + 1]
+        sparse_proposal_object_scores = F.softmax(sparse_proposal_object_logits, dim=1)  # [total_num_sparse_proposals, num_classes + 1]
+        bg_proposal_object_logits = self.obj_classifier(bg_proposal_embeddings)  # [total_num_bg_proposals, num_classes + 1]
+        sparse_proposal_object_scores_list = []
+        for i in range(sparse_proposal_labels.shape[0]):
+            c = int(sparse_proposal_labels[i].item())
+            sparse_proposal_object_scores_list.append(sparse_proposal_object_scores[i, c])
+        sparse_proposal_object_scores = torch.stack(sparse_proposal_object_scores_list, dim=0)  # [total_num_sparse_proposals]
+
+        sparse_proposal_fg_scores = self._compute_fg_scores(
+            sparse_props_ccam_scores=sparse_props_ccam_scores,
+            sparse_proposal_embeddings=sparse_proposal_embeddings_norm,
+            sparse_proposal_labels=sparse_proposal_labels,
+            sparse_proposal_boxes=sparse_proposal_boxes,
+            prototypes_embeddings=prototypes_embeddings_norm,
+            sparse_proposal_object_scores=sparse_proposal_object_scores,
+            w_prototype_sim=self.config.w_prototype_sim,
+            w_ccam_score=self.config.w_ccam_score,
+            w_obj_score=self.config.w_obj_score
+        )       # [total_num_sparse_proposals]
+
+        # # for debug
+        # with open("debug_data.txt", "w", encoding="utf-8") as f:
+        #     f.write("Sparse proposal foreground scores:\n")
+        #     for i in range(sparse_proposal_fg_scores.shape[0]):
+        #         score = sparse_proposal_fg_scores[i].item()
+        #         f.write(f"Proposal {i}: Score: {score}\n")
+
+        # compute loss_constrain
+        constrain_losses_dict = get_constrain_loss(
+            proposal_embeddings=sparse_proposal_embeddings_norm,
+            prototypes_embeddings=prototypes_embeddings_norm,
+            bg_prototype_embedding=bg_prototype_embedding_norm,
+            labels=sparse_proposal_labels,
+            fg_scores=sparse_proposal_fg_scores,
+            w_proto_loss=self.config.w_proto_loss,
+            w_pull_loss=self.config.w_pull_loss,
+            w_push_loss=self.config.w_push_loss
+        )
+        out.update({
+            "constrain_losses_dict" : constrain_losses_dict
+        })
+
+        # compute loss_obj
+        loss_obj = get_object_loss(
+            proposal_obj_logits=sparse_proposal_object_logits,
+            bg_proposal_obj_logits=bg_proposal_object_logits,
+            proposal_labels=sparse_proposal_labels,
+            fg_scores=sparse_proposal_fg_scores
+        )
+        out.update({
+            "loss_obj": loss_obj
+        })
+
+        # 6) Object Discovery
         # select Top-Scoring proposals for each class
-        # top_scoring_proposal_indices = sparse_proposal_object_scores.argmax(dim=0)  # [num_classes + 1]
-        # top_scoring_proposal_embeddings = sparse_proposal_embeddings[top_scoring_proposal_indices[:-1]]  # [num_classes, D]
-        obj_scores_fg = sparse_proposal_object_scores[:, :-1]       # [total_num_sparse_proposals, C], drop background logit
-        # 每个 proposal 在其预测类别下的得分
-        roi_scores = obj_scores_fg.gather(
-            1, roi_labels.view(-1, 1)
-        ).squeeze(1)  # [N]
-        top_scoring_proposal_embeddings = torch.zeros(
+        top_scoring_proposal_embeddings_norm = torch.zeros(
             (self.config.num_classes, sparse_proposal_embeddings.shape[1]),
             device=self.config.device
         )
-        for c in range(self.config.num_classes):
-            cls_mask = (roi_labels == c)
+        for c in range(1, self.config.num_classes + 1):
+            cls_mask = (sparse_proposal_labels == c)    # bool mask for proposals of class c, shape [total_num_sparse_proposals]
             if cls_mask.any():
-                cls_scores = roi_scores[cls_mask]  # [Nc]
-                cls_indices = torch.nonzero(cls_mask).squeeze(1)
+                fg_scores = sparse_proposal_fg_scores[cls_mask]  # [num_props_in_cls]
+                indices = torch.nonzero(cls_mask).squeeze(1)    # [num_props_in_cls]
 
-                # 在该类别内选 score 最大的 proposal
-                top_idx_in_cls = cls_indices[cls_scores.argmax()]
-                top_scoring_proposal_embeddings[c] = sparse_proposal_embeddings[top_idx_in_cls]
+                # select Top-Scoring proposal
+                top_idx_in_cls = indices[fg_scores.argmax()]
+                top_scoring_proposal_embeddings_norm[c - 1] = sparse_proposal_embeddings_norm[top_idx_in_cls]
 
         # get threshold for each class
-        thresholds = F.cosine_similarity(top_scoring_proposal_embeddings, prototypes_embeddings, dim=1)  # [num_classes]
-        sims_all = torch.matmul(sparse_proposal_embeddings, prototypes_embeddings.t())  # [total_num_sparse_proposals, num_classes]
+        thresholds = F.cosine_similarity(top_scoring_proposal_embeddings_norm, prototypes_embeddings_norm, dim=1)  # [num_classes]
+        sims_all = torch.matmul(sparse_proposal_embeddings_norm, prototypes_embeddings_norm.t())  # [total_num_sparse_proposals, num_classes]
+        # # for debug
+        # with open("debug_data.txt", "w", encoding="utf-8") as f:
+        #     f.write("Sim for all proposal:\n")
+        #     for i in range(sims_all.shape[0]):
+        #         sim_values = sims_all[i].cpu().detach().numpy().tolist()
+        #         f.write(f"Proposal {i}: label: {sparse_proposal_labels[i]}, " + f", ".join([f"Class {c + 1}: {sim:.4f}" for c, sim in enumerate(sim_values)]) + "\n")
 
         # get seed proposals
-        sim_for_label = sims_all.gather(1, roi_labels.view(-1, 1)).squeeze(1)  # [total_num_sparse_proposals]
-        thr_for_label = thresholds[roi_labels]  # [total_num_sparse_proposals]
+        labels = sparse_proposal_labels.to(dtype=torch.long) - 1    # shift to range [0, num_classes - 1]
+        sim_for_label = sims_all.gather(1, labels.view(-1, 1)).squeeze(1)  # [total_num_sparse_proposals]
+        thr_for_label = thresholds[labels]  # [total_num_sparse_proposals]
         # keep only if its class-specific similarity passes its class threshold
-        keep_mask = sim_for_label > thr_for_label  # [total_num_sparse_proposals] bool
+        keep_mask = sim_for_label > thr_for_label  # [total_num_sparse_proposals], dtype = bool
+
+        with open("debug_data.txt", "w", encoding="utf-8") as f:
+            f.write("Sim per proposal for its assigned class:\n")
+            for i in range(sim_for_label.shape[0]):
+                sim = sim_for_label[i].item()
+                thr = thr_for_label[i].item()
+                keep = keep_mask[i].item()
+                f.write(f"Proposal {i}: Sim: {sim:.4f}, Thr: {thr:.4f}, Keep: {keep}\n")
 
         # keep at least one proposal for per-image
         batch_idx = sparse_proposal_boxes[:, 0].long()  # [N], image index
@@ -1600,43 +1747,34 @@ class Stage2(nn.Module):
 
             # if no proposal kept for this image -> force keep the highest-score proposal
             if not keep_mask[idx_b].any():
-                scores_b = sparse_proposal_object_scores[idx_b, roi_labels[idx_b]]
+                scores_b = sparse_proposal_fg_scores[idx_b]
                 top_idx_in_b = torch.argmax(scores_b).item()
                 keep_mask[idx_b[top_idx_in_b]] = True
 
         keep_indices = torch.where(keep_mask)[0]  # [N_keep]
         seed_proposals: List[Dict] = []
         for i in keep_indices:
-            c = int(roi_labels[i].item())
+            c = int(sparse_proposal_labels[i].item())
             seed_proposals.append({
                 "box": sparse_proposal_boxes[i],  # [5] = (batch_idx, x1, y1, x2, y2)
-                "class_id": c,  # class label
-                "score": sparse_proposal_object_scores[i, c],  # scalar, score of class c
+                "class_id": c,  # class label, range [1, num_classes]
+                "score": sparse_proposal_fg_scores[i],  # scalar, foreground score
                 "logit": sparse_proposal_object_logits[i, c],  # scalar, logit of class c
             })
 
-        # with open("debug_data.txt", "w") as f:
-        #     seed_proposals_per_img = [[] for _ in range(B)]
-        #     for p in seed_proposals:
-        #         b = int(p["box"][0].item())
-        #         seed_proposals_per_img[b].append(p)
-        #     f.write("Seed proposals:\n")
-        #     for b in range(B):
-        #         f.write(f"Image {b}:\n")
-        #         for p in seed_proposals_per_img[b]:
-        #             box = p["box"][1:5].cpu().numpy().tolist()
-        #             score = p["score"].cpu().item()
-        #             class_id = p["class_id"]
-        #             f.write(f"  Box: {box}, Score: {score}, Class ID: {class_id}\n")
-
-        # compute proto loss
-        loss_proto = get_proto_loss(
-            proposal_embeddings=sparse_proposal_embeddings,
-            prototypes_embeddings=prototypes_embeddings,
-            labels=roi_labels,
-            keep_mask=keep_mask,
-            tau=self.config.proto_loss_tau
-        )
+        with open("debug_data.txt", "w") as f:
+            seed_proposals_per_img = [[] for _ in range(B)]
+            for p in seed_proposals:
+                b = int(p["box"][0].item())
+                seed_proposals_per_img[b].append(p)
+            f.write("Seed proposals:\n")
+            for b in range(B):
+                f.write(f"Image {b}:\n")
+                for p in seed_proposals_per_img[b]:
+                    box = p["box"][1:5].cpu().numpy().tolist()
+                    score = p["score"].cpu().item()
+                    class_id = p["class_id"]
+                    f.write(f"  Box: {box}, Score: {score}, Class ID: {class_id}\n")
 
         # # get aug seed proposals
         # Himg, Wimg = imgs.shape[-2], imgs.shape[-1]
@@ -1677,18 +1815,13 @@ class Stage2(nn.Module):
         #             class_id = p["class_id"]
         #             f.write(f"  Box: {box}, Score: {score}, Class ID: {class_id}\n")
 
-        # 5) get pseudo labels for RPN training
+        # 7) get pseudo labels for RPN training
         # pseudo_labels: list length B, each element:
         #                 {
         #                     "boxes": Tensor [num_boxes, 4] in image coords (xyxy),
         #                     "scores": Tensor [num_boxes],
         #                     "labels": Tensor [num_boxes] in range [1, C] (0 reserved for background),
         #                 }
-        # pseudo_labels = self._build_rpn_pseudo_labels(
-        #     # aug_seed_proposals=aug_seed_proposals,
-        #     proposals=seed_proposals,
-        #     batch_size=B
-        # )
         image_sizes = [(imgs.shape[-2], imgs.shape[-1]) for _ in range(B)]  # [(Himg,Wimg),...]
         pseudo_labels = self._build_rpn_pseudo_labels(
             proposals=seed_proposals,
@@ -1745,6 +1878,9 @@ class Stage2(nn.Module):
         #                    }
         proposals, rpn_losses_dict = self.rpn(img_list, features, rpn_targets)
 
+        out.update({
+            "rpn_losses_dict": rpn_losses_dict
+        })
 
 
         # # -----R-CNN Head-----
@@ -1851,6 +1987,10 @@ class Stage2(nn.Module):
         # evaluate pseudo labels
         pseudo_labels_mAP = self._evaluate_pseudo_labels(pseudo_labels, gt_targets)
 
+        out.update({
+            "pseudo_labels_mAP" : pseudo_labels_mAP
+        })
+
         # visualize for debug
         visualize_stage2_debug_batch(
             imgs=imgs,  # [B,3,H,W]
@@ -1865,66 +2005,7 @@ class Stage2(nn.Module):
             step_tag=f"e{epoch}_it{it}",
         )
 
-        # return loss_ccam, loss_proto, match_losses_dict, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, final_detections
-        # return loss_ccam, loss_proto, rpn_losses_dict, det_losses_dict, pseudo_labels_mAP, detections
-        return loss_ccam, loss_proto, rpn_losses_dict, pseudo_labels_mAP
-
-    # def _forward_inference(
-    #     self,
-    #     imgs: torch.Tensor,  # input images, [B, C, H, W]
-    # ) -> List[Dict[str, torch.Tensor]]:
-    #     """
-    #     :return:
-    #     - detections: List[Dict[str, torch.Tensor]], length B, each element:
-    #                         {
-    #                             "boxes": Tensor [Nd, 4] in image coords (xyxy),
-    #                             "labels": Tensor [Nd] in [1..C] (0 reserved for background),
-    #                             "scores": Tensor [Nd],
-    #                         }
-    #     """
-    #     # -----get high-level feature maps-----
-    #     self.encoder[-1] = nn.Identity()
-    #     high_feature_maps = self.encoder(imgs)  # [B, C_h, H_h, W_h]
-    #
-    #     # -----RPN-----
-    #     self.rpn.eval()
-    #     B, _, Himg, Wimg = imgs.shape
-    #     device = self.config.device
-    #     # build ImageList
-    #     image_sizes = [(Himg, Wimg) for _ in range(B)]
-    #     dummy_images = torch.zeros((B, 3, 1, 1), device=device)
-    #     img_list = ImageList(tensors=dummy_images, image_sizes=image_sizes)
-    #     # build features dict for RPN
-    #     features = {"0": high_feature_maps}
-    #     # get proposals
-    #     proposals, _ = self.rpn(img_list, features, None)
-    #
-    #     # -----R-CNN Head-----
-    #     self.roi_heads.eval()
-    #     detections, _ = self.roi_heads(
-    #         features={"0": high_feature_maps},
-    #         proposals=proposals,
-    #         image_shapes=image_sizes,
-    #         targets=None,
-    #     )
-    #
-    #     return detections
-    #
-    # def forward(
-    #     self,
-    #     mode: str,  # "train" or "inference"
-    #     imgs: torch.Tensor,  # input images, [B, C, H, W]
-    #     wboxes: torch.Tensor = None,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
-    #     wb_labels : torch.Tensor = None,     # class label for weak boxes, [R, num_classes]
-    #     gt_targets : List[Dict[str, torch.Tensor]] = None,   # ground-truth targets for evaluate pseudo labels
-    #     vis_dir : str = None,   # for debug : visualization output dir
-    #     epoch : int = 0,    # for debug : current epoch
-    #     it : int = 0    # for debug : current iteration
-    # ):
-    #     if mode == "train":
-    #         return self._forward_train(imgs, wboxes, wb_labels, gt_targets, vis_dir, epoch, it)
-    #     elif mode == "inference":
-    #         return self._forward_inference(imgs)
+        return out
 
 # For backbone verification
 class LinearProb(nn.Module):

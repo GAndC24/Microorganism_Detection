@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import v2 as T
 from datasets import UrinarySedimentDataset, detection_collate_fn
 from models import Stage2Config, build_Stage2_model
-from utils import Stage2TrainerConfig, build_stage2_trainer,  vgg_layer_out_size_ratio_maps, Logger
+from utils import Stage2TrainerConfig, build_stage2_trainer, vgg_layer_out_size_ratio_maps, Logger
 
 def _load_yaml(config_path : str)-> Dict[str, Any]:
     config_path = Path(config_path)
@@ -119,6 +119,7 @@ def _parse_to_list_of_float(
 def main()-> None:
     # 设置环境变量
     os.environ["OMP_NUM_THREADS"] = "1"
+    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
     args = _get_args()
 
@@ -140,22 +141,36 @@ def main()-> None:
     data_config = config["data"]
     data_root = data_config["data_root"]
     batch_size = data_config["batch_size"]
+    img_size = data_config["img_size"]
+    img_size = (img_size, img_size)
+    num_classes = data_config["num_classes"]
     print(
         "-----Data Configurations:-----\n"
         f"  Data Root: {data_root}\n"
         f"  Batch Size: {batch_size}\n"
+        f"  Image Size: {img_size}\n"
+        f"  Num Classes: {num_classes}\n"
     )
 
     # stage 2 model configurations
     stage2_model_config = config["stage2_model_config"]
-    img_size = stage2_model_config["img_size"]
-    img_size = (img_size, img_size)
-    num_classes = stage2_model_config["num_classes"]
+
     in_c = stage2_model_config["in_c"]
     freeze_backbone = bool(stage2_model_config["freeze_backbone"])
+
+    w_proto_loss = stage2_model_config["w_proto_loss"]
+    w_pull_loss = stage2_model_config["w_pull_loss"]
+    w_push_loss = stage2_model_config["w_push_loss"]
+
+    w_prototype_sim = stage2_model_config["w_prototype_sim"]
+    w_ccam_score = stage2_model_config["w_ccam_score"]
+    w_obj_score = stage2_model_config["w_obj_score"]
+
     keep_iou_thr = stage2_model_config["keep_iou_thr"]
+
     hidden_dim = stage2_model_config["hidden_dim"]
     embed_dim = stage2_model_config["embed_dim"]
+
     rpn_anchor_sizes = tuple(_parse_to_list_of_int(stage2_model_config["rpn_anchor_sizes"]))
     rpn_anchor_aspect_ratios = tuple(_parse_to_list_of_float(stage2_model_config["rpn_anchor_aspect_ratios"]))
     rpn_fg_iou_thresh = stage2_model_config["rpn_fg_iou_thresh"]
@@ -172,39 +187,40 @@ def main()-> None:
         "testing" : rpn_post_nms_top_n[1]
     }
     rpn_nms_thresh = stage2_model_config["rpn_nms_thresh"]
+
     ccam_threshold = stage2_model_config["ccam_threshold"]
-    proto_loss_tau = stage2_model_config["proto_loss_tau"]
-    cost_class = stage2_model_config["cost_class"]
-    cost_bbox = stage2_model_config["cost_bbox"]
-    cost_giou = stage2_model_config["cost_giou"]
+
+    # cost_class = stage2_model_config["cost_class"]
+    # cost_bbox = stage2_model_config["cost_bbox"]
+    # cost_giou = stage2_model_config["cost_giou"]
+
     rpn_pseudo_nms_thr = stage2_model_config["rpn_pseudo_nms_thr"]
     rpn_pseudo_topk = stage2_model_config["rpn_pseudo_topk"]
-    match_focal_alpha = stage2_model_config["match_focal_alpha"]
-    match_focal_gamma = stage2_model_config["match_focal_gamma"]
-    lambda_match_cls = stage2_model_config["lambda_match_cls"]
-    lambda_match_l1 = stage2_model_config["lambda_match_l1"]
-    lambda_match_giou = stage2_model_config["lambda_match_giou"]
-    det_fg_iou_thresh = stage2_model_config["det_fg_iou_thresh"]
-    det_bg_iou_thresh = stage2_model_config["det_bg_iou_thresh"]
-    det_batch_size_per_image = stage2_model_config["det_batch_size_per_image"]
-    det_positive_fraction = stage2_model_config["det_positive_fraction"]
-    det_score_thresh = stage2_model_config["det_score_thresh"]
-    det_nms_thresh = stage2_model_config["det_nms_thresh"]
-    detections_per_img = stage2_model_config["detections_per_img"]
+
+    # match_focal_alpha = stage2_model_config["match_focal_alpha"]
+    # match_focal_gamma = stage2_model_config["match_focal_gamma"]
+    # lambda_match_cls = stage2_model_config["lambda_match_cls"]
+    # lambda_match_l1 = stage2_model_config["lambda_match_l1"]
+    # lambda_match_giou = stage2_model_config["lambda_match_giou"]
+
     roi_out_size_h2wb = stage2_model_config["roi_out_size_h2wb"]
     roi_out_size_h2wb = (roi_out_size_h2wb, roi_out_size_h2wb)
-    # roi_out_size_wb2p = stage2_model_config["roi_out_size_wb2p"]
-    # roi_out_size_wb2p = (roi_out_size_wb2p, roi_out_size_wb2p)
+
     roi_out_size_h2p = stage2_model_config["roi_out_size_h2p"]
     roi_out_size_h2p = (roi_out_size_h2p, roi_out_size_h2p)
+
     backbone_weights_path = stage2_model_config["backbone_weights_path"]
     dataset_mps_path = stage2_model_config["dataset_mps_path"]
     print(
         "-----Stage 2 Model Configurations-----\n"
-        f"  Image Size: {img_size}\n"
-        f"  Num Classes: {num_classes}\n"
         f"  Input Channels: {in_c}\n"
         f"  Freeze Backbone: {freeze_backbone}\n"
+        f"  Weight Proto Loss: {w_proto_loss}\n"
+        f"  Weight Pull Loss: {w_pull_loss}\n"
+        f"  Weight Push Loss: {w_push_loss}\n"
+        f"  Weight Prototype Similarity: {w_prototype_sim}\n"
+        f"  Weight CCAM Score: {w_ccam_score}\n"
+        f"  Weight Obj Score: {w_obj_score}\n"
         f"  Keep IOU Thresh: {keep_iou_thr}\n"
         f"  Hidden Dimension: {hidden_dim}\n"
         f"  Embedding Dimension: {embed_dim}\n"
@@ -217,26 +233,17 @@ def main()-> None:
         f"  RPN Post NMS Top N: {rpn_post_nms_top_n}\n"
         f"  RPN NMS Thresh: {rpn_nms_thresh}\n"
         f"  CCAM Threshold: {ccam_threshold}\n"
-        f"  Proto Loss Tau: {proto_loss_tau}\n"
-        f"  Cost Class: {cost_class}\n"
-        f"  Cost BBox: {cost_bbox}\n"
-        f"  Cost GIOU: {cost_giou}\n"
+        # f"  Cost Class: {cost_class}\n"
+        # f"  Cost BBox: {cost_bbox}\n"
+        # f"  Cost GIOU: {cost_giou}\n"
         f"  RPN Pseudo NMS Thresh: {rpn_pseudo_nms_thr}\n"
         f"  RPN Pseudo TopK: {rpn_pseudo_topk}\n"
-        f"  Match Focal Alpha: {match_focal_alpha}\n"
-        f"  Match Focal Gamma: {match_focal_gamma}\n"
-        f"  Lambda Match Cls: {lambda_match_cls}\n"
-        f"  Lambda Match L1: {lambda_match_l1}\n"
-        f"  Lambda Match GIOU: {lambda_match_giou}\n"
-        f"  Det FG IOU Thresh: {det_fg_iou_thresh}\n"
-        f"  Det BG IOU Thresh: {det_bg_iou_thresh}\n"
-        f"  Det Batch Size Per Image: {det_batch_size_per_image}\n"
-        f"  Det Positive Fraction: {det_positive_fraction}\n"
-        f"  Det Score Thresh: {det_score_thresh}\n"
-        f"  Det NMS Thresh: {det_nms_thresh}\n"
-        f"  Detections Per Image: {detections_per_img}\n"
+        # f"  Match Focal Alpha: {match_focal_alpha}\n"
+        # f"  Match Focal Gamma: {match_focal_gamma}\n"
+        # f"  Lambda Match Cls: {lambda_match_cls}\n"
+        # f"  Lambda Match L1: {lambda_match_l1}\n"
+        # f"  Lambda Match GIOU: {lambda_match_giou}\n"
         f"  ROI Out Size H2WB: {roi_out_size_h2wb}\n"
-        # f"  ROI Out Size WB2P: {roi_out_size_wb2p}\n"
         f"  ROI Out Size H2P: {roi_out_size_h2p}\n"
         f"  Backbone Weights Path: {backbone_weights_path}\n"
         f"  Dataset MPs Path: {dataset_mps_path}\n"
@@ -254,10 +261,10 @@ def main()-> None:
     continue_train = bool(stage2_trainer_config["continue_train"])
     checkpoint_path = stage2_trainer_config["checkpoint_path"]
     w_ccam_loss = stage2_trainer_config["w_ccam_loss"]
+    w_constrain_loss = stage2_trainer_config["w_constrain_loss"]
     w_rpn_loss = stage2_trainer_config["w_rpn_loss"]
-    w_proto_loss = stage2_trainer_config["w_proto_loss"]
-    w_match_loss = stage2_trainer_config["w_match_loss"]
-    w_det_loss = stage2_trainer_config["w_det_loss"]
+    w_obj_loss = stage2_trainer_config["w_obj_loss"]
+    ema_alpha = stage2_trainer_config["ema_alpha"]
     print(
         "-----Stage 2 Trainer Configurations-----\n"
         f"  Epochs: {epochs}\n"
@@ -270,10 +277,11 @@ def main()-> None:
         f"  Continue Train: {continue_train}\n"
         f"  Checkpoint Path: {checkpoint_path}\n"
         f"  Weight CCAM Loss: {w_ccam_loss}\n"
+        f"  Weight Constrain Loss: {w_constrain_loss}\n"
         f"  Weight RPN Loss: {w_rpn_loss}\n"
-        f"  Weight Proto Loss: {w_proto_loss}\n"
-        f"  Weight Match Loss: {w_match_loss}\n"
-        f"  Weight Det Loss: {w_det_loss}\n"
+        f"  Weight Obj Loss: {w_obj_loss}\n"
+        f"  EMA Alpha: {ema_alpha}\n"
+        # f"  Weight Match Loss: {w_match_loss}\n"
     )
 
     # Initialize Dataset
@@ -300,13 +308,18 @@ def main()-> None:
 
     # Initialize Model
     spatial_scale_h2wb = spatial_scale_h2p = vgg_layer_out_size_ratio_maps[29]
-    # spatial_scale_wb2p = 1.0
     stage2_config = Stage2Config(
         device=device,
         img_size=img_size,
         num_classes=num_classes,
         in_c=in_c,
         freeze_backbone=freeze_backbone,
+        w_proto_loss=w_proto_loss,
+        w_pull_loss=w_pull_loss,
+        w_push_loss=w_push_loss,
+        w_prototype_sim=w_prototype_sim,
+        w_ccam_score=w_ccam_score,
+        w_obj_score=w_obj_score,
         keep_iou_thr=keep_iou_thr,
         hidden_dim=hidden_dim,
         embed_dim=embed_dim,
@@ -319,28 +332,18 @@ def main()-> None:
         rpn_post_nms_top_n=rpn_post_nms_top_n,
         rpn_nms_thresh=rpn_nms_thresh,
         ccam_threshold=ccam_threshold,
-        proto_loss_tau=proto_loss_tau,
-        cost_class=cost_class,
-        cost_bbox=cost_bbox,
-        cost_giou=cost_giou,
+        # cost_class=cost_class,
+        # cost_bbox=cost_bbox,
+        # cost_giou=cost_giou,
         rpn_pseudo_nms_thr=rpn_pseudo_nms_thr,
         rpn_pseudo_topk=rpn_pseudo_topk,
-        match_focal_alpha=match_focal_alpha,
-        match_focal_gamma=match_focal_gamma,
-        lambda_match_cls=lambda_match_cls,
-        lambda_match_l1=lambda_match_l1,
-        lambda_match_giou=lambda_match_giou,
-        det_fg_iou_thresh=det_fg_iou_thresh,
-        det_bg_iou_thresh=det_bg_iou_thresh,
-        det_batch_size_per_image=det_batch_size_per_image,
-        det_positive_fraction=det_positive_fraction,
-        det_score_thresh=det_score_thresh,
-        det_nms_thresh=det_nms_thresh,
-        detections_per_img=detections_per_img,
+        # match_focal_alpha=match_focal_alpha,
+        # match_focal_gamma=match_focal_gamma,
+        # lambda_match_cls=lambda_match_cls,
+        # lambda_match_l1=lambda_match_l1,
+        # lambda_match_giou=lambda_match_giou,
         roi_out_size_h2wb=roi_out_size_h2wb,
         spatial_scale_h2wb = spatial_scale_h2wb,
-        # roi_out_size_wb2p=roi_out_size_wb2p,
-        # spatial_scale_wb2p=spatial_scale_wb2p,
         roi_out_size_h2p=roi_out_size_h2p,
         spatial_scale_h2p=spatial_scale_h2p
     )
@@ -364,13 +367,14 @@ def main()-> None:
         checkpoints_save_path=checkpoints_save_path,
         model_save_path=model_save_path,
         logger=logger,
-        continue_train=continue_train,
-        checkpoint_path=checkpoint_path,
         w_ccam_loss=w_ccam_loss,
+        w_constrain_loss=w_constrain_loss,
         w_rpn_loss=w_rpn_loss,
-        w_proto_loss=w_proto_loss,
-        w_match_loss=w_match_loss,
-        w_det_loss=w_det_loss
+        w_obj_loss=w_obj_loss,
+        # w_match_loss=w_match_loss,
+        ema_alpha=ema_alpha,
+        continue_train = continue_train,
+        checkpoint_path = checkpoint_path,
     )
     trainer = build_stage2_trainer(model, train_loader, val_loader, stage2_trainer_config)
 
