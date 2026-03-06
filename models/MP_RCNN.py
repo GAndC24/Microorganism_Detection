@@ -645,7 +645,7 @@ class Stage2(nn.Module):
     ) -> torch.Tensor:
         """
         Map image-space boxes (xyxy) to ROI-local CCAM pixel coords (xyxy in [0..Wc-1]/[0..Hc-1]).
-        Return int64 boxes [N,4] in CCAM coords.
+        :return: cam_boxes: [N,4] in RoI coords
         """
         device = boxes_img_xyxy.device
         boxes = boxes_img_xyxy.to(device=device, dtype=torch.float32)
@@ -1537,40 +1537,106 @@ class Stage2(nn.Module):
 
         # 3) get CCAM foreground scores of sparse proposals
         R, _, Hc, Wc = ccam.shape
-        sparse_props_ccam_scores_per_img = [ [] for _ in range(B)]
+        sparse_props_ccam_scores_per_img: List[Optional[torch.Tensor]] = [None for _ in range(B)]
 
         # invert ccam
         # ccam = 1 - ccam
 
-        for i in range(R):
-            b = int(wboxes[i, 0].item())        # wbox batch_idx
-            wbox_xyxy = wboxes[i, 1:5]    # [4], image coords
-            props_xyxy = sparse_proposals_list[b]    # [num_props, 4], image coords
-
-            ccam_boxes = self._map_boxes_image_to_roi_xyxy(
-                boxes_img_xyxy=props_xyxy,
-                wbox_xyxy=wbox_xyxy,
-                cam_hw=(Hc, Wc),
-            )       # [num_props, 4], roi coords
-
-            ccam_i = ccam[i, 0]    # [Hc, Wc]
-
-            fg_scores, bg_scores = self._ccam_fg_bg_score_for_boxes(
-                ccam_i=ccam_i,
-                cam_boxes_xyxy=ccam_boxes,
-            )       # [num_props]
-
-            scores = fg_scores - bg_scores  # [num_props]
-            if len(sparse_props_ccam_scores_per_img[b]) == 0:
-                sparse_props_ccam_scores_per_img[b].append(scores)
-
-        sparse_props_ccam_scores_list = []  # len=B, each Tensor is [num_props]
         for b in range(B):
-            sparse_props_ccam_scores_list.append(
-                torch.cat(sparse_props_ccam_scores_per_img[b], dim=0)
+            wboxes_in_img : Dict[int, torch.Tensor] = {}  # {idx : wbox_xyxy(shape [4], image coords)}
+            for i in range(R):
+                if int(wboxes[i, 0].item()) == b:
+                    wboxes_in_img[i] = wboxes[i, 1:5]
+
+            props_xyxy = sparse_proposals_list[b]  # [num_props, 4], image coords
+            num_props = props_xyxy.shape[0]
+
+            # match sparse proposal with wbox
+            wbox_global_indices = list(wboxes_in_img.keys())
+            wbs = torch.stack([wboxes_in_img[idx] for idx in wbox_global_indices], dim=0)  # [num_wbs, 4]
+            inside = (
+                    (props_xyxy[:, None, 0] >= wbs[None, :, 0]) &
+                    (props_xyxy[:, None, 1] >= wbs[None, :, 1]) &
+                    (props_xyxy[:, None, 2] <= wbs[None, :, 2]) &
+                    (props_xyxy[:, None, 3] <= wbs[None, :, 3])
+            )   # [num_props, num_wbs]
+            ious = box_iou(props_xyxy, wbs)     # [num_props, num_wbs]
+            big_neg = torch.finfo(ious.dtype).min
+            masked_ious = torch.where(inside, ious, torch.tensor(big_neg, device=ious.device, dtype=ious.dtype))
+            # if one sparse proposal match multiple wboxes, pick the one with highest IoU among inside ones
+            wbox_best_inside = torch.argmax(masked_ious, dim=1)  # [num_props]
+            # if one sparse proposal not inside any wbox, pick the wbox with highest IoU
+            wbox_best_iou = torch.argmax(ious, dim=1)  # [num_props]
+            use_inside = inside.any(dim=1)  # [num_props]
+            chosen_local_widx = torch.where(
+                use_inside,
+                wbox_best_inside,
+                wbox_best_iou
+            )  # [num_props]
+
+            # initialize scores in this img
+            img_scores = torch.zeros(
+                (num_props,), device=self.config.device, dtype=torch.float32
             )
 
+            # for each sparse proposal, get ccam fg score
+            for local_j, global_widx in enumerate(wbox_global_indices):
+                prop_mask = (chosen_local_widx == local_j)  # [num_props]
+                props_for_this_wbox = props_xyxy[prop_mask]  # [num_assigned, 4]
+                wbox_xyxy = wboxes[global_widx, 1:5]  # [4], image coords
+                ccam_i = ccam[global_widx, 0]  # [Hc, Wc]
+                # image coords -> roi coords in this weak box's CCAM
+                ccam_boxes = self._map_boxes_image_to_roi_xyxy(
+                    boxes_img_xyxy=props_for_this_wbox,
+                    wbox_xyxy=wbox_xyxy,
+                    cam_hw=(Hc, Wc),
+                )  # [num_assigned, 4], roi coords
+                fg_scores, bg_scores = self._ccam_fg_bg_score_for_boxes(
+                    ccam_i=ccam_i,
+                    cam_boxes_xyxy=ccam_boxes,
+                )  # [num_assigned], [num_assigned]
+
+                scores = fg_scores - bg_scores  # [num_assigned]
+                img_scores[prop_mask] = scores
+
+            sparse_props_ccam_scores_per_img[b] = img_scores
+
+        sparse_props_ccam_scores_list = []
+        for b in range(B):
+            sparse_props_ccam_scores_list.append(sparse_props_ccam_scores_per_img[b])
+
         sparse_props_ccam_scores = torch.cat(sparse_props_ccam_scores_list, dim=0)  # [total_num_sparse_proposals]
+
+        # for i in range(R):
+        #     b = int(wboxes[i, 0].item())        # wbox batch_idx
+        #     wbox_xyxy = wboxes[i, 1:5]    # [4], image coords
+        #     props_xyxy = sparse_proposals_list[b]    # [num_props, 4], image coords
+        #
+        #     ccam_boxes = self._map_boxes_image_to_roi_xyxy(
+        #         boxes_img_xyxy=props_xyxy,
+        #         wbox_xyxy=wbox_xyxy,
+        #         cam_hw=(Hc, Wc),
+        #     )       # [num_props, 4], roi coords
+        #
+        #     ccam_i = ccam[i, 0]    # [Hc, Wc]
+        #
+        #     fg_scores, bg_scores = self._ccam_fg_bg_score_for_boxes(
+        #         ccam_i=ccam_i,
+        #         cam_boxes_xyxy=ccam_boxes,
+        #     )       # [num_props]
+        #
+        #     scores = fg_scores - bg_scores  # [num_props]
+        #     if len(sparse_props_ccam_scores_per_img[b]) == 0:
+        #         sparse_props_ccam_scores_per_img[b].append(scores)
+        #
+        # sparse_props_ccam_scores_list = []  # len=B, each Tensor is [num_props]
+        # for b in range(B):
+        #     sparse_props_ccam_scores_list.append(
+        #         torch.cat(sparse_props_ccam_scores_per_img[b], dim=0)
+        #     )
+        #
+        # sparse_props_ccam_scores = torch.cat(sparse_props_ccam_scores_list, dim=0)  # [total_num_sparse_proposals]
+
         # # for debug
         # with open("debug_data.txt", 'w') as f:
         #     for score in sparse_props_ccam_scores.cpu().tolist():
@@ -1762,19 +1828,19 @@ class Stage2(nn.Module):
                 "logit": sparse_proposal_object_logits[i, c],  # scalar, logit of class c
             })
 
-        with open("debug_data.txt", "w") as f:
-            seed_proposals_per_img = [[] for _ in range(B)]
-            for p in seed_proposals:
-                b = int(p["box"][0].item())
-                seed_proposals_per_img[b].append(p)
-            f.write("Seed proposals:\n")
-            for b in range(B):
-                f.write(f"Image {b}:\n")
-                for p in seed_proposals_per_img[b]:
-                    box = p["box"][1:5].cpu().numpy().tolist()
-                    score = p["score"].cpu().item()
-                    class_id = p["class_id"]
-                    f.write(f"  Box: {box}, Score: {score}, Class ID: {class_id}\n")
+        # with open("debug_data.txt", "w") as f:
+        #     seed_proposals_per_img = [[] for _ in range(B)]
+        #     for p in seed_proposals:
+        #         b = int(p["box"][0].item())
+        #         seed_proposals_per_img[b].append(p)
+        #     f.write("Seed proposals:\n")
+        #     for b in range(B):
+        #         f.write(f"Image {b}:\n")
+        #         for p in seed_proposals_per_img[b]:
+        #             box = p["box"][1:5].cpu().numpy().tolist()
+        #             score = p["score"].cpu().item()
+        #             class_id = p["class_id"]
+        #             f.write(f"  Box: {box}, Score: {score}, Class ID: {class_id}\n")
 
         # # get aug seed proposals
         # Himg, Wimg = imgs.shape[-2], imgs.shape[-1]
