@@ -965,7 +965,7 @@ class Stage2(nn.Module):
                 continue
 
             xyxy = box5[1:5].view(1, 4)  # [1, 4]
-            c = int(p["class_id"]) + 1  # shift to [1..C]
+            c = int(p["class_id"])
             s = p["score"]
 
             boxes_list[b].append(xyxy)
@@ -1084,35 +1084,56 @@ class Stage2(nn.Module):
     def _refine_rpn_pseudo_labels(
         self,
         pseudo_targets: List[Dict[str, torch.Tensor]],
-        topk: int = 50,
+        keep_ratio: float = 0.3,
         mode: Literal["per_class", "global"] = "per_class",
         score_thr: float = 0.0,
         nms_iou_thr: float = 0.5,
         class_agnostic_nms: bool = True,
         keep_empty: bool = True,  # True: 允许某张图最终为空；False: 至少保留1个最高分
+        min_keep: int = 1,
+        max_keep: Optional[int] = None,
     ) -> List[Dict[str, torch.Tensor]]:
         """
-        Top-K + NMS filtering for pseudo labels.
+        Ratio-based filtering + NMS for pseudo labels.
+
+        相比固定 top-k 的“硬截断”，这里改为“按候选数量保留一定比例”：
+          k = clamp(round(N * keep_ratio), min_keep, max_keep)
+        这样当 proposal 多时保留更多样本，proposal 少时不会被过度裁剪。
 
         Args:
             pseudo_targets: list of dicts, each dict has:
                 - "boxes": FloatTensor [N,4] in xyxy (image coords)
                 - "labels": LongTensor [N]
                 - "scores": FloatTensor [N]
-            topk: keep top-k (per class or global).
+            keep_ratio: 保留比例，取值建议 (0, 1]。例如 0.3 表示保留 30%。
             mode:
-                - "per_class": do top-k for each class separately, then merge.
-                - "global": do top-k over all boxes.
-            score_thr: drop boxes whose score < score_thr before top-k/nms.
-            nms_iou_thr: IoU threshold for NMS.
-            class_agnostic_nms: if True, NMS ignores class labels.
-            num_classes: optional, not strictly required.
-            keep_empty: if False and final is empty, keep 1 highest-score box from original (after score_thr if possible).
+                - "per_class": 每类按比例独立筛选后再合并。
+                - "global": 全部候选一起按比例筛选。
+            score_thr: 在比例筛选前先过滤低分框。
+            nms_iou_thr: NMS IoU 阈值。
+            class_agnostic_nms: True 为类无关 NMS；False 为按类 NMS。
+            keep_empty: False 时若最终为空，至少保留 1 个最高分框。
+            min_keep: 每个筛选组（global 或 per-class）最少保留数量。
+            max_keep: 每个筛选组（global 或 per-class）最多保留数量，None 表示不设上限。
 
         Returns:
             filtered_targets: same format as input, per image.
         """
         out: List[Dict[str, torch.Tensor]] = []
+
+        if keep_ratio <= 0:
+            raise ValueError(f"keep_ratio must be > 0, got {keep_ratio}")
+
+        def _calc_k(n: int) -> int:
+            """根据当前候选数 n 计算应保留的数量 k（比例 + 上下界）。"""
+            if n <= 0:
+                return 0
+            k = int(round(n * float(keep_ratio)))
+            k = max(int(min_keep), k)
+            if max_keep is not None:
+                k = min(k, int(max_keep))
+            k = min(k, n)
+            return k
 
         for t in pseudo_targets:
             boxes = t.get("boxes", None)
@@ -1154,9 +1175,9 @@ class Stage2(nn.Module):
                     })
                 continue
 
-            # 2) Top-K
+            # 2) Ratio-based selection（替代固定 top-k）
             if mode == "global":
-                k = min(int(topk), boxes1.shape[0])
+                k = _calc_k(boxes1.shape[0])
                 if k <= 0:
                     boxes2, labels2, scores2 = boxes1[:0], labels1[:0], scores1[:0]
                 else:
@@ -1171,7 +1192,7 @@ class Stage2(nn.Module):
                     idx_c = torch.nonzero(m, as_tuple=False).squeeze(1)
                     if idx_c.numel() == 0:
                         continue
-                    k = min(int(topk), idx_c.numel())
+                    k = _calc_k(idx_c.numel())
                     if k <= 0:
                         continue
                     scores_c = scores1[idx_c]
@@ -1607,36 +1628,6 @@ class Stage2(nn.Module):
 
         sparse_props_ccam_scores = torch.cat(sparse_props_ccam_scores_list, dim=0)  # [total_num_sparse_proposals]
 
-        # for i in range(R):
-        #     b = int(wboxes[i, 0].item())        # wbox batch_idx
-        #     wbox_xyxy = wboxes[i, 1:5]    # [4], image coords
-        #     props_xyxy = sparse_proposals_list[b]    # [num_props, 4], image coords
-        #
-        #     ccam_boxes = self._map_boxes_image_to_roi_xyxy(
-        #         boxes_img_xyxy=props_xyxy,
-        #         wbox_xyxy=wbox_xyxy,
-        #         cam_hw=(Hc, Wc),
-        #     )       # [num_props, 4], roi coords
-        #
-        #     ccam_i = ccam[i, 0]    # [Hc, Wc]
-        #
-        #     fg_scores, bg_scores = self._ccam_fg_bg_score_for_boxes(
-        #         ccam_i=ccam_i,
-        #         cam_boxes_xyxy=ccam_boxes,
-        #     )       # [num_props]
-        #
-        #     scores = fg_scores - bg_scores  # [num_props]
-        #     if len(sparse_props_ccam_scores_per_img[b]) == 0:
-        #         sparse_props_ccam_scores_per_img[b].append(scores)
-        #
-        # sparse_props_ccam_scores_list = []  # len=B, each Tensor is [num_props]
-        # for b in range(B):
-        #     sparse_props_ccam_scores_list.append(
-        #         torch.cat(sparse_props_ccam_scores_per_img[b], dim=0)
-        #     )
-        #
-        # sparse_props_ccam_scores = torch.cat(sparse_props_ccam_scores_list, dim=0)  # [total_num_sparse_proposals]
-
         # # for debug
         # with open("debug_data.txt", 'w') as f:
         #     for score in sparse_props_ccam_scores.cpu().tolist():
@@ -1798,13 +1789,13 @@ class Stage2(nn.Module):
         # keep only if its class-specific similarity passes its class threshold
         keep_mask = sim_for_label > thr_for_label  # [total_num_sparse_proposals], dtype = bool
 
-        with open("debug_data.txt", "w", encoding="utf-8") as f:
-            f.write("Sim per proposal for its assigned class:\n")
-            for i in range(sim_for_label.shape[0]):
-                sim = sim_for_label[i].item()
-                thr = thr_for_label[i].item()
-                keep = keep_mask[i].item()
-                f.write(f"Proposal {i}: Sim: {sim:.4f}, Thr: {thr:.4f}, Keep: {keep}\n")
+        # with open("debug_data.txt", "w", encoding="utf-8") as f:
+        #     f.write("Sim per proposal for its assigned class:\n")
+        #     for i in range(sim_for_label.shape[0]):
+        #         sim = sim_for_label[i].item()
+        #         thr = thr_for_label[i].item()
+        #         keep = keep_mask[i].item()
+        #         f.write(f"Proposal {i}: Sim: {sim:.4f}, Thr: {thr:.4f}, Keep: {keep}\n")
 
         # keep at least one proposal for per-image
         batch_idx = sparse_proposal_boxes[:, 0].long()  # [N], image index
@@ -1889,6 +1880,12 @@ class Stage2(nn.Module):
         #                     "labels": Tensor [num_boxes] in range [1, C] (0 reserved for background),
         #                 }
         image_sizes = [(imgs.shape[-2], imgs.shape[-1]) for _ in range(B)]  # [(Himg,Wimg),...]
+        # pseudo_labels: list length B, each:
+        #               {
+        #                   "boxes":  FloatTensor [Nb,4] in image coords (xyxy),
+        #                   "scores": FloatTensor [Nb],
+        #                   "labels": LongTensor  [Nb] in [1..C]  (0 reserved for background)
+        #               }
         pseudo_labels = self._build_rpn_pseudo_labels(
             proposals=seed_proposals,
             batch_size=B,
@@ -1897,14 +1894,24 @@ class Stage2(nn.Module):
             keep_empty=False,
         )
         pseudo_labels = self._refine_rpn_pseudo_labels(
-            pseudo_labels,
-            topk=10,
+            pseudo_targets=pseudo_labels,
+            keep_ratio=0.3,
             mode="per_class",
             score_thr=0.05,
             nms_iou_thr=0.5,
             class_agnostic_nms=False,
-            keep_empty=False,
+            keep_empty=True,
         )
+
+        with open("debug_data.txt", "a") as f:
+            f.write("Pseudo Labels:\n")
+            for b in range(B):
+                f.write(f"Image {b}:\n")
+                boxes = pseudo_labels[b]["boxes"].cpu().numpy().tolist()
+                scores = pseudo_labels[b]["scores"].cpu()
+                labels = pseudo_labels[b]["labels"].cpu()
+                for box, score, label in zip(boxes, scores, labels):
+                    f.write(f"  Box: {box}, Score: {score.item()}, Label: {label.item()}\n")
 
         # -----get proposals-----
         self.rpn.train()
