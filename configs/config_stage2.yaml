@@ -30,8 +30,8 @@ stage2_model_config:
   rpn_fg_iou_thresh: 0.6  # [0.5, 0.7]
   rpn_bg_iou_thresh: 0.3  # [0.2, 0.3]
   rpn_batch_size_per_image: 256  # [128, 256]
-  rpn_pre_nms_top_n: 4000, 2000  # train: [2000, 6000], test: [1000, 3000]
-  rpn_post_nms_top_n: 3000, 1000 # train: [2000, 4000], test: [1000, 2000]
+  rpn_pre_nms_top_n: 6000, 2000  # train: [2000, 6000], test: [1000, 3000]
+  rpn_post_nms_top_n: 4000, 1000 # train: [2000, 4000], test: [1000, 2000]
   rpn_nms_thresh: 0.8  # [0.7, 0.9]
   # for CCAM
   ccam_threshold: 0.5

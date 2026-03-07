@@ -1,4 +1,5 @@
 import os.path
+import copy
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import torch
@@ -380,6 +381,12 @@ class Stage2Trainer:
 
         self.bg_prototype : Dict[str, torch.Tensor] = {}
 
+        self.rpn_teacher = copy.deepcopy(self.model.rpn)
+        self.rpn_teacher.to(self.config.device)
+        for p in self.rpn_teacher.parameters():
+            p.requires_grad = False
+        self.rpn_teacher.eval()
+
         self.start_epoch = 1
 
         self.log_path = self.config.logger.get_log_dir()
@@ -404,6 +411,14 @@ class Stage2Trainer:
             lr_scheduler_state_dict = checkpoint['lr_scheduler_state_dict']
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
             print("Learning rate scheduler state loaded successfully.")
+
+            # 加载背景原型
+            self.bg_prototype = checkpoint['bg_prototype']
+            print("Background prototype loaded successfully.")
+
+            # 加载 RPN teacher 参数
+            rpn_teacher_state_dict = checkpoint['rpn_teacher_state_dict']
+            self.rpn_teacher.load_state_dict(rpn_teacher_state_dict)
 
     def _build_gt_targets(self, targets: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
         """
@@ -515,6 +530,22 @@ class Stage2Trainer:
         else:
             self.bg_prototype[k] = m * batch_bg_prototype + (1.0 - m) * self.bg_prototype[k]
 
+    @torch.no_grad()
+    def _update_rpn_teacher_ema(self) -> None:
+        m = float(self.config.ema_alpha)
+        student_state = self.model.rpn.state_dict()
+        teacher_state = self.rpn_teacher.state_dict()
+
+        for k, student_tensor in student_state.items():
+            if not torch.is_tensor(student_tensor):
+                teacher_state[k] = student_tensor
+                continue
+
+            student_tensor = student_tensor.detach()
+            if k in teacher_state and torch.is_floating_point(teacher_state[k]):
+                teacher_state[k].mul_(m).add_(student_tensor, alpha=1.0 - m)
+            else:
+                teacher_state[k] = student_tensor.clone()
 
     def _train_one_epoch(self, epoch) -> None:
         vis_root = os.path.join(self.log_path, "visualizations")
@@ -563,6 +594,7 @@ class Stage2Trainer:
                 wb_labels=wb_one_hot_labels,
                 bg_prototype=self.bg_prototype,
                 gt_targets=gt_targets,
+                rpn_teacher=self.rpn_teacher,
                 vis_dir=vis_dir,
                 epoch=epoch,
                 it=iter
@@ -596,6 +628,7 @@ class Stage2Trainer:
             loss.backward()
 
             self.optimizer.step()
+            self._update_rpn_teacher_ema()
 
             epoch_losses["total_loss"] += loss.item()
             epoch_losses["ccam_loss"] += loss_ccam.item()
@@ -695,6 +728,8 @@ class Stage2Trainer:
     def _save_checkpoint(self, current_epoch : int, checkpoints_save_path : str):
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
+            "rpn_teacher_state_dict": self.rpn_teacher.state_dict(),
+            "bg_prototype": self.bg_prototype,
             "epoch": current_epoch,
             "log_path": self.log_path,
             "optimizer_state_dict": self.optimizer.state_dict(),
