@@ -41,6 +41,7 @@ class Stage2TrainerConfig:
     lr: float  # base lr
     warm_up_lr_factor: float  # min_lr = warm_up_lr_factor * lr
     warmup_epochs: int
+    # warmup_phase_epochs: int
     weight_decay: float
     checkpoints_save_path: str
     model_save_path: str
@@ -381,11 +382,11 @@ class Stage2Trainer:
 
         self.bg_prototype : Dict[str, torch.Tensor] = {}
 
-        self.rpn_teacher = copy.deepcopy(self.model.rpn)
-        self.rpn_teacher.to(self.config.device)
-        for p in self.rpn_teacher.parameters():
-            p.requires_grad = False
-        self.rpn_teacher.eval()
+        # self.rpn_teacher = copy.deepcopy(self.model.rpn)
+        # self.rpn_teacher.to(self.config.device)
+        # for p in self.rpn_teacher.parameters():
+        #     p.requires_grad = False
+        # self.rpn_teacher.eval()
 
         self.start_epoch = 1
 
@@ -416,9 +417,10 @@ class Stage2Trainer:
             self.bg_prototype = checkpoint['bg_prototype']
             print("Background prototype loaded successfully.")
 
-            # 加载 RPN teacher 参数
-            rpn_teacher_state_dict = checkpoint['rpn_teacher_state_dict']
-            self.rpn_teacher.load_state_dict(rpn_teacher_state_dict)
+            # # 加载 RPN teacher 参数
+            # rpn_teacher_state_dict = checkpoint['rpn_teacher_state_dict']
+            # self.rpn_teacher.load_state_dict(rpn_teacher_state_dict)
+            # print("RPN teacher loaded successfully.")
 
     def _build_gt_targets(self, targets: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
         """
@@ -439,79 +441,98 @@ class Stage2Trainer:
             })
         return out
 
-    def _get_mAP_metric(
-        self,
-        mode : str, # 'train' or 'eval'
-    )-> float:
+    def _build_sam3_targets(self, targets: List[Dict[str, torch.Tensor]]) -> List[Dict[str, torch.Tensor]]:
         """
-        :return: mAP@[0.5:0.95]
+        :return: SAM3 targets[i] = {"boxes": [Si,4], "scores": [Si]}
         """
-        self.model.eval()
+        out = []
+        for t in targets:
+            if ("sam3_boxes" in t) and ("sam3_scores" in t):
+                boxes = t["sam3_boxes"]
+                scores = t["sam3_scores"]
+            else:
+                boxes = t["boxes"]
+                scores = torch.ones((boxes.size(0),), dtype=torch.float32, device=boxes.device)
 
-        if mode == "train":
-            loader = self.train_loader
-        elif mode == "val":
-            loader = self.val_loader
+            out.append({
+                "boxes": boxes.float(),
+                "scores": scores.float(),
+            })
+        return out
 
-        map_metric = MeanAveragePrecision(
-            iou_type="bbox",
-            iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50:0.05:0.95
-            max_detection_thresholds=[1, 10, 100],
-        ).to(self.config.device)
-
-        num_iters = len(loader)
-        pbar = tqdm(
-            enumerate(loader, start=1),
-            total=num_iters,
-            desc=f"Computing {mode} mAP@[0.5:0.95]",
-            leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
-            dynamic_ncols=True,  # 自适应终端宽度
-        )
-
-        with torch.no_grad():
-            for iter, (images, target) in pbar:
-                images = [img.to(self.config.device) for img in images]
-                gt_targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
-
-                X = torch.stack(images, dim=0)
-                detections = self.model("inference", X)
-
-                preds = []
-                for p in detections:
-                    # copy tensors (avoid in-place side effects)
-                    boxes = p["boxes"].detach()
-                    scores = p["scores"].detach()
-                    labels = p["labels"].detach()
-
-                    # drop background (labels <= 0)
-                    keep = labels > 0
-                    boxes = boxes[keep]
-                    scores = scores[keep]
-                    labels = labels[keep]
-
-                    preds.append({
-                        "boxes": boxes,
-                        "scores": scores,
-                        "labels": labels,
-                    })
-
-                targets = []
-                for t in gt_targets:
-                    boxes = t["boxes"].detach()
-                    labels = t["labels"].detach()
-
-                    labels = labels + 1  # shift to [1..C]
-
-                    targets.append({
-                        "boxes": boxes,
-                        "labels": labels,
-                    })
-
-                map_metric.update(preds, targets)
-
-        metric = map_metric.compute()
-
-        return float(metric["map"])
+    # def _get_mAP_metric(
+    #     self,
+    #     mode : str, # 'train' or 'eval'
+    # )-> float:
+    #     """
+    #     :return: mAP@[0.5:0.95]
+    #     """
+    #     self.model.eval()
+    #
+    #     if mode == "train":
+    #         loader = self.train_loader
+    #     elif mode == "val":
+    #         loader = self.val_loader
+    #
+    #     map_metric = MeanAveragePrecision(
+    #         iou_type="bbox",
+    #         iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50:0.05:0.95
+    #         max_detection_thresholds=[1, 10, 100],
+    #     ).to(self.config.device)
+    #
+    #     num_iters = len(loader)
+    #     pbar = tqdm(
+    #         enumerate(loader, start=1),
+    #         total=num_iters,
+    #         desc=f"Computing {mode} mAP@[0.5:0.95]",
+    #         leave=False,  # 一个epoch结束后不保留整条进度条（日志更干净）
+    #         dynamic_ncols=True,  # 自适应终端宽度
+    #     )
+    #
+    #     with torch.no_grad():
+    #         for iter, (images, target) in pbar:
+    #             images = [img.to(self.config.device) for img in images]
+    #             gt_targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
+    #
+    #             X = torch.stack(images, dim=0)
+    #             detections = self.model("inference", X)
+    #
+    #             preds = []
+    #             for p in detections:
+    #                 # copy tensors (avoid in-place side effects)
+    #                 boxes = p["boxes"].detach()
+    #                 scores = p["scores"].detach()
+    #                 labels = p["labels"].detach()
+    #
+    #                 # drop background (labels <= 0)
+    #                 keep = labels > 0
+    #                 boxes = boxes[keep]
+    #                 scores = scores[keep]
+    #                 labels = labels[keep]
+    #
+    #                 preds.append({
+    #                     "boxes": boxes,
+    #                     "scores": scores,
+    #                     "labels": labels,
+    #                 })
+    #
+    #             targets = []
+    #             for t in gt_targets:
+    #                 boxes = t["boxes"].detach()
+    #                 labels = t["labels"].detach()
+    #
+    #                 labels = labels + 1  # shift to [1..C]
+    #
+    #                 targets.append({
+    #                     "boxes": boxes,
+    #                     "labels": labels,
+    #                 })
+    #
+    #             map_metric.update(preds, targets)
+    #
+    #     metric = map_metric.compute()
+    #
+    #     return float(metric["map"])
 
     @torch.no_grad()
     def _update_bg_prototype_ema(
@@ -530,27 +551,29 @@ class Stage2Trainer:
         else:
             self.bg_prototype[k] = m * batch_bg_prototype + (1.0 - m) * self.bg_prototype[k]
 
-    @torch.no_grad()
-    def _update_rpn_teacher_ema(self) -> None:
-        m = float(self.config.ema_alpha)
-        student_state = self.model.rpn.state_dict()
-        teacher_state = self.rpn_teacher.state_dict()
-
-        for k, student_tensor in student_state.items():
-            if not torch.is_tensor(student_tensor):
-                teacher_state[k] = student_tensor
-                continue
-
-            student_tensor = student_tensor.detach()
-            if k in teacher_state and torch.is_floating_point(teacher_state[k]):
-                teacher_state[k].mul_(m).add_(student_tensor, alpha=1.0 - m)
-            else:
-                teacher_state[k] = student_tensor.clone()
+    # @torch.no_grad()
+    # def _update_rpn_teacher_ema(self) -> None:
+    #     m = float(self.config.ema_alpha)
+    #     student_state = self.model.rpn.state_dict()
+    #     teacher_state = self.rpn_teacher.state_dict()
+    #
+    #     for k, student_tensor in student_state.items():
+    #         if not torch.is_tensor(student_tensor):
+    #             teacher_state[k] = student_tensor
+    #             continue
+    #
+    #         student_tensor = student_tensor.detach()
+    #         if k in teacher_state and torch.is_floating_point(teacher_state[k]):
+    #             teacher_state[k].mul_(m).add_(student_tensor, alpha=1.0 - m)
+    #         else:
+    #             teacher_state[k] = student_tensor.clone()
 
     def _train_one_epoch(self, epoch) -> None:
         vis_root = os.path.join(self.log_path, "visualizations")
         vis_dir = os.path.join(vis_root, f"epoch_{epoch}")
         os.makedirs(vis_dir, exist_ok=True)
+
+        # train_phase = "warmup" if epoch <= self.config.warmup_phase_epochs else "main"
 
         num_iters = len(self.train_loader)
         pbar = tqdm(
@@ -572,29 +595,32 @@ class Stage2Trainer:
             "rpn_loss" : 0.0,
             "rpn_obj_loss" : 0.0,
             "rpn_reg_loss" : 0.0,
-            # "match_loss" : 0.0,
-            # "match_cls_loss" : 0.0,
-            # "match_l1_loss" : 0.0,
-            # "match_giou_loss" : 0.0,
+            "match_loss" : 0.0,
+            "match_cls_loss" : 0.0,
+            "match_l1_loss" : 0.0,
+            "match_giou_loss" : 0.0,
         }
 
         epoch_pseudo_labels_mAP = 0.0
 
         for iter, (images, target) in pbar:
             images = [img.to(self.config.device) for img in images]
-            gt_targets = self._build_gt_targets([{k: v.to(self.config.device) for k, v in t.items()} for t in target])
             targets = [{k: v.to(self.config.device) for k, v in t.items()} for t in target]
+            gt_targets = self._build_gt_targets(targets)
+            sam3_targets = self._build_sam3_targets(targets)
 
             wboxes = _build_wboxes(targets).to(self.config.device)
             wb_one_hot_labels = _build_wb_one_hot(targets, self.config.num_classes).to(self.config.device)
             X = torch.stack(images, dim=0)
             out = self.model(
+                # train_phase=train_phase,
                 imgs=X,
                 wboxes=wboxes,
                 wb_labels=wb_one_hot_labels,
                 bg_prototype=self.bg_prototype,
                 gt_targets=gt_targets,
-                rpn_teacher=self.rpn_teacher,
+                sam3_targets=sam3_targets,
+                # rpn_teacher=self.rpn_teacher,
                 vis_dir=vis_dir,
                 epoch=epoch,
                 it=iter
@@ -617,10 +643,18 @@ class Stage2Trainer:
             loss_rpn_reg = rpn_losses_dict["loss_rpn_box_reg"]
             loss_rpn = loss_rpn_obj + loss_rpn_reg
 
-            # loss_match = match_losses_dict["loss_match"]
-            # loss_match_cls = match_losses_dict["loss_match_cls"]
-            # loss_match_l1 = match_losses_dict["loss_match_l1"]
-            # loss_match_giou = match_losses_dict["loss_match_giou"]
+            # if train_phase == "main":
+                # match_losses_dict = out["match_losses_dict"]
+                # loss_match = match_losses_dict["loss_match"]
+                # loss_match_cls = match_losses_dict["loss_match_cls"]
+                # loss_match_l1 = match_losses_dict["loss_match_l1"]
+                # loss_match_giou = match_losses_dict["loss_match_giou"]
+
+
+            # if train_phase == "warmup":
+            #     loss = self.config.w_ccam_loss * loss_ccam + self.config.w_constrain_loss * loss_constrain + self.config.w_obj_loss * loss_obj + self.config.w_rpn_loss * loss_rpn
+            # else:
+                # loss = self.config.w_ccam_loss * loss_ccam + self.config.w_constrain_loss * loss_constrain + self.config.w_obj_loss * loss_obj + self.config.w_match_loss * loss_match + self.config.w_rpn_loss * loss_rpn
 
             loss = self.config.w_ccam_loss * loss_ccam + self.config.w_constrain_loss * loss_constrain + self.config.w_obj_loss * loss_obj + self.config.w_rpn_loss * loss_rpn
 
@@ -628,7 +662,8 @@ class Stage2Trainer:
             loss.backward()
 
             self.optimizer.step()
-            self._update_rpn_teacher_ema()
+            # if train_phase == "main":
+            #     self._update_rpn_teacher_ema()
 
             epoch_losses["total_loss"] += loss.item()
             epoch_losses["ccam_loss"] += loss_ccam.item()
@@ -640,20 +675,43 @@ class Stage2Trainer:
             epoch_losses["rpn_loss"] += loss_rpn.item()
             epoch_losses["rpn_obj_loss"] += loss_rpn_obj.item()
             epoch_losses["rpn_reg_loss"] += loss_rpn_reg.item()
-            # epoch_losses["match_loss"] += loss_match.item()
+            # if train_phase == "main":
+            #     epoch_losses["match_loss"] += loss_match.item()
+            #     epoch_losses["match_cls_loss"] += loss_match_cls.item()
+            #     epoch_losses["match_l1_loss"] += loss_match_l1.item()
+            #     epoch_losses["match_giou_loss"] += loss_match_giou.item()
 
             pseudo_labels_mAP = out["pseudo_labels_mAP"]
             epoch_pseudo_labels_mAP += pseudo_labels_mAP
 
+            # if train_phase == "warmup":
+            #     pbar.set_postfix({
+            #         "Iter Loss: Total": f"{loss.item():.4f} ",
+            #         "CCAM": f"{loss_ccam.item():.4f} ",
+            #         "RPN": f"{loss_rpn.item():.4f} ",
+            #         "Constrain": f"{loss_constrain.item():.4f} ",
+            #         "Obj" : f"{loss_obj.item():.4f} ",
+            #         "lr": f"{self.optimizer.param_groups[0]['lr']}",
+            #     })
+            # else:
+            #     pbar.set_postfix({
+            #         "Iter Loss: Total": f"{loss.item():.4f} ",
+            #         "CCAM": f"{loss_ccam.item():.4f} ",
+            #         "RPN": f"{loss_rpn.item():.4f} ",
+            #         "Constrain": f"{loss_constrain.item():.4f} ",
+            #         "Obj" : f"{loss_obj.item():.4f} ",
+            #         "Match": f"{loss_match.item():.4f} ",
+            #         "p_mAP": f"{pseudo_labels_mAP} ",
+            #         "lr": f"{self.optimizer.param_groups[0]['lr']}",
+            #     })
             pbar.set_postfix({
-                "Iter Loss: Total": f"{loss.item():.4f} ",
-                "CCAM": f"{loss_ccam.item():.4f} ",
-                "RPN": f"{loss_rpn.item():.4f} ",
-                "Constrain": f"{loss_constrain.item():.4f} ",
-                "Obj" : f"{loss_obj.item():.4f} ",
-                # "Match": f"{loss_match.item():.4f} ",
-                "p_mAP": f"{pseudo_labels_mAP} ",
-                "lr": f"{self.optimizer.param_groups[0]['lr']}",
+                        "Iter Loss: Total": f"{loss.item():.4f} ",
+                        "CCAM": f"{loss_ccam.item():.4f} ",
+                        "RPN": f"{loss_rpn.item():.4f} ",
+                        "Constrain": f"{loss_constrain.item():.4f} ",
+                        "Obj" : f"{loss_obj.item():.4f} ",
+                        "p_mAP": f"{pseudo_labels_mAP} ",
+                        "lr": f"{self.optimizer.param_groups[0]['lr']}",
             })
 
         self.lr_scheduler.step()
@@ -669,48 +727,107 @@ class Stage2Trainer:
         average_rpn_loss = epoch_losses["rpn_loss"] / num_iters
         average_rpn_obj_loss = epoch_losses["rpn_obj_loss"] / num_iters
         average_rpn_reg_loss = epoch_losses["rpn_reg_loss"] / num_iters
-        # average_match_loss = epoch_match_loss / num_iters
-        # average_match_cls_loss = epoch_match_cls_loss / num_iters
-        # average_match_l1_loss = epoch_match_l1_loss / num_iters
-        # average_match_giou_loss = epoch_match_giou_loss / num_iters
+        # if train_phase == "main":
+        #     average_match_loss = epoch_losses["match_loss"] / num_iters
+        #     average_match_cls_loss = epoch_losses["match_cls_loss"] / num_iters
+        #     average_match_l1_loss = epoch_losses["match_l1_loss"] / num_iters
+        #     average_match_giou_loss = epoch_losses["match_giou_loss"] / num_iters
 
         average_pseudo_labels_mAP = epoch_pseudo_labels_mAP / num_iters
 
+        # if train_phase == "warmup":
+        #     self.config.logger.add_info(
+        #         f"\nEpoch [{epoch}/{self.config.epochs}]"
+        #         f"Total Loss: {average_total_loss:.4f}, "
+        #         f"CCAM Loss: {average_ccam_loss:.4f}, "
+        #         f"Constrain Loss: {average_constrain_loss:.4f}, "
+        #         f"Obj Loss: {average_obj_loss:.4f}, "
+        #         f"RPN Loss: {average_rpn_loss:.4f},\n"
+        #         f"Proto Loss: {average_proto_loss:.4f}, "
+        #         f"Pull Loss: {average_pull_loss:.4f}, "
+        #         f"Push Loss: {average_push_loss:.4f},\n"
+        #         f"RPN Obj Loss: {average_rpn_obj_loss:.4f}, "
+        #         f"RPN Reg Loss: {average_rpn_reg_loss:.4f},\n"
+        #     )
+        # else:
+        #     self.config.logger.add_info(
+        #         f"\nEpoch [{epoch}/{self.config.epochs}]"
+        #         f"Total Loss: {average_total_loss:.4f}, "
+        #         f"CCAM Loss: {average_ccam_loss:.4f}, "
+        #         f"Constrain Loss: {average_constrain_loss:.4f}, "
+        #         f"Obj Loss: {average_obj_loss:.4f}, "
+        #         f"RPN Loss: {average_rpn_loss:.4f}, "
+        #         f"Match Loss: {average_match_loss:.4f},\n"
+        #         f"Proto Loss: {average_proto_loss:.4f}, "
+        #         f"Pull Loss: {average_pull_loss:.4f}, "
+        #         f"Push Loss: {average_push_loss:.4f}, "
+        #         f"RPN Obj Loss: {average_rpn_obj_loss:.4f}, "
+        #         f"RPN Reg Loss: {average_rpn_reg_loss:.4f},\n"
+        #         f"Match CLS Loss: {average_match_cls_loss:.4f}, "
+        #         f"Match L1 Loss: {average_match_l1_loss:.4f}, "
+        #         f"Match GIoU Loss: {average_match_giou_loss:.4f}\n"
+        #         f"Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
+        #     )
         self.config.logger.add_info(
-            f"Epoch [{epoch}/{self.config.epochs}]"
+            f"\nEpoch [{epoch}/{self.config.epochs}]"
             f"Total Loss: {average_total_loss:.4f}, "
             f"CCAM Loss: {average_ccam_loss:.4f}, "
             f"Constrain Loss: {average_constrain_loss:.4f}, "
             f"Obj Loss: {average_obj_loss:.4f}, "
             f"RPN Loss: {average_rpn_loss:.4f},\n"
-            # f"Match Loss: {average_match_loss:.4f},\n"
             f"Proto Loss: {average_proto_loss:.4f}, "
             f"Pull Loss: {average_pull_loss:.4f}, "
-            f"Push Loss: {average_push_loss:.4f}, "
+            f"Push Loss: {average_push_loss:.4f},\n"
             f"RPN Obj Loss: {average_rpn_obj_loss:.4f}, "
             f"RPN Reg Loss: {average_rpn_reg_loss:.4f},\n"
-            # f"Match CLS Loss: {average_match_cls_loss:.4f}, "
-            # f"Match L1 Loss: {average_match_l1_loss:.4f}, "
-            # f"Match GIoU Loss: {average_match_giou_loss:.4f}\n"
-            f"Pseudo Labels mAP@[0.5:0.95]: {average_pseudo_labels_mAP:.4f}\n"
+            f"Pseudo Labels mAP@[0.5]: {average_pseudo_labels_mAP:.4f}\n"
         )
+        # if train_phase == "warmup":
+        #     metrics = {
+        #         'Epoch': epoch,
+        #         'Total Loss': average_total_loss,
+        #         'CCAM Loss': average_ccam_loss,
+        #         'Constrain Loss': average_constrain_loss,
+        #         'Proto Loss' : average_proto_loss,
+        #         'Pull Loss' : average_pull_loss,
+        #         'Push Loss' : average_push_loss,
+        #         'Obj Loss': average_obj_loss,
+        #         'RPN Loss': average_rpn_loss,
+        #         'RPN Obj Loss': average_rpn_obj_loss,
+        #         'RPN Reg Loss': average_rpn_reg_loss,
+        #     }
+        # else:
+        #     metrics = {
+        #         'Epoch': epoch,
+        #         'Total Loss': average_total_loss,
+        #         'CCAM Loss': average_ccam_loss,
+        #         'Constrain Loss': average_constrain_loss,
+        #         'Proto Loss': average_proto_loss,
+        #         'Pull Loss': average_pull_loss,
+        #         'Push Loss': average_push_loss,
+        #         'Obj Loss': average_obj_loss,
+        #         'RPN Loss': average_rpn_loss,
+        #         'RPN Obj Loss': average_rpn_obj_loss,
+        #         'RPN Reg Loss': average_rpn_reg_loss,
+        #         'Match Loss': average_match_loss,
+        #         'Match CLS Loss': average_match_cls_loss,
+        #         'Match L1 Loss': average_match_l1_loss,
+        #         'Match GIoU Loss': average_match_giou_loss,
+        #         'Pseudo Labels mAP@[0.5:0.95]': average_pseudo_labels_mAP,
+        #     }
         metrics = {
-            'Epoch': epoch,
-            'Total Loss': average_total_loss,
-            'CCAM Loss': average_ccam_loss,
-            'Constrain Loss': average_constrain_loss,
-            'Proto Loss' : average_proto_loss,
-            'Pull Loss' : average_pull_loss,
-            'Push Loss' : average_push_loss,
-            'Obj Loss': average_obj_loss,
-            'RPN Loss': average_rpn_loss,
-            'RPN Obj Loss': average_rpn_obj_loss,
-            'RPN Reg Loss': average_rpn_reg_loss,
-            # 'Match Loss': average_match_loss,
-            # 'Match CLS Loss': average_match_cls_loss,
-            # 'Match L1 Loss': average_match_l1_loss,
-            # 'Match GIoU Loss': average_match_giou_loss,
-            'Pseudo Labels mAP@[0.5:0.95]': average_pseudo_labels_mAP,
+                'Epoch': epoch,
+                'Total Loss': average_total_loss,
+                'CCAM Loss': average_ccam_loss,
+                'Constrain Loss': average_constrain_loss,
+                'Proto Loss': average_proto_loss,
+                'Pull Loss': average_pull_loss,
+                'Push Loss': average_push_loss,
+                'Obj Loss': average_obj_loss,
+                'RPN Loss': average_rpn_loss,
+                'RPN Obj Loss': average_rpn_obj_loss,
+                'RPN Reg Loss': average_rpn_reg_loss,
+                'Pseudo Labels mAP@[0.5]': average_pseudo_labels_mAP,
         }
         self.config.logger.add_metrics(metrics)
 
@@ -728,7 +845,7 @@ class Stage2Trainer:
     def _save_checkpoint(self, current_epoch : int, checkpoints_save_path : str):
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
-            "rpn_teacher_state_dict": self.rpn_teacher.state_dict(),
+            # "rpn_teacher_state_dict": self.rpn_teacher.state_dict(),
             "bg_prototype": self.bg_prototype,
             "epoch": current_epoch,
             "log_path": self.log_path,

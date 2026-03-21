@@ -3,7 +3,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Any
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
-from utils import parse_voc_xml
+from utils import *
 from torchvision import tv_tensors
 
 Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
@@ -13,7 +13,7 @@ class_map_decoding = {v: k for k, v in class_map_encoding.items()}
 
 def detection_collate_fn(batch : List)-> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
     '''batch : List of (image, target)'''
-    images, targets = zip(*batch)       # 拆成两个元组
+    images, targets = zip(*batch)       # 鎷嗘垚涓や釜鍏冪粍
     return list(images), list(targets)
 
 class UrinarySedimentDataset(Dataset):
@@ -31,6 +31,7 @@ class UrinarySedimentDataset(Dataset):
 
         self.ann_wb_dir = os.path.join(self.root, "Annotations_wb")  # wb xml annotation folder
         self.ann_gt_dir = os.path.join(self.root, "Annotations_gt")  # gt xml annotation folder
+        self.ann_sam3_dir = os.path.join(self.root, "Annotations_sam3")  # sam3 xml annotation folder
         self.img_dir = os.path.join(self.root, "JPEGImages")  # jpg images folder
         self.set_dir = os.path.join(self.root, "ImageSets", "Main")  # dataset split folder
 
@@ -50,6 +51,7 @@ class UrinarySedimentDataset(Dataset):
         img_path = os.path.join(self.img_dir, f"{image_id}.jpg")
         wb_xml_path = os.path.join(self.ann_wb_dir, f"{image_id}.xml")
         gt_xml_path = os.path.join(self.ann_gt_dir, f"{image_id}.xml")
+        sam3_xml_path = os.path.join(self.ann_sam3_dir, f"{image_id}.xml")
 
         if not os.path.isfile(img_path):
             raise FileNotFoundError(f"Image not found: {img_path}")
@@ -57,28 +59,43 @@ class UrinarySedimentDataset(Dataset):
             raise FileNotFoundError(f"Annotation not found: {wb_xml_path}")
         if not os.path.isfile(gt_xml_path):
             raise FileNotFoundError(f"Annotation not found: {gt_xml_path}")
+        if not os.path.isfile(sam3_xml_path):
+            raise FileNotFoundError(f"Annotation not found: {sam3_xml_path}")
 
         image_pil = Image.open(img_path).convert("RGB")
         W, H = image_pil.size  # PIL: (W, H)
 
         image_info, wbs = parse_voc_xml(wb_xml_path, class_map_encoding)
         _, gts = parse_voc_xml(gt_xml_path, class_map_encoding)
+        _, sam3s = parse_voc_xml_sam3(sam3_xml_path, class_map_encoding)
 
         boxes : List[Box] = []
         labels : List[int] = []
         gt_boxes : List[Box] = []
         gt_labels : List[int] = []
+        sam3_boxes : List[Box] = []
+        sam3_scores : List[float] = []
         for wb in wbs:
             boxes.append(wb['box'])
             labels.append(wb['class_id'])
         for gt in gts:
             gt_boxes.append(gt['box'])
             gt_labels.append(gt['class_id'])
+        for sam3 in sam3s:
+            sam3_boxes.append(sam3['box'])
+            sam3_scores.append(sam3['score'])
+
+        if len(sam3_boxes) == 0:
+            raise RuntimeError(
+                f"Empty sam3_boxes for image_id={image_id}, annotation file: {sam3_xml_path}"
+            )
 
         boxes_tensor = torch.tensor(boxes, dtype=torch.float32)  # [N,4]
         labels_tensor = torch.tensor(labels, dtype=torch.int64)  # [N]
         gt_boxes_tensor = torch.tensor(gt_boxes, dtype=torch.float32)   # [N,4]
         gt_labels_tensor = torch.tensor(gt_labels, dtype=torch.int64)   # [N]
+        sam3_boxes_tensor = torch.tensor(sam3_boxes, dtype=torch.float32)
+        sam3_scores_tensor = torch.tensor(sam3_scores, dtype=torch.float32)
 
         image = tv_tensors.Image(image_pil)
         boxes_tv = tv_tensors.BoundingBoxes(
@@ -91,11 +108,18 @@ class UrinarySedimentDataset(Dataset):
             format="XYXY",
             canvas_size=(H, W)
         )
+        sam3_boxes_tv = tv_tensors.BoundingBoxes(
+            sam3_boxes_tensor,
+            format="XYXY",
+            canvas_size=(H, W)
+        )
         target: Dict[str, Any] = {
             "boxes": boxes_tv,
             "labels": labels_tensor,
             "gt_boxes": gt_boxes_tv,
             "gt_labels": gt_labels_tensor,
+            "sam3_boxes": sam3_boxes_tv,
+            "sam3_scores": sam3_scores_tensor,
             "image_id": torch.tensor([idx], dtype=torch.int64),
         }
 

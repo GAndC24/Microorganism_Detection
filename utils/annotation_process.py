@@ -310,6 +310,39 @@ def parse_voc_xml(xml_path: str, class_map : Dict) -> Tuple[Dict, List[LabeledBo
 
     return image_info, boxes
 
+# read the VOC XML annotation file
+def parse_voc_xml_sam3(xml_path: str, class_map : Dict) -> Tuple[Dict, List[Dict]]:
+    '''读取 VOC XML 标注文件并返回 image_info 和 boxes'''
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    # 读取 image_info
+    size = root.find("size")
+    image_info = {
+        "width": int(size.find("width").text),
+        "height": int(size.find("height").text),
+        "depth": int(size.find("depth").text),
+    }
+
+    # 读取 boxes
+    boxes = []
+    for obj in root.findall("object"):
+        bndbox = obj.find("bndbox")
+        score = float(obj.find("score").text)
+
+        xmin = float(bndbox.find("xmin").text)
+        ymin = float(bndbox.find("ymin").text)
+        xmax = float(bndbox.find("xmax").text)
+        ymax = float(bndbox.find("ymax").text)
+
+        gt = {
+            "box" : (xmin, ymin, xmax, ymax),
+            "score": score
+        }
+        boxes.append(gt)
+
+    return image_info, boxes
+
 # Indent XML for pretty printing
 def _indent_xml(elem: ET.Element, level: int = 0) -> None:
     """让 ElementTree 输出更美观（带缩进换行）。"""

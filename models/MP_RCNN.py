@@ -1,4 +1,4 @@
-# Morphological Prototype R-CNN
+﻿# Morphological Prototype R-CNN
 import os.path
 import torch
 import torch.nn as nn
@@ -77,19 +77,19 @@ class Stage2Config:
     rpn_nms_thresh: float  # RPN NMS threshold
     # for CCAM
     ccam_threshold : float # CCAM threshold
-    # # for HungarianMatcher
-    # cost_class: float  # classification cost weight
-    # cost_bbox: float  # bbox L1 cost weight
-    # cost_giou: float  # bbox GIoU cost weight
+    # for HungarianMatcher
+    cost_class: float  # classification cost weight
+    cost_bbox: float  # bbox L1 cost weight
+    cost_giou: float  # bbox GIoU cost weight
     # for Pseudo Labels
     rpn_pseudo_nms_thr : float  # NMS threshold for pseudo labels
     rpn_pseudo_topk : int  # top-k proposals for pseudo labels
-    # # for Match Loss
-    # match_focal_alpha : float   # focal loss alpha
-    # match_focal_gamma : float   # focal loss gamma
-    # lambda_match_cls: float     # weight for match classification loss
-    # lambda_match_l1: float    # weight for match L1 loss
-    # lambda_match_giou: float    # weight for match giou loss
+    # for Match Loss
+    match_focal_alpha : float   # focal loss alpha
+    match_focal_gamma : float   # focal loss gamma
+    lambda_match_cls: float     # weight for match classification loss
+    lambda_match_l1: float    # weight for match L1 loss
+    lambda_match_giou: float    # weight for match giou loss
     # # for RoI Head
     # det_fg_iou_thresh: float  # foreground IoU threshold
     # det_bg_iou_thresh: float  # background IoU threshold
@@ -284,6 +284,7 @@ class Stage2(nn.Module):
                     post_nms_top_n={"training": self.config.rpn_post_nms_top_n['training'], "testing": self.config.rpn_post_nms_top_n['testing']},
                     nms_thresh=self.config.rpn_nms_thresh
         )
+        self.rpn_pseudo_label_generator = build_RPN_pseudo_label_generator(device=config.device)
 
         # Global Average Pooling
         self.gap = nn.AdaptiveAvgPool2d((1, 1))
@@ -318,7 +319,7 @@ class Stage2(nn.Module):
         #     representation_size=self.config.hidden_dim,
         # )
         #
-        # # Box Predictor（cls + reg）
+        # # Box Predictor锛坈ls + reg锛?
         # box_predictor = FastRCNNPredictor(
         #     in_channels=self.config.hidden_dim,
         #     num_classes=self.config.num_classes + 1,  # include background
@@ -341,23 +342,153 @@ class Stage2(nn.Module):
         #     detections_per_img=self.config.detections_per_img,
         # )
 
-    @torch.no_grad()
     def _get_dense_proposals(
         self,
         high_feature_maps : torch.Tensor,   # high-level feature maps, [B, C_h, H_h, W_h]
-        image_sizes: List[Tuple[int, int]],  # [(H_img, W_img), ...] 真实尺寸
+        image_sizes: List[Tuple[int, int]],  # [(H_img, W_img), ...]
         images_tensor: Optional[torch.Tensor] = None,  # images.tensors
-    )-> List[torch.Tensor]:
+        rpn_targets: List[Dict[str, torch.Tensor]] = None,  # RPN targets for training
+    )-> Tuple[List[torch.Tensor], List[Dict[str, torch.Tensor]]]:
         ''':return dense_proposals : List[Tensor], len=R, each Tensor is [num_proposals, 4]'''
-        self.rpn.eval()
+        self.rpn.train()
 
         # prepare img_list
         img_list = ImageList(tensors=images_tensor, image_sizes=image_sizes)
 
         features = {"0": high_feature_maps}  # RPN features format, Dict[str, tensor]
-        dense_proposals_list, _ = self.rpn(img_list, features)
 
-        return dense_proposals_list
+        dense_proposals_list, rpn_losses_dict = self.rpn(img_list, features, rpn_targets)
+
+        return dense_proposals_list, rpn_losses_dict
+
+    @torch.no_grad()
+    def _build_rpn_targets(
+        self,
+        wboxes: torch.Tensor,
+        wb_labels: torch.Tensor,
+        sam3_targets: List[Dict[str, torch.Tensor]],
+        score_thresh: float = 0.5
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Filter SAM3 targets for RPN supervision.
+
+        Returned format is List[Dict] with keys:
+        - "box": Tensor [N, 4]
+        - "score": Tensor [N]
+        - "class_id": Tensor [N], range [1, C]
+        """
+        if sam3_targets is None:
+            return []
+
+        device = wboxes.device
+        num_classes = int(self.config.num_classes)
+        rpn_targets: List[Dict[str, torch.Tensor]] = []
+
+        for b, sam_target in enumerate(sam3_targets):
+            sam_boxes = sam_target.get("boxes", None)
+            sam_scores = sam_target.get("scores", None)
+
+            if sam_boxes is None or sam_boxes.numel() == 0:
+                rpn_targets.append({
+                    "box": torch.zeros((0, 4), device=device, dtype=torch.float32),
+                    "score": torch.zeros((0,), device=device, dtype=torch.float32),
+                    "class_id": torch.zeros((0,), device=device, dtype=torch.long),
+                })
+                continue
+
+            sam_boxes = sam_boxes.to(device=device, dtype=torch.float32)
+            if sam_scores is None:
+                sam_scores = torch.ones((sam_boxes.shape[0],), device=device, dtype=torch.float32)
+            else:
+                sam_scores = sam_scores.to(device=device, dtype=torch.float32)
+
+            wb_mask = (wboxes[:, 0].long() == b)
+            wb_boxes_b = wboxes[wb_mask, 1:5].to(device=device, dtype=torch.float32)
+            wb_labels_b = wb_labels[wb_mask].to(device=device, dtype=torch.float32)
+
+            if wb_boxes_b.numel() == 0:
+                rpn_targets.append({
+                    "box": torch.zeros((0, 4), device=device, dtype=torch.float32),
+                    "score": torch.zeros((0,), device=device, dtype=torch.float32),
+                    "class_id": torch.zeros((0,), device=device, dtype=torch.long),
+                })
+                continue
+
+            inside = (
+                (sam_boxes[:, None, 0] >= wb_boxes_b[None, :, 0]) &
+                (sam_boxes[:, None, 1] >= wb_boxes_b[None, :, 1]) &
+                (sam_boxes[:, None, 2] <= wb_boxes_b[None, :, 2]) &
+                (sam_boxes[:, None, 3] <= wb_boxes_b[None, :, 3])
+            )
+            score_keep = sam_scores > score_thresh
+            wb_areas = (
+                (wb_boxes_b[:, 2] - wb_boxes_b[:, 0]).clamp(min=0.0) *
+                (wb_boxes_b[:, 3] - wb_boxes_b[:, 1]).clamp(min=0.0)
+            )
+
+            keep_boxes: List[torch.Tensor] = []
+            keep_scores: List[torch.Tensor] = []
+            keep_class_ids: List[int] = []
+
+            for sam_idx in range(sam_boxes.shape[0]):
+                if not bool(score_keep[sam_idx]):
+                    continue
+
+                valid_wb = torch.nonzero(inside[sam_idx], as_tuple=False).squeeze(1)
+                if valid_wb.numel() == 0:
+                    continue
+
+                chosen_wb = valid_wb[torch.argmin(wb_areas[valid_wb])]
+                class_id = int(torch.argmax(wb_labels_b[chosen_wb]).item()) + 1
+                class_id = max(1, min(class_id, num_classes))
+
+                keep_boxes.append(sam_boxes[sam_idx])
+                keep_scores.append(sam_scores[sam_idx])
+                keep_class_ids.append(class_id)
+
+            if len(keep_boxes) == 0:
+                rpn_targets.append({
+                    "box": torch.zeros((0, 4), device=device, dtype=torch.float32),
+                    "score": torch.zeros((0,), device=device, dtype=torch.float32),
+                    "class_id": torch.zeros((0,), device=device, dtype=torch.long),
+                })
+                continue
+
+            rpn_targets.append({
+                "box": torch.stack(keep_boxes, dim=0),
+                "score": torch.stack(keep_scores, dim=0),
+                "class_id": torch.tensor(keep_class_ids, device=device, dtype=torch.long),
+            })
+
+        return rpn_targets
+
+    # @torch.no_grad()
+    # def _get_dense_proposals(
+    #     self,
+    #     high_feature_maps : torch.Tensor,   # high-level feature maps, [B, C_h, H_h, W_h]
+    #     image_sizes: List[Tuple[int, int]],  # [(H_img, W_img), ...] 鐪熷疄灏哄
+    #     images_tensor: Optional[torch.Tensor] = None,  # images.tensors
+    #     rpn_module: Optional[nn.Module] = None
+    # )-> List[torch.Tensor]:
+    #     ''':return dense_proposals : List[Tensor], len=R, each Tensor is [num_proposals, 4]'''
+    #     # self.rpn.eval()
+    #     if rpn_module is None:
+    #         rpn_module = self.rpn
+    #
+    #     was_training = rpn_module.training
+    #     rpn_module.eval()
+    #
+    #     # prepare img_list
+    #     img_list = ImageList(tensors=images_tensor, image_sizes=image_sizes)
+    #
+    #     features = {"0": high_feature_maps}  # RPN features format, Dict[str, tensor]
+    #     # dense_proposals_list, _ = self.rpn(img_list, features)
+    #     dense_proposals_list, _ = rpn_module(img_list, features)
+    #
+    #     if was_training:
+    #         rpn_module.train()
+    #
+    #     return dense_proposals_list
 
     # @torch.no_grad()
     # def _get_multi_bboxes(
@@ -454,7 +585,7 @@ class Stage2(nn.Module):
     #     boxes = torch.stack([ax1, ay1, ax2, ay2], dim=-1)
     #
     #     # If clamping near borders caused width/height to collapse again,
-    #     # do a second-pass “push inside bounds” to enforce min size as much as possible.
+    #     # do a second-pass 鈥減ush inside bounds鈥?to enforce min size as much as possible.
     #     # (This matters when cx is extremely close to the border.)
     #     w3 = boxes[:, 2] - boxes[:, 0]
     #     h3 = boxes[:, 3] - boxes[:, 1]
@@ -637,6 +768,7 @@ class Stage2(nn.Module):
 
         return boxes_global
 
+
     def _map_boxes_image_to_roi_xyxy(
         self,
         boxes_img_xyxy: torch.Tensor,  # [N,4] in image coords
@@ -683,41 +815,7 @@ class Stage2(nn.Module):
         cam_boxes = torch.stack([x_min, y_min, x_max, y_max], dim=-1).to(dtype=torch.long)
         return cam_boxes
 
-    # def _ccam_fg_bg_score_for_boxes(
-    #     self,
-    #     ccam_i: torch.Tensor,  # [Hc, Wc] float
-    #     cam_boxes_xyxy: torch.Tensor  # [N, 4] long in CCAM coords
-    # ):
-    #     """
-    #     For each box, compute:
-    #       fg_score = mean(CCAM inside box)
-    #       bg_score = mean(1-CCAM inside box)
-    #     Return fg, bg: [N] float
-    #     """
-    #     device = ccam_i.device
-    #     ccam_i = ccam_i.to(device=device, dtype=torch.float32)
-    #
-    #     N = cam_boxes_xyxy.shape[0]
-    #     if N == 0:
-    #         z = torch.zeros((0,), device=device, dtype=torch.float32)
-    #         return z, z
-    #
-    #     fg = torch.zeros((N,), device=device, dtype=torch.float32)
-    #     bg = torch.zeros((N,), device=device, dtype=torch.float32)
-    #
-    #     # Hc,Wc are small (ROIAlign output), loop is fine; N is per-wbox proposals then topk
-    #     for n in range(N):
-    #         x1, y1, x2, y2 = cam_boxes_xyxy[n].tolist()
-    #         patch = ccam_i[y1:y2 + 1, x1:x2 + 1]  # [h,w]
-    #         if patch.numel() == 0:
-    #             fg[n] = 0.0
-    #             bg[n] = 1.0
-    #         else:
-    #             m = patch.mean()
-    #             fg[n] = m
-    #             bg[n] = 1.0 - m
-    #
-    #     return fg, bg
+
     def _ccam_fg_bg_score_for_boxes(
         self,
         ccam_i: torch.Tensor,  # [Hc, Wc] float
@@ -793,6 +891,7 @@ class Stage2(nn.Module):
 
         return fg, bg
 
+
     def _xyxy_to_cxcywh(self, xyxy: torch.Tensor) -> torch.Tensor:
         # xyxy: [N,4]
         x1, y1, x2, y2 = xyxy.unbind(dim=-1)
@@ -802,10 +901,12 @@ class Stage2(nn.Module):
         h = (y2 - y1).clamp(min=1e-6)
         return torch.stack([cx, cy, w, h], dim=-1)
 
+
     def _compute_fg_scores(
         self,
         sparse_props_ccam_scores : torch.Tensor,  # [total_num_sparse_proposals], range [0, 1]
         prototypes_embeddings : torch.Tensor,   # Normalized, shape [num_classes, D]
+        bg_prototype_embedding : torch.Tensor,  # Normalized, shape [D]
         sparse_proposal_embeddings : torch.Tensor,  # Normalized, shape [total_num_sparse_proposals, D]
         sparse_proposal_labels : torch.Tensor,  # [total_num_sparse_proposals], range [1, num_classes] (0 reserved for background)
         sparse_proposal_boxes : torch.Tensor,  # [total_num_sparse_proposals, 5], each row = [batch_idx, x1, y1, x2, y2]
@@ -813,12 +914,13 @@ class Stage2(nn.Module):
         w_prototype_sim : float,
         w_ccam_score: float,
         w_obj_score: float,
-        tau : float = 0.07,     # [0.05, 0.15]
+        tau : float = 0.1
     )-> torch.Tensor:
         """
         :return: fg_scores: [total_num_sparse_proposals], range [0,1]
         """
         z = sparse_proposal_embeddings
+        bg = bg_prototype_embedding
         s_1 = sparse_props_ccam_scores
         s_2 = sparse_proposal_object_scores
         labels = sparse_proposal_labels
@@ -833,14 +935,17 @@ class Stage2(nn.Module):
         # compute
         # sim_k = (z * proto_k).sum(dim=1) / tau  # [total_num_sparse_proposals]
         sim_k = (z * proto_k).sum(dim=1)  # [total_num_sparse_proposals]
-        logits = float(w_prototype_sim) * sim_k + float(w_ccam_score) * s_1 + float(w_obj_score) * s_2  # [total_num_sparse_proposals]
+        # logits = float(w_prototype_sim) * sim_k + float(w_ccam_score) * s_1 + float(w_obj_score) * s_2  # [total_num_sparse_proposals]
+        margin_k = (z * proto_k - z * bg).sum(dim=1)  # [total_num_sparse_proposals]
+        logits = float(w_prototype_sim) * margin_k + float(w_ccam_score) * s_1 + float(w_obj_score) * s_2  # [total_num_sparse_proposals]
 
         # # for debug
         # with open("debug_data.txt", "w") as f:
         #     for i in range(logits.size(0)):
-        #         f.write(f"Proposal {i}: sim_k={sim_k[i].item()}, ccam_score={s_1[i].item()}, obj_score={s_2[i].item()}, logit={logits[i].item()}\n")
+        #         # f.write(f"Proposal {i}: sim_k={sim_k[i].item()}, ccam_score={s_1[i].item()}, obj_score={s_2[i].item()}, logit={logits[i].item()}\n")
+        #         f.write(f"Proposal {i}: sim_k={sim_k[i].item()}, margin_k={margin_k[i].item()}, ccam_score={s_1[i].item()}, obj_score={s_2[i].item()}, logit={logits[i].item()}\n")
 
-        # fg_scores = torch.sigmoid(logits)  # [total_num_sparse_proposals]
+        fg_scores_0 = torch.sigmoid(logits)  # [total_num_sparse_proposals]
 
         # # grouped softmax by class
         # fg_scores = torch.zeros((N,), device=self.config.device, dtype=torch.float32)
@@ -879,68 +984,33 @@ class Stage2(nn.Module):
             l = l - l.max()  # numerical stability
             fg_scores[m] = torch.softmax(l, dim=0)
 
-        return fg_scores
+        fg_scores_final = fg_scores_0 + fg_scores  # combine original sigmoid score with grouped softmax
 
-    # def _build_rpn_pseudo_labels(
-    #     self,
-    #     proposals: List[Dict],
-    #     batch_size: int,
-    # )-> List[Dict[str, torch.Tensor]]:
-    #     """
-    #     :return: pseudo labels: list length B, each element:
-    #                 {
-    #                     "boxes": Tensor [num_boxes, 4] in image coords (xyxy),
-    #                     "scores": Tensor [num_boxes],
-    #                     "labels": Tensor [num_boxes] in range [1, C] (0 reserved for background),
-    #                 }
-    #     """
-    #     device = self.config.device
-    #     pseudo: List[Dict[str, torch.Tensor]] = []
-    #
-    #     # init empty containers per image
-    #     boxes_list = [[] for _ in range(batch_size)]
-    #     scores_list = [[] for _ in range(batch_size)]
-    #     labels_list = [[] for _ in range(batch_size)]
-    #
-    #     for p in proposals:
-    #         box5 = p["box"]  # [5] = (batch_idx,x1,y1,x2,y2)
-    #         b = int(box5[0].item())
-    #         xyxy = box5[1:5].view(1, 4)  # [1, 4]
-    #         c = int(p["class_id"])
-    #         c += 1  # shift to [1, C]
-    #         s = p["score"]
-    #
-    #         boxes_list[b].append(xyxy)
-    #         scores_list[b].append(s)
-    #         labels_list[b].append(c)
-    #
-    #     # with open("debug_data.txt", "a") as f:
-    #     #     for b in range(batch_size):
-    #     #         f.write(f"Image {b}:\n")
-    #     #         for i in range(len(boxes_list[b])):
-    #     #             box = boxes_list[b][i].cpu().numpy().tolist()[0]
-    #     #             score = scores_list[b][i].cpu().item()
-    #     #             label = labels_list[b][i]
-    #     #             f.write(f"  Box: {box}, Score: {score}, Label: {label}\n")
-    #
-    #     for b in range(batch_size):
-    #         boxes = torch.cat(boxes_list[b], dim=0)  # [Nb,4]
-    #         scores = torch.tensor(scores_list[b], device=device, dtype=torch.float32)  # [Nb]
-    #         labels = torch.tensor(labels_list[b], device=device, dtype=torch.long)  # [Nb]
-    #
-    #         pseudo.append({"boxes": boxes, "scores": scores, "labels": labels})
-    #
-    #     return pseudo
+        return fg_scores_final
+
+
     def _build_rpn_pseudo_labels(
         self,
         proposals: List[Dict],
         batch_size: int,
         image_sizes: List[Tuple[int, int]],  # [(Himg, Wimg), ...]
-        min_box_size: float = 2.0,  # avoid degenerate tiny boxes
-        keep_empty: bool = False,  # False -> force keep 1 box if any candidate exists
+        min_box_size: float = 4.0,
+        nms_iou_thr: Optional[float] = 0.3,
+        keep_empty: bool = False,
+        contain_thr: float = 0.80,
+        contain_score_ratio_thr: float = 0.90,
+        center_dist_rel_thr: float = 0.30,
+        center_score_ratio_thr: float = 0.90,
+        do_global_dedup: bool = False,
+        global_nms_iou_thr: float = 0.15,
     ) -> List[Dict[str, torch.Tensor]]:
         """
-        Build RPN pseudo labels with strong sanitization to avoid inf reg loss.
+        Build RPN pseudo labels with:
+          1) sanitization
+          2) per-class NMS
+          3) containment filter
+          4) center-distance suppression
+          5) optional global dedup
 
         Return list length B, each:
           {
@@ -949,22 +1019,222 @@ class Stage2(nn.Module):
             "labels": LongTensor  [Nb] in [1..C]  (0 reserved for background)
           }
         """
+
         device = self.config.device
         pseudo: List[Dict[str, torch.Tensor]] = []
 
+        # =========================================================
+        # helper functions
+        # =========================================================
+        def _box_area(boxes: torch.Tensor) -> torch.Tensor:
+            w = (boxes[:, 2] - boxes[:, 0]).clamp(min=0.0)
+            h = (boxes[:, 3] - boxes[:, 1]).clamp(min=0.0)
+            return w * h
+
+        def _pairwise_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+            """
+            boxes1: [N,4], boxes2: [M,4]
+            return: [N,M]
+            """
+            area1 = _box_area(boxes1)  # [N]
+            area2 = _box_area(boxes2)  # [M]
+
+            lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])  # [N,M,2]
+            rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])  # [N,M,2]
+
+            wh = (rb - lt).clamp(min=0.0)  # [N,M,2]
+            inter = wh[..., 0] * wh[..., 1]  # [N,M]
+
+            union = area1[:, None] + area2[None, :] - inter
+            iou = inter / union.clamp(min=1e-12)
+            return iou
+
+        def _pairwise_intersection(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+            """
+            boxes1: [N,4], boxes2: [M,4]
+            return: [N,M] 浜ら潰绉?
+            """
+            lt = torch.maximum(boxes1[:, None, :2], boxes2[None, :, :2])
+            rb = torch.minimum(boxes1[:, None, 2:], boxes2[None, :, 2:])
+            wh = (rb - lt).clamp(min=0.0)
+            inter = wh[..., 0] * wh[..., 1]
+            return inter
+
+        def _containment_filter_single_class(
+                boxes: torch.Tensor,
+                scores: torch.Tensor,
+                labels: torch.Tensor,
+                contain_thr: float,
+                contain_score_ratio_thr: float,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """
+            澶勭悊鈥滃ぇ妗嗗灏忔鈥濅絾 IoU 涓嶉珮鐨勬儏鍐点€?
+            瀵瑰悓绫绘锛岃嫢锛?
+              inter / area(smaller) >= contain_thr
+            涓斿皬妗嗗垎鏁版病鏈夋樉钁楅珮浜庡ぇ妗嗭紝
+            鍒欏垹鎺夎緝宸殑閭ｄ釜锛堥粯璁ゅ€惧悜淇濈暀楂樺垎妗嗭級銆?
+            """
+            if boxes.size(0) <= 1:
+                return boxes, scores, labels
+
+            # 鎸夊垎鏁伴檷搴忥紝浼樺厛淇濈暀楂樺垎妗?
+            order = torch.argsort(scores, descending=True)
+            boxes = boxes[order]
+            scores = scores[order]
+            labels = labels[order]
+
+            areas = _box_area(boxes)  # [N]
+            inter = _pairwise_intersection(boxes, boxes)  # [N,N]
+
+            keep = torch.ones(boxes.size(0), dtype=torch.bool, device=boxes.device)
+
+            N = boxes.size(0)
+            for i in range(N):
+                if not keep[i]:
+                    continue
+                for j in range(i + 1, N):
+                    if not keep[j]:
+                        continue
+
+                    # 鍚岀被鎵嶅鐞嗭紙铏界劧杩欓噷鏈韩灏辨槸鍗曠被瀛愰泦锛屼粛淇濈暀淇濇姢锛?
+                    if labels[i] != labels[j]:
+                        continue
+
+                    ai = areas[i]
+                    aj = areas[j]
+                    inter_ij = inter[i, j]
+
+                    if ai <= 0 or aj <= 0 or inter_ij <= 0:
+                        continue
+
+                    smaller = torch.minimum(ai, aj)
+                    contain_ratio = inter_ij / smaller.clamp(min=1e-12)
+
+                    # 涓€鏂瑰ぇ閮ㄥ垎琚彟涓€鏂瑰寘鍚?
+                    if contain_ratio >= contain_thr:
+                        # 鍒嗘暟浣庣殑鑻ユ病鏈夋槑鏄句紭鍔匡紝鍒欏垹鎺?
+                        # 鍥犱负褰撳墠鏄寜鍒嗘暟闄嶅簭锛岄粯璁ゅ垹 j 鏇村悎鐞?
+                        if scores[j] <= scores[i] / contain_score_ratio_thr:
+                            keep[j] = False
+                        else:
+                            # 鏋佸皯瑙侊細鍚庨潰鐨勫垎鏁版樉钁楁洿楂橈紝鍒欏垹鍓嶉潰
+                            keep[i] = False
+                            break
+
+            return boxes[keep], scores[keep], labels[keep]
+
+        def _center_distance_filter_single_class(
+                boxes: torch.Tensor,
+                scores: torch.Tensor,
+                labels: torch.Tensor,
+                center_dist_rel_thr: float,
+                center_score_ratio_thr: float,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """
+            澶勭悊鈥滀腑蹇冨嚑涔庝竴鑷翠絾灏哄/闀垮鐣ユ湁宸紓鈥濈殑閲嶅妗嗐€?
+            鍒ゅ畾鎬濊矾锛?
+              1) 涓ゆ涓績璺濈瓒冲杩?
+              2) 璺濈鐩稿闃堝€肩敤杈冨皬妗嗗瑙掔嚎褰掍竴鍖?
+              3) 鍒嗘暟宸窛涓嶅ぇ鏃讹紝淇濈暀鏇撮珮鍒嗘
+            """
+            if boxes.size(0) <= 1:
+                return boxes, scores, labels
+
+            order = torch.argsort(scores, descending=True)
+            boxes = boxes[order]
+            scores = scores[order]
+            labels = labels[order]
+
+            cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
+            cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
+            w = (boxes[:, 2] - boxes[:, 0]).clamp(min=1e-6)
+            h = (boxes[:, 3] - boxes[:, 1]).clamp(min=1e-6)
+            diag = torch.sqrt(w * w + h * h)  # [N]
+
+            keep = torch.ones(boxes.size(0), dtype=torch.bool, device=boxes.device)
+            N = boxes.size(0)
+
+            for i in range(N):
+                if not keep[i]:
+                    continue
+                for j in range(i + 1, N):
+                    if not keep[j]:
+                        continue
+
+                    if labels[i] != labels[j]:
+                        continue
+
+                    dx = cx[i] - cx[j]
+                    dy = cy[i] - cy[j]
+                    dist = torch.sqrt(dx * dx + dy * dy)
+
+                    ref_diag = torch.minimum(diag[i], diag[j]).clamp(min=1e-6)
+                    rel_dist = dist / ref_diag
+
+                    if rel_dist <= center_dist_rel_thr:
+                        # 涓績闈炲父杩戯紝鑻ュ悗鑰呭垎鏁版病鏈夋槑鏄句紭鍔匡紝鍒欏垹鎺夊悗鑰?
+                        if scores[j] <= scores[i] / center_score_ratio_thr:
+                            keep[j] = False
+                        else:
+                            keep[i] = False
+                            break
+
+            return boxes[keep], scores[keep], labels[keep]
+
+        def _process_one_class(
+                boxes_c: torch.Tensor,
+                scores_c: torch.Tensor,
+                labels_c: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """
+            瀵瑰崟涓被鍒殑涓€缁勬渚濇鍋氾細
+              1) NMS
+              2) containment filter
+              3) center-distance suppression
+            """
+            if boxes_c.numel() == 0:
+                return boxes_c, scores_c, labels_c
+
+            # 1) 绫诲唴 NMS
+            iou_thr = 0.3 if nms_iou_thr is None else float(nms_iou_thr)
+            keep = nms(boxes_c, scores_c, iou_thr)
+            boxes_c = boxes_c[keep]
+            scores_c = scores_c[keep]
+            labels_c = labels_c[keep]
+
+            # 2) containment filter
+            boxes_c, scores_c, labels_c = _containment_filter_single_class(
+                boxes_c, scores_c, labels_c,
+                contain_thr=contain_thr,
+                contain_score_ratio_thr=contain_score_ratio_thr,
+            )
+
+            # 3) center-distance suppression
+            boxes_c, scores_c, labels_c = _center_distance_filter_single_class(
+                boxes_c, scores_c, labels_c,
+                center_dist_rel_thr=center_dist_rel_thr,
+                center_score_ratio_thr=center_score_ratio_thr,
+            )
+
+            return boxes_c, scores_c, labels_c
+
+        # =========================================================
         # init empty containers per image
+        # =========================================================
         boxes_list = [[] for _ in range(batch_size)]
         scores_list = [[] for _ in range(batch_size)]
         labels_list = [[] for _ in range(batch_size)]
 
-        # --------- collect raw boxes ----------
+        # =========================================================
+        # collect raw boxes
+        # =========================================================
         for p in proposals:
             box5 = p["box"]  # [5] = (batch_idx,x1,y1,x2,y2)
             b = int(box5[0].item())
             if b < 0 or b >= batch_size:
                 continue
 
-            xyxy = box5[1:5].view(1, 4)  # [1, 4]
+            xyxy = box5[1:5].view(1, 4)
             c = int(p["class_id"])
             s = p["score"]
 
@@ -972,7 +1242,9 @@ class Stage2(nn.Module):
             scores_list[b].append(s)
             labels_list[b].append(c)
 
-        # --------- per-image sanitize ----------
+        # =========================================================
+        # per-image sanitize
+        # =========================================================
         eps = 1e-6
         minsz = float(min_box_size)
 
@@ -987,16 +1259,15 @@ class Stage2(nn.Module):
                 })
                 continue
 
-            boxes = torch.cat(boxes_list[b], dim=0).to(device=device, dtype=torch.float32)  # [N,4]
-            scores = torch.tensor(scores_list[b], device=device, dtype=torch.float32).view(-1)  # [N]
-            labels = torch.tensor(labels_list[b], device=device, dtype=torch.long).view(-1)  # [N]
+            boxes = torch.cat(boxes_list[b], dim=0).to(device=device, dtype=torch.float32)
+            scores = torch.tensor(scores_list[b], device=device, dtype=torch.float32).view(-1)
+            labels = torch.tensor(labels_list[b], device=device, dtype=torch.long).view(-1)
 
             # 1) drop non-finite
             finite = torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores)
             boxes, scores, labels = boxes[finite], scores[finite], labels[finite]
 
             if boxes.numel() == 0:
-                # nothing valid left
                 pseudo.append({
                     "boxes": boxes,
                     "scores": scores,
@@ -1004,7 +1275,7 @@ class Stage2(nn.Module):
                 })
                 continue
 
-            # 2) enforce ordering (x1<=x2, y1<=y2)
+            # 2) enforce ordering
             x1 = torch.minimum(boxes[:, 0], boxes[:, 2])
             y1 = torch.minimum(boxes[:, 1], boxes[:, 3])
             x2 = torch.maximum(boxes[:, 0], boxes[:, 2])
@@ -1017,7 +1288,7 @@ class Stage2(nn.Module):
             boxes[:, 1].clamp_(0.0, max(Himg - 1, 0))
             boxes[:, 3].clamp_(0.0, max(Himg - 1, 0))
 
-            # 4) remove non-positive size (strict)
+            # 4) remove non-positive size
             w = boxes[:, 2] - boxes[:, 0]
             h = boxes[:, 3] - boxes[:, 1]
             pos = (w > eps) & (h > eps)
@@ -1031,8 +1302,7 @@ class Stage2(nn.Module):
                 })
                 continue
 
-            # 5) expand too-small boxes to min_box_size (center-preserving)
-            #    This prevents pw/ph extremely small -> huge deltas -> overflow/inf.
+            # 5) expand too-small boxes to min_box_size
             cx = (boxes[:, 0] + boxes[:, 2]) * 0.5
             cy = (boxes[:, 1] + boxes[:, 3]) * 0.5
             w = (boxes[:, 2] - boxes[:, 0]).clamp(min=eps)
@@ -1046,344 +1316,102 @@ class Stage2(nn.Module):
             nx2 = cx + 0.5 * w2
             ny2 = cy + 0.5 * h2
 
-            # clamp again
             nx1 = nx1.clamp(0.0, max(Wimg - 1, 0))
             nx2 = nx2.clamp(0.0, max(Wimg - 1, 0))
             ny1 = ny1.clamp(0.0, max(Himg - 1, 0))
             ny2 = ny2.clamp(0.0, max(Himg - 1, 0))
 
-            # re-sanitize ordering after clamp
             ax1 = torch.minimum(nx1, nx2)
             ay1 = torch.minimum(ny1, ny2)
             ax2 = torch.maximum(nx1, nx2)
             ay2 = torch.maximum(ny1, ny2)
             boxes = torch.stack([ax1, ay1, ax2, ay2], dim=-1)
 
-            # 6) final strict validity (still need positive size)
+            # 6) final strict validity
             w = boxes[:, 2] - boxes[:, 0]
             h = boxes[:, 3] - boxes[:, 1]
             valid = (w > eps) & (h > eps) & torch.isfinite(boxes).all(dim=1) & torch.isfinite(scores)
             boxes, scores, labels = boxes[valid], scores[valid], labels[valid]
 
-            # 7) optional non-empty fallback
+            if boxes.numel() == 0:
+                if (not keep_empty):
+                    boxes = torch.tensor([[0.0, 0.0, minsz, minsz]], device=device, dtype=torch.float32)
+                    boxes[:, 2].clamp_(0.0, max(Wimg - 1, 0))
+                    boxes[:, 3].clamp_(0.0, max(Himg - 1, 0))
+                    scores = torch.tensor([1.0], device=device, dtype=torch.float32)
+                    labels = torch.tensor([1], device=device, dtype=torch.long)
+
+                pseudo.append({
+                    "boxes": boxes,
+                    "scores": scores,
+                    "labels": labels,
+                })
+                continue
+
+            # =====================================================
+            # 7) Per-class process:
+            #    NMS + containment filter + center suppression
+            # =====================================================
+            out_boxes = []
+            out_scores = []
+            out_labels = []
+
+            unique_classes = torch.unique(labels).tolist()
+            for c in unique_classes:
+                idx_c = torch.nonzero(labels == c, as_tuple=False).squeeze(1)
+                if idx_c.numel() == 0:
+                    continue
+
+                boxes_c = boxes[idx_c]
+                scores_c = scores[idx_c]
+                labels_c = labels[idx_c]
+
+                boxes_c, scores_c, labels_c = _process_one_class(
+                    boxes_c, scores_c, labels_c
+                )
+
+                if boxes_c.numel() > 0:
+                    out_boxes.append(boxes_c)
+                    out_scores.append(scores_c)
+                    out_labels.append(labels_c)
+
+            if len(out_boxes) > 0:
+                boxes = torch.cat(out_boxes, dim=0)
+                scores = torch.cat(out_scores, dim=0)
+                labels = torch.cat(out_labels, dim=0)
+
+                # 鍙€夛細璺ㄧ被鍏ㄥ眬鍘婚噸
+                if do_global_dedup and boxes.size(0) > 1:
+                    keep = nms(boxes, scores, global_nms_iou_thr)
+                    boxes = boxes[keep]
+                    scores = scores[keep]
+                    labels = labels[keep]
+
+                order = torch.argsort(scores, descending=True)
+                boxes = boxes[order]
+                scores = scores[order]
+                labels = labels[order]
+            else:
+                boxes = boxes[:0]
+                scores = scores[:0]
+                labels = labels[:0]
+
+            # 8) optional non-empty fallback
             if (not keep_empty) and boxes.numel() == 0:
-                # fall back to best score among original finite candidates (before strict filters)
-                # simplest: just return empty and let later stage handle; or keep_empty=False keep 1
-                # Here we keep 1 dummy-safe box in center (rare).
                 boxes = torch.tensor([[0.0, 0.0, minsz, minsz]], device=device, dtype=torch.float32)
                 boxes[:, 2].clamp_(0.0, max(Wimg - 1, 0))
                 boxes[:, 3].clamp_(0.0, max(Himg - 1, 0))
                 scores = torch.tensor([1.0], device=device, dtype=torch.float32)
                 labels = torch.tensor([1], device=device, dtype=torch.long)
 
-            pseudo.append({"boxes": boxes, "scores": scores, "labels": labels})
+            pseudo.append({
+                "boxes": boxes,
+                "scores": scores,
+                "labels": labels
+            })
 
         return pseudo
 
-    @torch.no_grad()
-    def _refine_rpn_pseudo_labels(
-        self,
-        pseudo_targets: List[Dict[str, torch.Tensor]],
-        keep_ratio: float = 0.3,
-        mode: Literal["per_class", "global"] = "per_class",
-        score_thr: float = 0.0,
-        nms_iou_thr: float = 0.5,
-        class_agnostic_nms: bool = True,
-        keep_empty: bool = True,  # True: 允许某张图最终为空；False: 至少保留1个最高分
-        min_keep: int = 1,
-        max_keep: Optional[int] = None,
-    ) -> List[Dict[str, torch.Tensor]]:
-        """
-        Ratio-based filtering + NMS for pseudo labels.
-
-        相比固定 top-k 的“硬截断”，这里改为“按候选数量保留一定比例”：
-          k = clamp(round(N * keep_ratio), min_keep, max_keep)
-        这样当 proposal 多时保留更多样本，proposal 少时不会被过度裁剪。
-
-        Args:
-            pseudo_targets: list of dicts, each dict has:
-                - "boxes": FloatTensor [N,4] in xyxy (image coords)
-                - "labels": LongTensor [N]
-                - "scores": FloatTensor [N]
-            keep_ratio: 保留比例，取值建议 (0, 1]。例如 0.3 表示保留 30%。
-            mode:
-                - "per_class": 每类按比例独立筛选后再合并。
-                - "global": 全部候选一起按比例筛选。
-            score_thr: 在比例筛选前先过滤低分框。
-            nms_iou_thr: NMS IoU 阈值。
-            class_agnostic_nms: True 为类无关 NMS；False 为按类 NMS。
-            keep_empty: False 时若最终为空，至少保留 1 个最高分框。
-            min_keep: 每个筛选组（global 或 per-class）最少保留数量。
-            max_keep: 每个筛选组（global 或 per-class）最多保留数量，None 表示不设上限。
-
-        Returns:
-            filtered_targets: same format as input, per image.
-        """
-        out: List[Dict[str, torch.Tensor]] = []
-
-        if keep_ratio <= 0:
-            raise ValueError(f"keep_ratio must be > 0, got {keep_ratio}")
-
-        def _calc_k(n: int) -> int:
-            """根据当前候选数 n 计算应保留的数量 k（比例 + 上下界）。"""
-            if n <= 0:
-                return 0
-            k = int(round(n * float(keep_ratio)))
-            k = max(int(min_keep), k)
-            if max_keep is not None:
-                k = min(k, int(max_keep))
-            k = min(k, n)
-            return k
-
-        for t in pseudo_targets:
-            boxes = t.get("boxes", None)
-            labels = t.get("labels", None)
-            scores = t.get("scores", None)
-
-            if boxes is None or labels is None or scores is None:
-                raise KeyError("pseudo_targets each dict must contain 'boxes', 'labels', 'scores'.")
-
-            if boxes.numel() == 0:
-                out.append({"boxes": boxes, "labels": labels, "scores": scores})
-                continue
-
-            # basic sanity
-            boxes = boxes.float()
-            labels = labels.long()
-            scores = scores.float()
-
-            # 1) score threshold
-            keep = scores >= float(score_thr)
-            boxes1, labels1, scores1 = boxes[keep], labels[keep], scores[keep]
-
-            # fallback pool for keep_empty=False
-            boxes_pool, labels_pool, scores_pool = boxes1, labels1, scores1
-            if boxes_pool.numel() == 0:
-                # if score_thr filters all, fall back to original
-                boxes_pool, labels_pool, scores_pool = boxes, labels, scores
-
-            if boxes1.numel() == 0:
-                # no candidates after score_thr
-                if keep_empty:
-                    out.append({"boxes": boxes1, "labels": labels1, "scores": scores1})
-                else:
-                    best = torch.argmax(scores_pool)
-                    out.append({
-                        "boxes": boxes_pool[best:best + 1],
-                        "labels": labels_pool[best:best + 1],
-                        "scores": scores_pool[best:best + 1],
-                    })
-                continue
-
-            # 2) Ratio-based selection（替代固定 top-k）
-            if mode == "global":
-                k = _calc_k(boxes1.shape[0])
-                if k <= 0:
-                    boxes2, labels2, scores2 = boxes1[:0], labels1[:0], scores1[:0]
-                else:
-                    idx = torch.topk(scores1, k=k, largest=True, sorted=False).indices
-                    boxes2, labels2, scores2 = boxes1[idx], labels1[idx], scores1[idx]
-
-            elif mode == "per_class":
-                kept_indices = []
-                uniq = torch.unique(labels1)
-                for c in uniq.tolist():
-                    m = (labels1 == c)
-                    idx_c = torch.nonzero(m, as_tuple=False).squeeze(1)
-                    if idx_c.numel() == 0:
-                        continue
-                    k = _calc_k(idx_c.numel())
-                    if k <= 0:
-                        continue
-                    scores_c = scores1[idx_c]
-                    top_idx_local = torch.topk(scores_c, k=k, largest=True, sorted=False).indices
-                    kept_indices.append(idx_c[top_idx_local])
-                if len(kept_indices) == 0:
-                    boxes2, labels2, scores2 = boxes1[:0], labels1[:0], scores1[:0]
-                else:
-                    idx = torch.cat(kept_indices, dim=0)
-                    boxes2, labels2, scores2 = boxes1[idx], labels1[idx], scores1[idx]
-            else:
-                raise ValueError(f"Unknown mode: {mode}")
-
-            # 3) NMS
-            if boxes2.numel() == 0:
-                if keep_empty:
-                    out.append({"boxes": boxes2, "labels": labels2, "scores": scores2})
-                else:
-                    best = torch.argmax(scores_pool)
-                    out.append({
-                        "boxes": boxes_pool[best:best + 1],
-                        "labels": labels_pool[best:best + 1],
-                        "scores": scores_pool[best:best + 1],
-                    })
-                continue
-
-            if class_agnostic_nms:
-                keep_nms = nms(boxes2, scores2, float(nms_iou_thr))
-            else:
-                # per-class nms
-                keep_list = []
-                for c in torch.unique(labels2).tolist():
-                    m = (labels2 == c)
-                    idx_c = torch.nonzero(m, as_tuple=False).squeeze(1)
-                    if idx_c.numel() == 0:
-                        continue
-                    keep_c = nms(boxes2[idx_c], scores2[idx_c], float(nms_iou_thr))
-                    keep_list.append(idx_c[keep_c])
-                keep_nms = torch.cat(keep_list, dim=0) if len(keep_list) > 0 else boxes2.new_zeros((0,),
-                                                                                                   dtype=torch.long)
-
-            boxes3, labels3, scores3 = boxes2[keep_nms], labels2[keep_nms], scores2[keep_nms]
-
-            # optional: sort by score descending (nice for debugging / stable output)
-            if scores3.numel() > 0:
-                order = torch.argsort(scores3, descending=True)
-                boxes3, labels3, scores3 = boxes3[order], labels3[order], scores3[order]
-
-            # final fallback if forced non-empty
-            if (not keep_empty) and boxes3.numel() == 0:
-                best = torch.argmax(scores_pool)
-                boxes3 = boxes_pool[best:best + 1]
-                labels3 = labels_pool[best:best + 1]
-                scores3 = scores_pool[best:best + 1]
-
-            out.append({"boxes": boxes3, "labels": labels3, "scores": scores3})
-
-        return out
-
-    # def _match_with_hungarian(
-    #     self,
-    #     topk_detections: List[Dict[str, torch.Tensor]],
-    #     aug_seed_proposals: List[Dict],
-    #     num_classes: int,
-    #     other_class_logit: float = -20.0,
-    # ) -> Tuple[List[Tuple[Dict, Dict]], List[Dict]]:
-    #     """
-    #     One-to-one Hungarian matching between:
-    #       - pred: topk_detections (RoIHeads outputs, per-image)
-    #       - tgt : aug_seed_proposals (list of dict with box[5], class_id)
-    #     :returns:
-    #       - matched_pairs: List[(det_dict, aug_seed_dict)]
-    #             - det_dict{
-    #                 "sp_idx": int,                 # 全 batch 唯一索引（内部 bookkeeping）
-    #                 "box": Tensor [5],              # (batch_idx, x1, y1, x2, y2)  image coords
-    #                 "class_id": int,                # 预测类别 id ∈ [0 .. C-1]
-    #                 "score": Tensor scalar,         # detection score ∈ (0,1)
-    #                 "logit": Tensor scalar,         # logit(score) or log(score)（用于 matcher cost_class）
-    #             }
-    #             - aug_seed_dict = {
-    #                 "box": Tensor [5],              # (batch_idx, x1, y1, x2, y2)
-    #                 "class_id": int,                # GT-like class id ∈ [0 .. C-1]
-    #                 "score": float or Tensor,
-    #                 "logit": Tensor scalar,
-    #             }
-    #       - unmatched_dets: List[det_dict]  (treated as background in match cls loss)
-    #     """
-    #     B = len(topk_detections)
-    #     if B == 0:
-    #         return [], []
-    #
-    #     device = topk_detections[0]["boxes"].device
-    #     matched_pairs: List[Tuple[Dict, Dict]] = []
-    #     unmatched_dets: List[Dict] = []
-    #
-    #     # Build aug seeds grouped by batch
-    #     aug_by_img: List[List[Dict]] = [[] for _ in range(B)]
-    #     for t in aug_seed_proposals:
-    #         b = int(t["box"][0].item())
-    #         if 0 <= b < B:
-    #             aug_by_img[b].append(t)
-    #
-    #     global_det_idx = 0  # for sp_idx-like indexing across batch (optional but consistent)
-    #
-    #     for b in range(B):
-    #         det_b = topk_detections[b]
-    #         boxes = det_b.get("boxes", None)
-    #         scores = det_b.get("scores", None)
-    #         labels = det_b.get("labels", None)
-    #
-    #         if boxes is None or scores is None or labels is None:
-    #             continue
-    #
-    #         if boxes.numel() == 0:
-    #             continue
-    #
-    #         seeds_b = aug_by_img[b]
-    #         if len(seeds_b) == 0:
-    #             # no targets -> all detections unmatched
-    #             for i in range(boxes.shape[0]):
-    #                 cls_id = int(labels[i].item()) - 1  # labels are 1..C
-    #                 unmatched_dets.append({
-    #                     "sp_idx": global_det_idx,
-    #                     "box": torch.cat([torch.tensor([b], device=device, dtype=boxes.dtype), boxes[i]], dim=0),  # [5]
-    #                     "class_id": cls_id,
-    #                     "score": scores[i],
-    #                     "logit": torch.log(scores[i].clamp(1e-6, 1 - 1e-6)),
-    #                 })
-    #                 global_det_idx += 1
-    #             continue
-    #
-    #         Nd = boxes.shape[0]
-    #
-    #         # ---- build det dicts (for output pairing + later losses) ----
-    #         det_dicts: List[Dict] = []
-    #         for i in range(Nd):
-    #             cls_id = int(labels[i].item()) - 1  # shift [1..C] -> [0..C-1]
-    #             s = scores[i].to(device=device, dtype=torch.float32)
-    #             # convert score -> logit proxy (monotonic), used only for cost_class
-    #             lg = torch.log(s.clamp(1e-6, 1 - 1e-6))
-    #
-    #             box5 = torch.cat([
-    #                 torch.tensor([b], device=device, dtype=boxes.dtype),
-    #                 boxes[i]
-    #             ], dim=0)  # [5]
-    #
-    #             det_dicts.append({
-    #                 "sp_idx": global_det_idx,
-    #                 "box": box5,  # [5]
-    #                 "class_id": cls_id,  # [0..C-1]
-    #                 "score": s,  # scalar tensor
-    #                 "logit": lg,  # scalar tensor
-    #             })
-    #             global_det_idx += 1
-    #
-    #         # ---- matcher inputs: pred_boxes/pred_logits ----
-    #         pred_boxes_xyxy = boxes.to(device=device, dtype=torch.float32)  # [Nd,4]
-    #         pred_boxes = self._xyxy_to_cxcywh(pred_boxes_xyxy)  # [Nd,4]
-    #
-    #         # pred_logits: [1, Nd, C] (foreground only)
-    #         pred_logits = torch.full((1, Nd, num_classes), other_class_logit, device=device, dtype=torch.float32)
-    #         for i in range(Nd):
-    #             cls = det_dicts[i]["class_id"]
-    #             pred_logits[0, i, cls] = det_dicts[i]["logit"].to(device=device, dtype=torch.float32)
-    #
-    #         outputs = {
-    #             "pred_logits": pred_logits,  # [1, Nd, C]
-    #             "pred_boxes": pred_boxes.unsqueeze(0),  # [1, Nd, 4]
-    #         }
-    #
-    #         # ---- targets ----
-    #         tgt_labels = torch.tensor([int(t["class_id"]) for t in seeds_b], device=device, dtype=torch.long)  # [Nt]
-    #         tgt_boxes_xyxy = torch.stack([t["box"][1:5] for t in seeds_b], dim=0).to(device=device,
-    #                                                                                  dtype=torch.float32)  # [Nt,4]
-    #         tgt_boxes = self._xyxy_to_cxcywh(tgt_boxes_xyxy)  # [Nt,4]
-    #         targets = [{"labels": tgt_labels, "boxes": tgt_boxes}]
-    #
-    #         # ---- hungarian ----
-    #         indices = self.matcher(outputs, targets)  # list length=1
-    #         src_idx, tgt_idx = indices[0]
-    #
-    #         matched_src = set(src_idx.tolist())
-    #         for si, ti in zip(src_idx.tolist(), tgt_idx.tolist()):
-    #             matched_pairs.append((det_dicts[si], seeds_b[ti]))
-    #
-    #         # unmatched detections (background)
-    #         for i in range(Nd):
-    #             if i not in matched_src:
-    #                 unmatched_dets.append(det_dicts[i])
-    #
-    #     return matched_pairs, unmatched_dets
 
     def _evaluate_pseudo_labels(self,
         pseudo_labels: List[Dict[str, torch.Tensor]],  # pseudo labels
@@ -1425,7 +1453,8 @@ class Stage2(nn.Module):
 
         map_metric = MeanAveragePrecision(
             iou_type="bbox",
-            iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # 0.50 : 0.05 : 0.95
+            # iou_thresholds=torch.arange(0.5, 0.96, 0.05).tolist(),  # mAP@[0.50 : 0.95]
+            iou_thresholds=[0.5],  # mAP@[0.50]
             max_detection_thresholds=[1, 10, 100],
         ).to(self.config.device)
 
@@ -1434,20 +1463,24 @@ class Stage2(nn.Module):
 
         return float(result["map"])
 
+
     def forward(
         self,
+        # train_phase: str,  # "warmup" or "main"
         imgs: torch.Tensor,  # input images, [B, C, H, W]
         wboxes: torch.Tensor,  # weak boxes for training, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels: torch.Tensor,  # class label for weak boxes, one-hot, [R, num_classes], range [0, num_classes - 1]
         bg_prototype: Dict[str, torch.Tensor],  # background prototype
         gt_targets: List[Dict[str, torch.Tensor]] = None,  # ground-truth targets for evaluate pseudo labels
+        sam3_targets: List[Dict[str, torch.Tensor]] = None,
+        # rpn_teacher: Optional[nn.Module] = None,  # teacher RPN for no-grad pseudo labels
         vis_dir: str = None,  # for debug : visualization output dir
         epoch: int = 0,  # for debug : current epoch
         it: int = 0  # for debug : current iteration
     ) -> Dict[str, Any]:
         """
         :return:
-        out : Dict[str, Any], contains:
+        out : Dict[str, Any], for warmpu phase, contains:
         - loss_ccam: torch.Tensor, CCAM loss
         - batch_bg_prototype: torch.Tensor, batch background prototype for EMA update, shape [D]
         - constrain_losses_dict: Dict[str, torch.Tensor], constrain losses
@@ -1458,6 +1491,7 @@ class Stage2(nn.Module):
                                     "loss_push" : loss_push,
                                 }
         - loss_obj: torch.Tensor, sparse proposal objectness loss
+        for main phase, also contains:
         - rpn_losses_dict: Dict[str, torch.Tensor], RPN losses
                             {
                                 "loss_objectness": loss_objectness,
@@ -1482,11 +1516,47 @@ class Stage2(nn.Module):
             "loss_ccam" : loss_ccam
         })
 
-        # -----Branch 2: get augmented seed proposals-----
+        # -----Branch 2: get seed proposals-----
         # 1) get dense proposals
         img_size = (imgs.shape[-1], imgs.shape[-2])  # (H_img, W_img)
         img_size_list = [img_size for _ in range(imgs.shape[0])]
-        dense_proposals_list = self._get_dense_proposals(high_feature_maps, img_size_list, imgs)  # List[Tensor], len=B, each Tensor is [num_proposals, 4]
+
+        rpn_targets = self._build_rpn_targets(
+            wboxes=wboxes,
+            wb_labels=wb_labels,
+            sam3_targets=sam3_targets,
+        )
+        # # for debug
+        # with open("debug_data.txt", "w") as f:
+        #     for b in range(imgs.shape[0]):
+        #         f.write(f"Image {b}:\n")
+        #         f.write(f"  RPN Targets:\n")
+        #         t = rpn_targets[b]
+        #         for i in range(t["box"].shape[0]):
+        #             box = t["box"][i].tolist()
+        #             label = t["class_id"][i].item()
+        #             score = t["score"][i].item()
+        #             f.write(f"    Box: {box}, score: {score}, Label: {label}\n")
+
+
+        rpn_targets_for_train = [
+            {
+                "boxes": target["box"],
+                "labels": target["class_id"],
+            }
+            for target in rpn_targets
+        ]
+
+        dense_proposals_list, rpn_losses_dict = self._get_dense_proposals(
+            high_feature_maps=high_feature_maps,
+            image_sizes=img_size_list,
+            images_tensor=imgs,
+            rpn_targets=rpn_targets_for_train,
+        )  # List[Tensor], len=B, each Tensor is [num_proposals, 4]
+
+        out.update({
+            "rpn_losses_dict": rpn_losses_dict
+        })
 
         # 2) split dense proposals into sparse proposals and background proposals based on wboxes
         B = imgs.shape[0]
@@ -1717,6 +1787,7 @@ class Stage2(nn.Module):
             sparse_proposal_labels=sparse_proposal_labels,
             sparse_proposal_boxes=sparse_proposal_boxes,
             prototypes_embeddings=prototypes_embeddings_norm,
+            bg_prototype_embedding=bg_prototype_embedding_norm,
             sparse_proposal_object_scores=sparse_proposal_object_scores,
             w_prototype_sim=self.config.w_prototype_sim,
             w_ccam_score=self.config.w_ccam_score,
@@ -1724,7 +1795,7 @@ class Stage2(nn.Module):
         )       # [total_num_sparse_proposals]
 
         # # for debug
-        # with open("debug_data.txt", "w", encoding="utf-8") as f:
+        # with open("debug_data.txt", "a", encoding="utf-8") as f:
         #     f.write("Sparse proposal foreground scores:\n")
         #     for i in range(sparse_proposal_fg_scores.shape[0]):
         #         score = sparse_proposal_fg_scores[i].item()
@@ -1756,6 +1827,9 @@ class Stage2(nn.Module):
             "loss_obj": loss_obj
         })
 
+        # if train_phase == "warmup":
+        #     return out
+
         # 6) Object Discovery
         # select Top-Scoring proposals for each class
         top_scoring_proposal_embeddings_norm = torch.zeros(
@@ -1775,12 +1849,14 @@ class Stage2(nn.Module):
         # get threshold for each class
         thresholds = F.cosine_similarity(top_scoring_proposal_embeddings_norm, prototypes_embeddings_norm, dim=1)  # [num_classes]
         sims_all = torch.matmul(sparse_proposal_embeddings_norm, prototypes_embeddings_norm.t())  # [total_num_sparse_proposals, num_classes]
+
         # # for debug
-        # with open("debug_data.txt", "w", encoding="utf-8") as f:
-        #     f.write("Sim for all proposal:\n")
-        #     for i in range(sims_all.shape[0]):
-        #         sim_values = sims_all[i].cpu().detach().numpy().tolist()
-        #         f.write(f"Proposal {i}: label: {sparse_proposal_labels[i]}, " + f", ".join([f"Class {c + 1}: {sim:.4f}" for c, sim in enumerate(sim_values)]) + "\n")
+        # sims_with_bg_all = torch.matmul(sparse_proposal_embeddings_norm, torch.cat([bg_prototype_embedding_norm.unsqueeze(0), prototypes_embeddings_norm], dim=0).t())  # [total_num_sparse_proposals, num_classes + 1]
+        # with open("debug_data.txt", "a", encoding="utf-8") as f:
+        #     f.write("\nSim for all proposal:\n")
+        #     for i in range(sims_with_bg_all.shape[0]):
+        #         sim_values = sims_with_bg_all[i].cpu().detach().numpy().tolist()
+        #         f.write(f"Proposal {i}: label: {sparse_proposal_labels[i]}, score: {sparse_proposal_fg_scores[i]}, " + f", ".join([f"Class {c}: {sim:.4f}" for c, sim in enumerate(sim_values)]) + "\n")
 
         # get seed proposals
         labels = sparse_proposal_labels.to(dtype=torch.long) - 1    # shift to range [0, num_classes - 1]
@@ -1819,6 +1895,29 @@ class Stage2(nn.Module):
                 "logit": sparse_proposal_object_logits[i, c],  # scalar, logit of class c
             })
 
+        # # one-to-one match
+        # match_losses_dict, matched_indices = match_seed_proposals_with_sam3_targets(
+        #     seed_proposals=seed_proposals,
+        #     rpn_targets=rpn_targets,
+        #     imgs=imgs,
+        #     cost_class=self.config.cost_class,
+        #     cost_bbox=self.config.cost_bbox,
+        #     cost_giou=self.config.cost_giou,
+        #     match_focal_alpha=self.config.match_focal_alpha,
+        #     match_focal_gamma=self.config.match_focal_gamma,
+        #     lambda_match_cls=self.config.lambda_match_cls,
+        #     lambda_match_l1=self.config.lambda_match_l1,
+        #     lambda_match_giou=self.config.lambda_match_giou,
+        # )
+        #
+        # out.update({
+        #     "match_losses_dict" : match_losses_dict
+        # })
+        #
+        # seed_proposals = [seed_proposals[i] for i in matched_indices]
+
+
+        # # for debug
         # with open("debug_data.txt", "w") as f:
         #     seed_proposals_per_img = [[] for _ in range(B)]
         #     for p in seed_proposals:
@@ -1886,25 +1985,20 @@ class Stage2(nn.Module):
         #                   "scores": FloatTensor [Nb],
         #                   "labels": LongTensor  [Nb] in [1..C]  (0 reserved for background)
         #               }
-        pseudo_labels = self._build_rpn_pseudo_labels(
+        # pseudo_labels = self._build_rpn_pseudo_labels(
+        #     proposals=seed_proposals,
+        #     batch_size=B,
+        #     image_sizes=image_sizes,
+        # )
+        pseudo_labels = self.rpn_pseudo_label_generator(
             proposals=seed_proposals,
             batch_size=B,
             image_sizes=image_sizes,
-            min_box_size=2.0,
-            keep_empty=False,
-        )
-        pseudo_labels = self._refine_rpn_pseudo_labels(
-            pseudo_targets=pseudo_labels,
-            keep_ratio=0.3,
-            mode="per_class",
-            score_thr=0.05,
-            nms_iou_thr=0.5,
-            class_agnostic_nms=False,
-            keep_empty=True,
         )
 
-        with open("debug_data.txt", "a") as f:
-            f.write("Pseudo Labels:\n")
+        # for debug
+        with open("debug_data.txt", "w") as f:
+            f.write("\nPseudo Labels:\n")
             for b in range(B):
                 f.write(f"Image {b}:\n")
                 boxes = pseudo_labels[b]["boxes"].cpu().numpy().tolist()
@@ -1913,47 +2007,47 @@ class Stage2(nn.Module):
                 for box, score, label in zip(boxes, scores, labels):
                     f.write(f"  Box: {box}, Score: {score.item()}, Label: {label.item()}\n")
 
-        # -----get proposals-----
-        self.rpn.train()
-        B, _, Himg, Wimg = imgs.shape
-
-        # build ImageList
-        image_sizes = [(Himg, Wimg) for _ in range(B)]
-        img_list = ImageList(tensors=imgs, image_sizes=image_sizes)
-
-        # build targets in the format expected by RPN: List[Dict], each requires "boxes"
-        rpn_targets: List[Dict[str, torch.Tensor]] = []
-        for b in range(B):
-            boxes = pseudo_labels[b]["boxes"]  # [Nb,4] xyxy in image coords
-            # safety checks
-            # clamp to image bounds
-            boxes[:, 0].clamp_(0, Wimg - 1)
-            boxes[:, 2].clamp_(0, Wimg - 1)
-            boxes[:, 1].clamp_(0, Himg - 1)
-            boxes[:, 3].clamp_(0, Himg - 1)
-            # ensure x1<=x2, y1<=y2
-            x1 = torch.min(boxes[:, 0], boxes[:, 2])
-            x2 = torch.max(boxes[:, 0], boxes[:, 2])
-            y1 = torch.min(boxes[:, 1], boxes[:, 3])
-            y2 = torch.max(boxes[:, 1], boxes[:, 3])
-            boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-
-            rpn_targets.append({"boxes": boxes})
-
-        # build features dict for RPN
-        features = {"0": high_feature_maps}
-        # get proposals
-        # proposals : List[Tensor], len=B, each Tensor is [num_proposals, 4] in image coords
-        # rpn_losses_dict : Dict[str, Tensor], RPN losses
-        #                    {
-        #                        "loss_objectness": loss_objectness,
-        #                        "loss_rpn_box_reg": loss_rpn_box_reg,
-        #                    }
-        proposals, rpn_losses_dict = self.rpn(img_list, features, rpn_targets)
-
-        out.update({
-            "rpn_losses_dict": rpn_losses_dict
-        })
+        # # -----get proposals-----
+        # self.rpn.train()
+        # B, _, Himg, Wimg = imgs.shape
+        #
+        # # build ImageList
+        # image_sizes = [(Himg, Wimg) for _ in range(B)]
+        # img_list = ImageList(tensors=imgs, image_sizes=image_sizes)
+        #
+        # # build targets in the format expected by RPN: List[Dict], each requires "boxes"
+        # rpn_targets: List[Dict[str, torch.Tensor]] = []
+        # for b in range(B):
+        #     boxes = pseudo_labels[b]["boxes"]  # [Nb,4] xyxy in image coords
+        #     # safety checks
+        #     # clamp to image bounds
+        #     boxes[:, 0].clamp_(0, Wimg - 1)
+        #     boxes[:, 2].clamp_(0, Wimg - 1)
+        #     boxes[:, 1].clamp_(0, Himg - 1)
+        #     boxes[:, 3].clamp_(0, Himg - 1)
+        #     # ensure x1<=x2, y1<=y2
+        #     x1 = torch.min(boxes[:, 0], boxes[:, 2])
+        #     x2 = torch.max(boxes[:, 0], boxes[:, 2])
+        #     y1 = torch.min(boxes[:, 1], boxes[:, 3])
+        #     y2 = torch.max(boxes[:, 1], boxes[:, 3])
+        #     boxes = torch.stack([x1, y1, x2, y2], dim=-1)
+        #
+        #     rpn_targets.append({"boxes": boxes})
+        #
+        # # build features dict for RPN
+        # features = {"0": high_feature_maps}
+        # # get proposals
+        # # proposals : List[Tensor], len=B, each Tensor is [num_proposals, 4] in image coords
+        # # rpn_losses_dict : Dict[str, Tensor], RPN losses
+        # #                    {
+        # #                        "loss_objectness": loss_objectness,
+        # #                        "loss_rpn_box_reg": loss_rpn_box_reg,
+        # #                    }
+        # proposals, rpn_losses_dict = self.rpn(img_list, features, rpn_targets)
+        #
+        # out.update({
+        #     "rpn_losses_dict": rpn_losses_dict
+        # })
 
 
         # # -----R-CNN Head-----
@@ -2060,18 +2154,29 @@ class Stage2(nn.Module):
         # evaluate pseudo labels
         pseudo_labels_mAP = self._evaluate_pseudo_labels(pseudo_labels, gt_targets)
 
+
         out.update({
             "pseudo_labels_mAP" : pseudo_labels_mAP
         })
 
-        # visualize for debug
+        # for debug
+        rpn_targets_for_eval = [
+            {
+                "boxes": rpn_targets[b]["box"],
+                "labels": rpn_targets[b]["class_id"],
+                "scores": rpn_targets[b]["score"],
+            }
+            for b in range(B)
+        ]
+        # pseudo_labels_mAP_1 = self._evaluate_pseudo_labels(rpn_targets_for_eval, gt_targets)
         visualize_stage2_debug_batch(
             imgs=imgs,  # [B,3,H,W]
             wboxes=wboxes,  # [R,5]
             ccam=ccam,  # [R,1,Hc,Wc]
             # final_detections=final_detections,
             # final_detections=detections[0],
-            final_detections=None,
+            final_detections=rpn_targets_for_eval,
+            # final_detections=sam3_targets,
             pseudo_labels=pseudo_labels,
             gt_targets=gt_targets,
             out_dir=vis_dir,
@@ -2211,7 +2316,7 @@ class PrototypeChecker(nn.Module):
         class_ids = sorted(list(prototypes.keys()))
         proto_mat = torch.stack([prototypes[k] for k in class_ids], dim=0)  # [num_classes, D]
 
-        # statistics：sum and cnt
+        # statistics锛歴um and cnt
         R, num_classes = boxes_labels.shape
         sims_sum = {k: 0.0 for k in range(num_classes)}
         sims_cnt = {k: 0 for k in range(num_classes)}
@@ -2357,3 +2462,5 @@ def build_PrototypeChecker_model(
     )
 
     return model
+
+

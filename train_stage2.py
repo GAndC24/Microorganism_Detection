@@ -190,18 +190,18 @@ def main()-> None:
 
     ccam_threshold = stage2_model_config["ccam_threshold"]
 
-    # cost_class = stage2_model_config["cost_class"]
-    # cost_bbox = stage2_model_config["cost_bbox"]
-    # cost_giou = stage2_model_config["cost_giou"]
+    cost_class = stage2_model_config["cost_class"]
+    cost_bbox = stage2_model_config["cost_bbox"]
+    cost_giou = stage2_model_config["cost_giou"]
 
     rpn_pseudo_nms_thr = stage2_model_config["rpn_pseudo_nms_thr"]
     rpn_pseudo_topk = stage2_model_config["rpn_pseudo_topk"]
 
-    # match_focal_alpha = stage2_model_config["match_focal_alpha"]
-    # match_focal_gamma = stage2_model_config["match_focal_gamma"]
-    # lambda_match_cls = stage2_model_config["lambda_match_cls"]
-    # lambda_match_l1 = stage2_model_config["lambda_match_l1"]
-    # lambda_match_giou = stage2_model_config["lambda_match_giou"]
+    match_focal_alpha = stage2_model_config["match_focal_alpha"]
+    match_focal_gamma = stage2_model_config["match_focal_gamma"]
+    lambda_match_cls = stage2_model_config["lambda_match_cls"]
+    lambda_match_l1 = stage2_model_config["lambda_match_l1"]
+    lambda_match_giou = stage2_model_config["lambda_match_giou"]
 
     roi_out_size_h2wb = stage2_model_config["roi_out_size_h2wb"]
     roi_out_size_h2wb = (roi_out_size_h2wb, roi_out_size_h2wb)
@@ -233,16 +233,16 @@ def main()-> None:
         f"  RPN Post NMS Top N: {rpn_post_nms_top_n}\n"
         f"  RPN NMS Thresh: {rpn_nms_thresh}\n"
         f"  CCAM Threshold: {ccam_threshold}\n"
-        # f"  Cost Class: {cost_class}\n"
-        # f"  Cost BBox: {cost_bbox}\n"
-        # f"  Cost GIOU: {cost_giou}\n"
+        f"  Cost Class: {cost_class}\n"
+        f"  Cost BBox: {cost_bbox}\n"
+        f"  Cost GIOU: {cost_giou}\n"
         f"  RPN Pseudo NMS Thresh: {rpn_pseudo_nms_thr}\n"
         f"  RPN Pseudo TopK: {rpn_pseudo_topk}\n"
-        # f"  Match Focal Alpha: {match_focal_alpha}\n"
-        # f"  Match Focal Gamma: {match_focal_gamma}\n"
-        # f"  Lambda Match Cls: {lambda_match_cls}\n"
-        # f"  Lambda Match L1: {lambda_match_l1}\n"
-        # f"  Lambda Match GIOU: {lambda_match_giou}\n"
+        f"  Match Focal Alpha: {match_focal_alpha}\n"
+        f"  Match Focal Gamma: {match_focal_gamma}\n"
+        f"  Lambda Match Cls: {lambda_match_cls}\n"
+        f"  Lambda Match L1: {lambda_match_l1}\n"
+        f"  Lambda Match GIOU: {lambda_match_giou}\n"
         f"  ROI Out Size H2WB: {roi_out_size_h2wb}\n"
         f"  ROI Out Size H2P: {roi_out_size_h2p}\n"
         f"  Backbone Weights Path: {backbone_weights_path}\n"
@@ -255,6 +255,7 @@ def main()-> None:
     lr = stage2_trainer_config["lr"]
     warm_up_lr_factor = stage2_trainer_config["warm_up_lr_factor"]
     warmup_epochs = stage2_trainer_config["warmup_epochs"]
+    warmup_phase_epochs = stage2_trainer_config["warmup_phase_epochs"]
     weight_decay = stage2_trainer_config["weight_decay"]
     checkpoints_save_path = stage2_trainer_config["checkpoints_save_path"]
     model_save_path = stage2_trainer_config["model_save_path"]
@@ -264,6 +265,7 @@ def main()-> None:
     w_constrain_loss = stage2_trainer_config["w_constrain_loss"]
     w_rpn_loss = stage2_trainer_config["w_rpn_loss"]
     w_obj_loss = stage2_trainer_config["w_obj_loss"]
+    w_match_loss= stage2_trainer_config["w_match_loss"]
     ema_alpha = stage2_trainer_config["ema_alpha"]
     print(
         "-----Stage 2 Trainer Configurations-----\n"
@@ -271,6 +273,7 @@ def main()-> None:
         f"  Learning Rate: {lr}\n"
         f"  Min Learning Rate: {lr * warm_up_lr_factor}\n"
         f"  Warmup Epochs: {warmup_epochs}\n"
+        f"  Warmup Phase Epochs: {warmup_phase_epochs}\n"
         f"  Weight Decay: {weight_decay}\n"
         f"  Checkpoints Save Path: {checkpoints_save_path}\n"
         f"  Model Save Path: {model_save_path}\n"
@@ -281,7 +284,7 @@ def main()-> None:
         f"  Weight RPN Loss: {w_rpn_loss}\n"
         f"  Weight Obj Loss: {w_obj_loss}\n"
         f"  EMA Alpha: {ema_alpha}\n"
-        # f"  Weight Match Loss: {w_match_loss}\n"
+        f"  Weight Match Loss: {w_match_loss}\n"
     )
 
     # Initialize Dataset
@@ -332,16 +335,16 @@ def main()-> None:
         rpn_post_nms_top_n=rpn_post_nms_top_n,
         rpn_nms_thresh=rpn_nms_thresh,
         ccam_threshold=ccam_threshold,
-        # cost_class=cost_class,
-        # cost_bbox=cost_bbox,
-        # cost_giou=cost_giou,
+        cost_class=cost_class,
+        cost_bbox=cost_bbox,
+        cost_giou=cost_giou,
         rpn_pseudo_nms_thr=rpn_pseudo_nms_thr,
         rpn_pseudo_topk=rpn_pseudo_topk,
-        # match_focal_alpha=match_focal_alpha,
-        # match_focal_gamma=match_focal_gamma,
-        # lambda_match_cls=lambda_match_cls,
-        # lambda_match_l1=lambda_match_l1,
-        # lambda_match_giou=lambda_match_giou,
+        match_focal_alpha=match_focal_alpha,
+        match_focal_gamma=match_focal_gamma,
+        lambda_match_cls=lambda_match_cls,
+        lambda_match_l1=lambda_match_l1,
+        lambda_match_giou=lambda_match_giou,
         roi_out_size_h2wb=roi_out_size_h2wb,
         spatial_scale_h2wb = spatial_scale_h2wb,
         roi_out_size_h2p=roi_out_size_h2p,
@@ -363,6 +366,7 @@ def main()-> None:
         lr=lr,
         warm_up_lr_factor=warm_up_lr_factor,
         warmup_epochs=warmup_epochs,
+        # warmup_phase_epochs=warmup_phase_epochs,
         weight_decay=weight_decay,
         checkpoints_save_path=checkpoints_save_path,
         model_save_path=model_save_path,
