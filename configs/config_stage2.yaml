@@ -12,12 +12,12 @@ stage2_model_config:
   in_c: 512
   freeze_backbone: False
   # for compute constrain loss
-  w_proto_loss: 3.0  #  [1.0, 3.0]
-  w_pull_loss: 1.0 # [0.3, 1.5]
+  w_proto_loss: 2.0  #  [1.0, 3.0]
+  w_pull_loss: 0.5 # [0.3, 1.5]
   w_push_loss: 1.0 # [0.01, 0.3]
   # for compute foreground scores
-  w_prototype_sim: 1.5  # [1.0, 2.0]
-  w_ccam_score: 1.0  # [0.2, 0.8]
+  w_prototype_sim: 1.0  # [1.0, 2.0]
+  w_ccam_score: 0.5  # [0.2, 0.8]
   w_obj_score: 0.5  # [0.1, 0.6]
   # for select sparse proposal
   keep_iou_thr: 0.5   # [0.1, 0.5]
@@ -42,6 +42,7 @@ stage2_model_config:
   # for Pseudo Labels
   rpn_pseudo_nms_thr: 0.7  # [0.6, 0.8]
   rpn_pseudo_topk: 200  # [100, 300]
+  sim_threshold: 0.7
   # for Match Loss
   match_focal_alpha: 0.25
   match_focal_gamma: 2.0
@@ -79,6 +80,6 @@ stage2_trainer_config:
   checkpoints_save_path: "./checkpoints/stage2/"
   model_save_path: "./results/model_weights/"
   continue_train: True
-  checkpoint_path: "./checkpoints/stage2/checkpoint_23.pth"  # ./checkpoints/stage2/checkpoint_{epoch}.pth
+  checkpoint_path: "./checkpoints/stage2/checkpoint_8.pth"  # ./checkpoints/stage2/checkpoint_{epoch}.pth
 
 

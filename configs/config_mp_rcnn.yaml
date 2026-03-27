@@ -1,0 +1,46 @@
+runtime:
+  seed: 42
+  device: cuda  # 'cuda' or 'cpu'
+
+data:
+  data_root: "./data/processed/Urinary Sediment Dataset"
+  batch_size: 16    # (32, 64)
+  img_size: 640  # (600, 800)
+  num_classes: 7
+
+model:
+  in_c: 512
+  freeze_backbone: False
+  hidden_dim: 512   # (256, 512, 768, 1024)
+  # for RPN
+  rpn_anchor_sizes: 24, 34, 46, 62, 84   # statistics-based sizes, or [32, 40, 64, 120, 208]
+  rpn_anchor_aspect_ratios: 0.67, 1.0, 1.5   # statistics-based ratios, or [0.89, 1.0, 1.15]
+  rpn_fg_iou_thresh: 0.6  # [0.5, 0.7]
+  rpn_bg_iou_thresh: 0.3  # [0.2, 0.3]
+  rpn_batch_size_per_image: 256  # [128, 256]
+  rpn_pre_nms_top_n: 4000, 2000  # train: [2000, 6000], test: [1000, 3000]
+  rpn_post_nms_top_n: 2000, 1000 # train: [2000, 4000], test: [1000, 2000]
+  rpn_nms_thresh: 0.8  # [0.7, 0.9]
+  # for RoI Head
+  det_fg_iou_thresh: 0.5  # [0.3, 0.5]
+  det_bg_iou_thresh: 0.1  # [0.0, 0.2]
+  det_batch_size_per_image: 128  # [128, 256]
+  det_positive_fraction: 0.25
+  det_score_thresh: 0.0   # for training = 0.0, for inference = [0.3, 0.5]
+  det_nms_thresh: 0.5
+  detections_per_img: 100
+  # for RoI Align
+  roi_out_size_h2p: 7
+  # load path
+  backbone_weights_path: "./results/model_weights/Vgg16_backbone_260125.pth"
+
+trainer:
+  epochs: 50
+  lr: 0.001
+  warm_up_lr_factor: 0.01    # min_lr = warm_up_lr_factor * lr
+  warmup_epochs: 5    # 1/10 epochs
+  weight_decay: 0.05    # [0.05, 0.1]
+  checkpoints_save_path: "./checkpoints/mp_rcnn/"
+  model_save_path: "./results/model_weights/"
+  continue_train: False
+  checkpoint_path: ""  # ./checkpoints/mp_rcnn/checkpoint_{epoch}.pth

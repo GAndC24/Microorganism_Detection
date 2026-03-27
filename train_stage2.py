@@ -196,6 +196,7 @@ def main()-> None:
 
     rpn_pseudo_nms_thr = stage2_model_config["rpn_pseudo_nms_thr"]
     rpn_pseudo_topk = stage2_model_config["rpn_pseudo_topk"]
+    sim_threshold = stage2_model_config["sim_threshold"]
 
     match_focal_alpha = stage2_model_config["match_focal_alpha"]
     match_focal_gamma = stage2_model_config["match_focal_gamma"]
@@ -238,6 +239,7 @@ def main()-> None:
         f"  Cost GIOU: {cost_giou}\n"
         f"  RPN Pseudo NMS Thresh: {rpn_pseudo_nms_thr}\n"
         f"  RPN Pseudo TopK: {rpn_pseudo_topk}\n"
+        f"  Similarity Threshold: {sim_threshold}\n"
         f"  Match Focal Alpha: {match_focal_alpha}\n"
         f"  Match Focal Gamma: {match_focal_gamma}\n"
         f"  Lambda Match Cls: {lambda_match_cls}\n"
@@ -294,13 +296,13 @@ def main()-> None:
         T.ToImage(),
         T.ToDtype(torch.float32, scale=True),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        # 轻度几何扰动
-        T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.5),
+        # # 轻度几何扰动
+        # T.RandomHorizontalFlip(p=0.5),
+        # T.RandomVerticalFlip(p=0.5),
         # T.RandomRotation(degrees=15),
-        # 亮度/对比度扰动
-        T.RandomApply([T.ColorJitter(brightness=0.25, contrast=0.25)], p=0.8),
-        T.RandomAutocontrast(p=0.2),
+        # # 亮度/对比度扰动
+        # T.RandomApply([T.ColorJitter(brightness=0.25, contrast=0.25)], p=0.8),
+        # T.RandomAutocontrast(p=0.2),
         # T.RandomAdjustSharpness(sharpness_factor=1.5, p=0.2),
     ])
 
@@ -340,6 +342,7 @@ def main()-> None:
         cost_giou=cost_giou,
         rpn_pseudo_nms_thr=rpn_pseudo_nms_thr,
         rpn_pseudo_topk=rpn_pseudo_topk,
+        sim_threshold=sim_threshold,
         match_focal_alpha=match_focal_alpha,
         match_focal_gamma=match_focal_gamma,
         lambda_match_cls=lambda_match_cls,
@@ -359,6 +362,7 @@ def main()-> None:
     else:       # new train
         logger = Logger(model_name="Stage2", config=config)
 
+
     stage2_trainer_config = Stage2TrainerConfig(
         num_classes=num_classes,
         device=device,
@@ -366,7 +370,7 @@ def main()-> None:
         lr=lr,
         warm_up_lr_factor=warm_up_lr_factor,
         warmup_epochs=warmup_epochs,
-        # warmup_phase_epochs=warmup_phase_epochs,
+        warmup_phase_epochs=warmup_phase_epochs,
         weight_decay=weight_decay,
         checkpoints_save_path=checkpoints_save_path,
         model_save_path=model_save_path,

@@ -38,7 +38,7 @@ class Logger:
                 metrics_file.write("")
 
             # save config as yaml
-            self.config_file_path = os.path.join(self.log_dir, "train_config.yaml")
+            self.config_file_path = os.path.join(self.log_dir, "config_ccam.yaml")
             self._save_yaml(config, self.config_file_path)
 
         else:       # continue existing logs
@@ -49,7 +49,7 @@ class Logger:
                                f"Continue Time: {datetime.now()}\n"
                                "\n")
             self.metrics_file_path = os.path.join(self.log_dir, "training_metrics.jsonl")
-            self.config_file_path = os.path.join(self.log_dir, "train_config.yaml")
+            self.config_file_path = os.path.join(self.log_dir, "config_ccam.yaml")
             self._save_yaml(config, self.config_file_path)
 
     def get_log_dir(self)-> str:

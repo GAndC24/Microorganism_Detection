@@ -486,133 +486,30 @@ def get_object_loss(
     return loss_obj
 
 # ----- Constrain Loss -----
-def get_constrain_loss(
-    proposal_embeddings: torch.Tensor,  # Normalized, [N = total_num_sparse_proposals, D = embed_dim]
-    prototypes_embeddings: torch.Tensor,  # Normalized, [C = num_classes, D]
-    bg_prototype_embedding: torch.Tensor,  # Normalized, [D]
-    labels: torch.Tensor,  # [N], dtype long, range [1, C]
-    fg_scores: torch.Tensor,  # [N] float, range [0, 1]
-    w_proto_loss: float,
-    w_pull_loss: float,
-    w_push_loss: float,
-    tau: float = 0.07,
-    push_margin: float = 0.1,
-    push_tau: float = 0.2,
-    fg_gate_quantile: float = 0.7,
-    bg_gate_quantile: float = 0.3,
-    eps: float = 1e-12,
-) -> Dict[str, torch.Tensor]:
-    """
-    compute constrain loss
-    :return:
-    constrain_loss_dict = {
-        "loss_constrain": total_loss,
-        "loss_proto": loss_proto,
-        "loss_pull": loss_pull,
-        "loss_push": loss_push,
-    }
-    """
-    C = prototypes_embeddings.shape[0]
-    z = proposal_embeddings  # [N, D]
-    p = prototypes_embeddings  # [C, D]
-    bg_p = bg_prototype_embedding.view(1, -1)  # [1, D]
-
-    labels = (labels - 1).clamp(min=0, max=C - 1)  # shift to range [0, C - 1], shape [N]
-    a = fg_scores.detach()  # [N]
-
-    if a.numel() == 0:
-        zero = z.new_zeros(())
-        return {
-            "loss_constrain": zero,
-            "loss_proto": zero,
-            "loss_pull": zero,
-            "loss_push": zero,
-        }
-
-    fg_gate_quantile = min(max(float(fg_gate_quantile), 0.0), 1.0)
-    bg_gate_quantile = min(max(float(bg_gate_quantile), 0.0), 1.0)
-
-    fg_gate_thr = torch.quantile(a, fg_gate_quantile)
-    bg_gate_thr = torch.quantile(a, bg_gate_quantile)
-
-    # Gate mask
-    fg_mask = a >= fg_gate_thr
-    bg_mask = a <= bg_gate_thr
-
-    fg_weight = torch.zeros_like(a)
-    bg_weight = torch.zeros_like(a)
-
-    fg_denom = torch.clamp(1.0 - fg_gate_thr, min=eps)
-    bg_denom = torch.clamp(bg_gate_thr, min=eps)
-
-    fg_weight[fg_mask] = (a[fg_mask] - fg_gate_thr) / fg_denom
-    bg_weight[bg_mask] = (bg_gate_thr - a[bg_mask]) / bg_denom
-
-    # compute loss_proto
-    logits_fg = (z @ p.t()) / tau  # [N, C]
-    logits_bg = (z @ bg_p.t()) / tau  # [N, 1]
-    logits_all = torch.cat([logits_bg, logits_fg], dim=1)  # [N, 1 + C]
-    log_prob_all = F.log_softmax(logits_all, dim=1)  # [N, 1 + C]
-
-    targets = labels + 1  # shift back to range [1, C], background class index = 0
-    log_p_true = log_prob_all.gather(1, targets.view(-1, 1)).squeeze(1)  # [N]
-
-    if fg_mask.any():
-        loss_proto = -(fg_weight[fg_mask] * log_p_true[fg_mask]).sum() / fg_weight[fg_mask].sum().clamp_min(eps)
-    else:
-        loss_proto = z.new_zeros(())
-
-    # compute loss_pull
-    log_p_bg = log_prob_all[:, 0]  # [N]
-    if bg_mask.any():
-        loss_pull = -(bg_weight[bg_mask] * log_p_bg[bg_mask]).sum() / bg_weight[bg_mask].sum().clamp_min(eps)
-    else:
-        loss_pull = z.new_zeros(())
-
-    # compute loss_push
-    s_fg = (z * p[labels]).sum(dim=1)
-    s_bg = (z @ bg_p.t()).squeeze(1)
-    push_term = F.softplus((push_margin + s_bg - s_fg) / push_tau)  # [N]
-
-    if fg_mask.any():
-        loss_push = (fg_weight[fg_mask] * push_term[fg_mask]).sum() / fg_weight[fg_mask].sum().clamp_min(eps)
-    else:
-        loss_push = z.new_zeros(())
-
-    total_loss = (w_proto_loss * loss_proto) + (w_pull_loss * loss_pull) + (w_push_loss * loss_push)
-
-    return {
-        "loss_constrain": total_loss,
-        "loss_proto": loss_proto,
-        "loss_pull": loss_pull,
-        "loss_push": loss_push,
-    }
-
-
 # def get_constrain_loss(
 #     proposal_embeddings: torch.Tensor,  # Normalized, [N = total_num_sparse_proposals, D = embed_dim]
 #     prototypes_embeddings: torch.Tensor,  # Normalized, [C = num_classes, D]
-#     bg_prototype_embedding : torch.Tensor,  # Normalized, [D]
-#     labels : torch.Tensor, # [N], dtype long, range [1, C]
-#     fg_scores : torch.Tensor, # [N] float, range [0, 1]
-#     w_proto_loss : float,
-#     w_pull_loss : float,
-#     w_push_loss : float,
-#     tau : float = 0.07,
-#     push_margin : float  = 0.1,
-#     push_tau : float = 0.2,
-#     fg_gate_thr: float = 0.7,
-#     bg_gate_thr: float = 0.3,
+#     bg_prototype_embedding: torch.Tensor,  # Normalized, [D]
+#     labels: torch.Tensor,  # [N], dtype long, range [1, C]
+#     fg_scores: torch.Tensor,  # [N] float, range [0, 1]
+#     w_proto_loss: float,
+#     w_pull_loss: float,
+#     w_push_loss: float,
+#     tau: float = 0.07,
+#     push_margin: float = 0.1,
+#     push_tau: float = 0.2,
+#     fg_gate_quantile: float = 0.7,
+#     bg_gate_quantile: float = 0.3,
 #     eps: float = 1e-12,
-# )-> Dict[str, torch.Tensor]:
+# ) -> Dict[str, torch.Tensor]:
 #     """
 #     compute constrain loss
 #     :return:
 #     constrain_loss_dict = {
-#         "loss_constrain" : total_loss,
-#         "loss_proto" : loss_proto,
-#         "loss_pull" : loss_pull,
-#         "loss_push" : loss_push,
+#         "loss_constrain": total_loss,
+#         "loss_proto": loss_proto,
+#         "loss_pull": loss_pull,
+#         "loss_push": loss_push,
 #     }
 #     """
 #     C = prototypes_embeddings.shape[0]
@@ -620,9 +517,23 @@ def get_constrain_loss(
 #     p = prototypes_embeddings  # [C, D]
 #     bg_p = bg_prototype_embedding.view(1, -1)  # [1, D]
 #
-#     labels = (labels - 1).clamp(min=0, max=C - 1)    # shift to range [0, C - 1], shape [N]
-#
+#     labels = (labels - 1).clamp(min=0, max=C - 1)  # shift to range [0, C - 1], shape [N]
 #     a = fg_scores.detach()  # [N]
+#
+#     if a.numel() == 0:
+#         zero = z.new_zeros(())
+#         return {
+#             "loss_constrain": zero,
+#             "loss_proto": zero,
+#             "loss_pull": zero,
+#             "loss_push": zero,
+#         }
+#
+#     fg_gate_quantile = min(max(float(fg_gate_quantile), 0.0), 1.0)
+#     bg_gate_quantile = min(max(float(bg_gate_quantile), 0.0), 1.0)
+#
+#     fg_gate_thr = torch.quantile(a, fg_gate_quantile)
+#     bg_gate_thr = torch.quantile(a, bg_gate_quantile)
 #
 #     # Gate mask
 #     fg_mask = a >= fg_gate_thr
@@ -631,19 +542,21 @@ def get_constrain_loss(
 #     fg_weight = torch.zeros_like(a)
 #     bg_weight = torch.zeros_like(a)
 #
-#     fg_weight[fg_mask] = (a[fg_mask] - fg_gate_thr) / max(1.0 - fg_gate_thr, eps)
-#     bg_weight[bg_mask] = (bg_gate_thr - a[bg_mask]) / max(bg_gate_thr, eps)
+#     fg_denom = torch.clamp(1.0 - fg_gate_thr, min=eps)
+#     bg_denom = torch.clamp(bg_gate_thr, min=eps)
+#
+#     fg_weight[fg_mask] = (a[fg_mask] - fg_gate_thr) / fg_denom
+#     bg_weight[bg_mask] = (bg_gate_thr - a[bg_mask]) / bg_denom
 #
 #     # compute loss_proto
 #     logits_fg = (z @ p.t()) / tau  # [N, C]
-#     logits_bg = (z @ bg_p.t()) / tau    # [N, 1]
+#     logits_bg = (z @ bg_p.t()) / tau  # [N, 1]
 #     logits_all = torch.cat([logits_bg, logits_fg], dim=1)  # [N, 1 + C]
-#     # log_prob_fg = F.log_softmax(logits_fg, dim=1)  # [N, C]
 #     log_prob_all = F.log_softmax(logits_all, dim=1)  # [N, 1 + C]
-#     # log_p_true = log_prob_fg.gather(1, labels.view(-1, 1)).squeeze(1)  # [N]
-#     targets = labels + 1    # shift back to range [1, C], background class index = 0
+#
+#     targets = labels + 1  # shift back to range [1, C], background class index = 0
 #     log_p_true = log_prob_all.gather(1, targets.view(-1, 1)).squeeze(1)  # [N]
-#     # loss_proto = -(a * log_p_true).mean()
+#
 #     if fg_mask.any():
 #         loss_proto = -(fg_weight[fg_mask] * log_p_true[fg_mask]).sum() / fg_weight[fg_mask].sum().clamp_min(eps)
 #     else:
@@ -651,27 +564,21 @@ def get_constrain_loss(
 #
 #     # compute loss_pull
 #     log_p_bg = log_prob_all[:, 0]  # [N]
-#     # loss_pull = -((1.0 - a) * log_p_bg).mean()
 #     if bg_mask.any():
 #         loss_pull = -(bg_weight[bg_mask] * log_p_bg[bg_mask]).sum() / bg_weight[bg_mask].sum().clamp_min(eps)
 #     else:
 #         loss_pull = z.new_zeros(())
 #
 #     # compute loss_push
-#     # # softplus version
-#     # s_bg = (z @ bg_p.t()).squeeze(1)  # [N]
-#     # loss_push = (a * F.softplus((s_bg - push_margin) / push_tau)).mean()
-#     # sim margin version
 #     s_fg = (z * p[labels]).sum(dim=1)
 #     s_bg = (z @ bg_p.t()).squeeze(1)
 #     push_term = F.softplus((push_margin + s_bg - s_fg) / push_tau)  # [N]
-#     # loss_push = (a * F.softplus((push_margin + s_bg - s_fg) / push_tau)).mean()
+#
 #     if fg_mask.any():
 #         loss_push = (fg_weight[fg_mask] * push_term[fg_mask]).sum() / fg_weight[fg_mask].sum().clamp_min(eps)
 #     else:
 #         loss_push = z.new_zeros(())
 #
-#     # total
 #     total_loss = (w_proto_loss * loss_proto) + (w_pull_loss * loss_pull) + (w_push_loss * loss_push)
 #
 #     return {
@@ -680,6 +587,99 @@ def get_constrain_loss(
 #         "loss_pull": loss_pull,
 #         "loss_push": loss_push,
 #     }
+
+
+def get_constrain_loss(
+    proposal_embeddings: torch.Tensor,  # Normalized, [N = total_num_sparse_proposals, D = embed_dim]
+    prototypes_embeddings: torch.Tensor,  # Normalized, [C = num_classes, D]
+    bg_prototype_embedding : torch.Tensor,  # Normalized, [D]
+    labels : torch.Tensor, # [N], dtype long, range [1, C]
+    fg_scores : torch.Tensor, # [N] float, range [0, 1]
+    w_proto_loss : float,
+    w_pull_loss : float,
+    w_push_loss : float,
+    tau : float = 0.07,
+    push_margin : float  = 0.1,
+    push_tau : float = 0.2,
+    fg_gate_thr: float = 0.7,
+    bg_gate_thr: float = 0.3,
+    eps: float = 1e-12,
+)-> Dict[str, torch.Tensor]:
+    """
+    compute constrain loss
+    :return:
+    constrain_loss_dict = {
+        "loss_constrain" : total_loss,
+        "loss_proto" : loss_proto,
+        "loss_pull" : loss_pull,
+        "loss_push" : loss_push,
+    }
+    """
+    C = prototypes_embeddings.shape[0]
+    z = proposal_embeddings  # [N, D]
+    p = prototypes_embeddings  # [C, D]
+    bg_p = bg_prototype_embedding.view(1, -1)  # [1, D]
+
+    labels = (labels - 1).clamp(min=0, max=C - 1)    # shift to range [0, C - 1], shape [N]
+
+    a = fg_scores.detach()  # [N]
+
+    # Gate mask
+    fg_mask = a >= fg_gate_thr
+    bg_mask = a <= bg_gate_thr
+
+    fg_weight = torch.zeros_like(a)
+    bg_weight = torch.zeros_like(a)
+
+    fg_weight[fg_mask] = (a[fg_mask] - fg_gate_thr) / max(1.0 - fg_gate_thr, eps)
+    bg_weight[bg_mask] = (bg_gate_thr - a[bg_mask]) / max(bg_gate_thr, eps)
+
+    # compute loss_proto
+    logits_fg = (z @ p.t()) / tau  # [N, C]
+    logits_bg = (z @ bg_p.t()) / tau    # [N, 1]
+    logits_all = torch.cat([logits_bg, logits_fg], dim=1)  # [N, 1 + C]
+    # log_prob_fg = F.log_softmax(logits_fg, dim=1)  # [N, C]
+    log_prob_all = F.log_softmax(logits_all, dim=1)  # [N, 1 + C]
+    # log_p_true = log_prob_fg.gather(1, labels.view(-1, 1)).squeeze(1)  # [N]
+    targets = labels + 1    # shift back to range [1, C], background class index = 0
+    log_p_true = log_prob_all.gather(1, targets.view(-1, 1)).squeeze(1)  # [N]
+    # loss_proto = -(a * log_p_true).mean()
+    if fg_mask.any():
+        loss_proto = -(fg_weight[fg_mask] * log_p_true[fg_mask]).sum() / fg_weight[fg_mask].sum().clamp_min(eps)
+    else:
+        loss_proto = z.new_zeros(())
+
+    # compute loss_pull
+    log_p_bg = log_prob_all[:, 0]  # [N]
+    # loss_pull = -((1.0 - a) * log_p_bg).mean()
+    if bg_mask.any():
+        loss_pull = -(bg_weight[bg_mask] * log_p_bg[bg_mask]).sum() / bg_weight[bg_mask].sum().clamp_min(eps)
+    else:
+        loss_pull = z.new_zeros(())
+
+    # compute loss_push
+    # # softplus version
+    # s_bg = (z @ bg_p.t()).squeeze(1)  # [N]
+    # loss_push = (a * F.softplus((s_bg - push_margin) / push_tau)).mean()
+    # sim margin version
+    s_fg = (z * p[labels]).sum(dim=1)
+    s_bg = (z @ bg_p.t()).squeeze(1)
+    push_term = F.softplus((push_margin + s_bg - s_fg) / push_tau)  # [N]
+    # loss_push = (a * F.softplus((push_margin + s_bg - s_fg) / push_tau)).mean()
+    if fg_mask.any():
+        loss_push = (fg_weight[fg_mask] * push_term[fg_mask]).sum() / fg_weight[fg_mask].sum().clamp_min(eps)
+    else:
+        loss_push = z.new_zeros(())
+
+    # total
+    total_loss = (w_proto_loss * loss_proto) + (w_pull_loss * loss_pull) + (w_push_loss * loss_push)
+
+    return {
+        "loss_constrain": total_loss,
+        "loss_proto": loss_proto,
+        "loss_pull": loss_pull,
+        "loss_push": loss_push,
+    }
 
 # ----- Match Loss -----
 def _softmax_focal_loss(
